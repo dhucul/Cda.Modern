@@ -15,7 +15,7 @@
 
 #define AppName        "CDA"
 #define AppFullName     "CDA - Modern"
-#define AppVersion      "1.4.0"
+#define AppVersion      "1.5.0"
 #define AppPublisher    "CDA"
 #define AppExeName      "Cda.App.exe"
 #define PublishDir      "publish-x64"

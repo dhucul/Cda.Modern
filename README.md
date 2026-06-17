@@ -38,6 +38,15 @@ Working and validated on real targets. Implemented and confirmed:
 - **Windows-API capture** — in one click, hook the OS functions a program imports
   (kernel32, user32, ntdll, …) and record every call to them with arguments and
   decoded strings.
+- **Call-surface capture from startup** — the same hooking, but for an EXE
+  *launched* under a debugger and instrumented at the **initial loader breakpoint**
+  (modules mapped, imports already bound, the program's entry point not yet run), so
+  the calls a program makes *during startup* are captured from the first instruction.
+  Attaching after the fact misses them — the startup is already over, so the log shows
+  0 calls; this closes that gap. Three surfaces: **API** (inline-hook the resolved
+  Windows-API entries it imports), **imports** (IAT-hook the import slots — data-only,
+  anti-tamper-safe), and **exports** (inline-hook the functions its *own* modules
+  export — calls *in* to the app's public surface, the mirror of the import capture).
 - **Caller tracing** — every captured call also snapshots the stack, so a call
   routed through CRT/runtime wrappers is traced back to the function in *your*
   program that triggered it: a per-call **Call stack** and a recursive **Called
@@ -180,6 +189,28 @@ loader-bound address — and record every call with arguments and decoded string
 Ultra-hot primitives (critical-section / heap / last-error) are skipped to avoid
 flooding. The broad trace keeps running as you click around, so selecting an API
 inspects its callers without collapsing the trace.
+
+**Launch & capture API / imports / exports (from startup).** The same hooking, but
+started against an EXE you *launch* rather than one you attach to — because the calls
+worth seeing are usually made *during* a program's startup, and by the time you can
+attach they are already over (so the attach-time buttons above show 0 calls). CDA
+launches the target under a debugger and, at the **initial loader breakpoint** — the
+loader has finished, so every module is mapped and every static import is bound, but
+the program's own entry point has not run yet — discovers the chosen surface and arms
+the hooks, then lets the program go. Every matching call from its first instruction
+onward is captured. **Launch & capture API…** inline-splices the resolved Windows-API
+entries the program imports (most complete); **Launch & capture imports…** overwrites
+the import-table slots instead (writes only to data, never `.text`, so an anti-tamper
+target that checksums its own code is captured cleanly); **Launch & capture
+exports…** inline-splices the functions the program's *own* modules (its EXE and app
+DLLs, not the OS) export — the calls *in* to its public surface, the mirror of the
+import capture, and most useful for an app built from its own DLLs. Forwarder exports
+are skipped, and an export is an authoritative function entry, so that set is always
+safe to splice. All three keep a side debugger attached so a hook-induced fault is
+reported live (faulting `module+0xRVA`) and the target's exit is noticed; the ring is
+drained by the same poll loop as every other capture. Same flooding guard (hot
+primitives skipped) and same broad-trace click-to-inspect behaviour as the
+attach-time form.
 
 **Called by (caller tree).** For the selected function, a recursive tree of who
 calls it — its direct callers, then *their* callers, on back toward the entry
@@ -363,6 +394,11 @@ exercisable. From there:
   selected function — or **Capture Windows API** to hook every OS function it
   imports at once.
 - **Launch & capture…** to trace an EXE from startup.
+- **Launch & capture API… / imports… / exports…** to launch an EXE and capture, from
+  *during startup* (hooked before its entry point runs), the Windows-API calls it
+  imports, those same calls via IAT slots, or the calls into the functions its own
+  modules export — use these instead of the attach-time buttons when the calls you
+  want happen at startup and attaching after the fact shows nothing.
 - **Capture DLL…** to trace a DLL from the moment it loads.
 - **Follow children…** to trace a program and every process it spawns.
 - **Open / Save trace…** to review a captured `.cdatrace` offline or keep one.
@@ -450,7 +486,9 @@ Cda.Modern/
 │  │                         snapshot), CaptureBuffer (ring) + RingBuffer (decoder),
 │  │                         CaptureSession, CallSiteScanner, StartupPlan (candidate +
 │  │                         leaf-primitive filtering), StackUnwinder (x64 .pdata),
-│  │                         ApiImportScanner + ApiSignatures, DebugLoadCapture,
+│  │                         ApiImportScanner + ApiSignatures, ExportScanner,
+│  │                         DebugLoadCapture, LaunchApiCapture (hook a chosen surface
+│  │                         from startup: imports inline/IAT, or own-module exports),
 │  │                         ChildFollowCapture, CaptureCondition, CaptureController,
 │  │                         StringScanner (strings + code cross-references),
 │  │                         SymbolResolver, TraceArchive, TraceCsvExport, TraceComparison,

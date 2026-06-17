@@ -57,5 +57,21 @@ namespace Cda.Core.Model
 
         public double TimeStart;
         public double TimeEnd;
+
+        /// <summary>
+        /// Drop every module that no function in this dataset lives in. Used after a
+        /// capture-surface function list has been capped to a maximum (the Windows-API
+        /// / imports / exports captures), so the function list and graph don't show an
+        /// empty group/node for a module whose every function was trimmed away. No-op
+        /// when there are no functions (nothing is "referenced", so the modules are
+        /// left as-is rather than all removed).
+        /// </summary>
+        public void PruneUnreferencedModules()
+        {
+            if (Modules.Count == 0 || Functions.Count == 0) return;
+            var referenced = new HashSet<ulong>();
+            foreach (var f in Functions) referenced.Add(f.ModuleBase);
+            Modules.RemoveAll(m => !referenced.Contains(m.BaseAddress));
+        }
     }
 }

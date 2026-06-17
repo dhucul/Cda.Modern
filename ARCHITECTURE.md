@@ -365,6 +365,55 @@ dedicated thread. On the `LOAD_DLL_DEBUG_EVENT` whose path matches the target DL
 hooks the DLL **while the loader is frozen at the debug event** — before `DllMain`
 runs — then continues all events. This is how a DLL's own initialization is captured.
 
+## Call-surface capture from startup (`LaunchApiCapture`)
+
+`Engine/LaunchApiCapture` captures the calls a program makes (or receives) **during
+its own startup**, which the attach-time `ApiImportScanner` + `CaptureSession` path
+(MainWindow's *Capture Windows API* / *Capture imports (IAT)*) cannot: by the time
+you attach to a running process its startup is over, those calls have already
+happened, and the log shows nothing.
+
+It cannot reuse the suspended-launch trick the EXE startup trace uses, for a
+concrete reason: at `CREATE_SUSPENDED` the Windows loader has not run, so
+kernel32/user32/… are not mapped and the **import-address table is not yet bound** —
+there is nothing to resolve to a live entry or to hook. So it launches the target
+under a debugger (`DEBUG_ONLY_THIS_PROCESS`, on the dedicated thread every debug loop
+in this engine uses) and hooks at the **initial loader breakpoint**: the first
+`EXCEPTION_BREAKPOINT`. That breakpoint is delivered *after* the loader has mapped
+every static dependency, run their `DllMain`s, and bound the IAT, but *before* the
+program's own entry point executes — every thread frozen, imports resolved, no app
+code run. At that instant it:
+
+1. attaches a read-only `TargetProcess`, enumerates modules into a `ModuleMap`, and
+   discovers the chosen surface against the now-resolved tables — `ApiImportScanner`
+   for the program's imports (inline `Discover` or slot-based `DiscoverImportSlots`),
+   or `ExportScanner.Discover` for the functions the program's **own** modules export;
+2. installs the hooks with `CaptureSession.Start` (inline splice of the resolved entry
+   points — used for both imported APIs and own-module exports) or
+   `CaptureSession.StartIat` (overwrite the import slots — data only, never `.text`,
+   so an anti-tamper target that checksums its code is captured);
+3. raises `Hooked` to the UI with the session + dataset (the surface's modules as
+   nodes — the OS DLLs for imports, the app's own modules for exports) + the full
+   `ModuleMap` (so both ends of a call resolve), then continues the debuggee.
+
+The **exports** surface is the mirror of imports: `ExportScanner` walks the export
+directory of each app module (skipping anything under `\Windows\`, and skipping
+*forwarder* exports whose code lives in another DLL), resolving each export to
+`module base + RVA`. Because an export is an authoritative function entry, that set
+needs none of the call-site discovery heuristics the startup trace uses and is always
+safe to splice. It hooks calls *in* to the app's public functions, where the import
+surface hooks calls *out* to the OS.
+
+Like `DebugLoadCapture` it keeps pumping after the hooks are armed: the first
+breakpoint is swallowed (it is the loader's), a later int3 or hardware fault is
+reported with `DebugExceptionInfo` (faulting `module+0xRVA`) and handed back to the
+program, and `EXIT_PROCESS` ends the loop. The ring is drained by the UI's ordinary
+100 ms poll through the session's own handle, concurrently with the debug loop — the
+same arrangement the DLL-at-load capture uses. The hooked set is bounded
+(`ApiTraceFunctions`) and the same ultra-hot primitives (critical-section / heap /
+last-error) are skipped, exactly as in the attach-time form, since both share
+`ApiImportScanner`.
+
 ## Child-process follow (instrument a tree)
 
 `Engine/ChildFollowCapture` launches an executable under a `DEBUG_PROCESS` debug loop

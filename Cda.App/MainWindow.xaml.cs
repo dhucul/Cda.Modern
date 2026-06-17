@@ -41,6 +41,7 @@ namespace Cda.App
         private readonly HashSet<ulong> _autoUnhooked = new(); // callees auto-removed mid-capture as runaways
         private readonly List<string> _diag = new(); // step-by-step log, included in Copy results
         private DebugLoadCapture? _dllCapture; // active DLL-at-load capture, if any
+        private LaunchApiCapture? _apiLaunch; // active launch-and-hook-imports-from-startup capture, if any
         private ChildFollowCapture? _childFollow; // active child-process-follow capture, if any
         private HwBreakpointCapture? _hwbp; // active hardware-breakpoint (debug-register) capture, if any
         private ulong _captureFocus; // function the live trace is focused on (0 = broad)
@@ -322,6 +323,7 @@ namespace Cda.App
             // A file view is a different mode from live capture; stop capturing
             // first so the poll timer doesn't fight the file's data.
             StopDllCapture();
+            StopApiLaunch();
             StopChildFollow();
             StopCaptureQuietly(); // defers disposal if a background poll is in flight
 
@@ -925,6 +927,7 @@ namespace Cda.App
 
             StopCaptureQuietly();
             StopDllCapture();
+            StopApiLaunch();
             StopChildFollow();
             _captured.Clear();
             _autoUnhooked.Clear();
@@ -1510,6 +1513,7 @@ namespace Cda.App
 
             StopCaptureQuietly();
             StopDllCapture();
+            StopApiLaunch();
             StopChildFollow();
             _captured.Clear();
             _maxCursorSeen = 0;
@@ -1614,6 +1618,7 @@ namespace Cda.App
             // Don't run alongside another capture/observer.
             StopCaptureQuietly();
             StopDllCapture();
+            StopApiLaunch();
             StopChildFollow();
             _diag.Clear();
 
@@ -2062,7 +2067,7 @@ namespace Cda.App
                 StatusText.Text = "Attach to a process first (Attach to process…), then Capture Windows API.";
                 return;
             }
-            if (_capture != null || _dllCapture != null)
+            if (_capture != null || _dllCapture != null || _apiLaunch != null)
             {
                 StatusText.Text = "Capture already running — stop it first.";
                 return;
@@ -2114,6 +2119,7 @@ namespace Cda.App
             var ds = new TraceDataset { TimeStart = 0, TimeEnd = 1 };
             ds.Modules.AddRange(api.ApiModules);
             ds.Functions.AddRange(api.Functions);
+            ds.PruneUnreferencedModules(); // drop modules whose functions were all trimmed by the cap
 
             _currentPe = null;
             _is64 = session.Is64Bit;
@@ -2153,7 +2159,7 @@ namespace Cda.App
                 StatusText.Text = "Attach to a process first (Attach to process…), then Capture imports (IAT).";
                 return;
             }
-            if (_capture != null || _dllCapture != null)
+            if (_capture != null || _dllCapture != null || _apiLaunch != null)
             {
                 StatusText.Text = "Capture already running — stop it first.";
                 return;
@@ -2202,6 +2208,7 @@ namespace Cda.App
             var ds = new TraceDataset { TimeStart = 0, TimeEnd = 1 };
             ds.Modules.AddRange(slots.ApiModules);
             ds.Functions.AddRange(funcs);
+            ds.PruneUnreferencedModules(); // drop modules whose functions were all trimmed by the cap
 
             _currentPe = null;
             _is64 = session.Is64Bit;
@@ -2226,6 +2233,192 @@ namespace Cda.App
             foreach (var s in slots.Slots) imports.Add((s.SlotVa, s.Target));
 
             StartIatCaptureOn(imports, $"{imports.Count} import slot(s)");
+        }
+
+        // --- launch & capture a call surface FROM STARTUP --------------------
+
+        // The attach-based Capture Windows API / Capture imports (IAT) above only see
+        // calls a program makes AFTER you attach — by which point its startup is over,
+        // so the very calls you wanted are already gone and the log shows 0. These
+        // launch the target under a debugger and hook a chosen call surface at the
+        // loader breakpoint (imports bound, modules mapped, but the entry point not yet
+        // run), so the startup flow is captured from the first instruction:
+        //   · API     — inline-splice the resolved Windows-API entries it imports;
+        //   · imports — overwrite its import-table slots (data only, anti-tamper-safe);
+        //   · exports — inline-splice the functions its own modules export (calls IN
+        //               to the app's public surface).
+        // All three run through LaunchApiCapture.
+
+        private void OnLaunchApiCapture(object sender, RoutedEventArgs e) =>
+            LaunchSurfaceCapture(LaunchApiCapture.HookMode.Inline, "Windows API calls (inline)");
+
+        private void OnLaunchIatCapture(object sender, RoutedEventArgs e) =>
+            LaunchSurfaceCapture(LaunchApiCapture.HookMode.Iat, "imported-API calls (IAT)");
+
+        private void OnLaunchExportCapture(object sender, RoutedEventArgs e) =>
+            LaunchSurfaceCapture(LaunchApiCapture.HookMode.Exports, "exported-function calls");
+
+        // A short noun for the surface a launch capture is tracing, for status lines.
+        private static string SurfaceNoun(LaunchApiCapture.HookMode mode) => mode switch
+        {
+            LaunchApiCapture.HookMode.Inline => "Windows API",
+            LaunchApiCapture.HookMode.Iat => "imports",
+            _ => "exports",
+        };
+
+        private void LaunchSurfaceCapture(LaunchApiCapture.HookMode mode, string modeLabel)
+        {
+            if (_capture != null || _dllCapture != null || _apiLaunch != null ||
+                _childFollow != null || _hwbp != null)
+            {
+                StatusText.Text = "Capture already running — stop it first.";
+                return;
+            }
+
+            var dlg = new Microsoft.Win32.OpenFileDialog
+            {
+                Title = $"Launch an executable and capture its {modeLabel} from the start",
+                Filter = "Executables (*.exe)|*.exe|All files (*.*)|*.*",
+            };
+            if (dlg.ShowDialog(this) != true) return;
+
+            string path = dlg.FileName;
+            string name = Path.GetFileName(path);
+
+            PeImage exe;
+            try { exe = PeImage.FromFile(File.ReadAllBytes(path)); }
+            catch (Exception ex) { Diag($"couldn't read {name}: {ex.Message}"); return; }
+
+            if (!Environment.Is64BitProcess && exe.Is64Bit)
+            {
+                Diag("a 32-bit build can't instrument a 64-bit target. Rebuild CDA as x64.");
+                return;
+            }
+
+            bool disableAslr = DisableAslr.IsChecked == true;
+
+            // With "Disable ASLR" on, launch a fixed-base copy (DYNAMICBASE stripped)
+            // so the image — and the absolute addresses in the trace — are stable
+            // across runs. Same mechanism as Launch & capture.
+            string launchPath = path;
+            if (disableAslr)
+            {
+                try
+                {
+                    launchPath = FixedBaseImage.Create(path);
+                    if (launchPath != path) _fixedBaseOriginals.Add(path);
+                }
+                catch (Exception ex)
+                {
+                    Diag($"ASLR: couldn't write a fixed-base copy ({ex.Message}); relying on the bottom-up mitigation policy only");
+                    launchPath = path;
+                }
+            }
+            string commandLine = "\"" + launchPath + "\"";
+
+            StopCaptureQuietly();
+            StopDllCapture();
+            StopApiLaunch();
+            StopChildFollow();
+            _captured.Clear();
+            _autoUnhooked.Clear();
+            _maxCursorSeen = 0;
+            _captureFocus = 0;
+            _diag.Clear();
+            SetCallersTarget(0);
+            _apiCaptureMode = false;
+            _offlineTrace = false;
+            _childView = false;
+            ClearStringsTab(); // this mode traces the OS surface, not the image's strings
+            Diag($"launch & capture {modeLabel}: {name}" + (disableAslr ? " (ASLR disabled)" : "") + " — waiting for the loader…");
+
+            _apiLaunch = new LaunchApiCapture(launchPath, commandLine, mode,
+                ApiTraceFunctions, StartupBufferRecords, disableAslr: disableAslr);
+            _apiLaunch.Log += m => Dispatcher.BeginInvoke(new Action(() => Diag(m)));
+            _apiLaunch.TargetExited += () => Dispatcher.BeginInvoke(new Action(() =>
+            {
+                Diag($"launch & capture {modeLabel}: target exited.");
+                StopCapture();
+            }));
+            _apiLaunch.Hooked += h => Dispatcher.BeginInvoke(new Action(() => OnApiLaunchHooked(h)));
+            _apiLaunch.Aborted += m => Dispatcher.BeginInvoke(new Action(() =>
+            {
+                // Loader breakpoint reached but nothing was hooked: the loop is now a
+                // debugger attached to a running target with no capture. Detach and free
+                // the toolbar (the target keeps running un-instrumented).
+                Diag(m);
+                StopApiLaunch();
+            }));
+            _apiLaunch.Start();
+            UpdateClearCallsState();
+        }
+
+        // Raised (marshalled to the UI thread) once the launched target's imports are
+        // hooked at the loader breakpoint: wire up the views and begin polling for the
+        // startup API calls. Mirrors OnDllHooked.
+        private async void OnApiLaunchHooked(LaunchApiCapture.HookedApis h)
+        {
+            if (h.Instrumented <= 0)
+            {
+                Diag($"{SurfaceNoun(h.Mode)} discovered but no entry could be hooked " +
+                     $"({h.FirstError ?? "no candidate"}).");
+                h.Session.Dispose();
+                StopApiLaunch(); // detach the debug loop; nothing is being captured
+                return;
+            }
+
+            _capture = h.Session;
+            _is64 = h.Is64Bit;
+            _liveDataset = h.Dataset;
+            _currentPe = null;
+            _selectedFunctionAddr = 0;
+            _captureFocus = 0;          // broad trace
+            _apiCaptureMode = true;     // a click inspects callers, doesn't refocus onto one API
+            _moduleMap = h.ModuleMap;   // full map: resolves both callers (app) and callees (OS)
+            _captured.Clear();
+            _autoUnhooked.Clear();
+            _maxCursorSeen = 0;
+
+            _model.Load(h.Dataset);
+            GraphView.SetModel(_model);
+            PlayBar.SetData(h.Dataset);
+            FunctionList.LoadFromDataset(h.Dataset);
+            CallList.Configure(_moduleMap);
+            CallList.Clear();
+
+            _pollTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
+            _pollTimer.Tick += OnPollTick;
+            _pollTimer.Start();
+            UpdateClearCallsState();
+
+            _diag.Add($"capture: {h.Instrumented} hook(s) armed before the entry point" +
+                      (h.Trimmed ? $" (capped to {ApiTraceFunctions}, alphabetical)" : "") +
+                      (h.ExcludedHot > 0 ? $"; skipped {h.ExcludedHot} hot primitive(s) (critical-section/heap/last-error)" : "") +
+                      (h.SkippedLargeModules > 0 ? $"; skipped {h.SkippedLargeModules} oversized module(s)" : ""));
+            Diag($"✓ Ready · capturing {SurfaceNoun(h.Mode)} from startup · " +
+                 $"{h.Instrumented} hook(s) — the startup call flow streams in as the program runs.");
+
+            // Attach a read-only live session so the hex view has bytes and
+            // click-to-refocus works; widen the module map for better resolution.
+            try
+            {
+                var session = await Task.Run(() => LiveSession.Attach(h.Pid));
+                _session?.Dispose();
+                _session = session;
+                _moduleMap = session.Modules;
+                CallList.Configure(_moduleMap);
+                DisposeFileMap();
+                Hex.SetSource(session.Process,
+                    session.Dataset.Functions.Count > 0 ? session.Dataset.Functions[0].Address : session.Process.MinAddress);
+                _diag.Add($"post-hook attach ok: {session.Dataset.Functions.Count} functions (UI/focus session)");
+            }
+            catch (Exception ex) { _diag.Add("post-hook attach failed: " + ex.Message); }
+        }
+
+        private void StopApiLaunch()
+        {
+            if (_apiLaunch != null) { _apiLaunch.Stop(); _apiLaunch = null; }
+            UpdateClearCallsState();
         }
 
         // Arm an IAT capture over the given (slot, target) pairs and start polling.
@@ -2296,7 +2489,7 @@ namespace Cda.App
                 StatusText.Text = "Attach to a process first (Attach to process…), then select a function and Capture (hardware bp).";
                 return;
             }
-            if (_capture != null || _dllCapture != null || _childFollow != null || _hwbp != null)
+            if (_capture != null || _dllCapture != null || _apiLaunch != null || _childFollow != null || _hwbp != null)
             {
                 StatusText.Text = "Capture already running — stop it first.";
                 return;
@@ -3375,6 +3568,7 @@ namespace Cda.App
             _startupActive = false;
             if (_debugWatch != null) { _debugWatch.Stop(); _debugWatch = null; }
             StopDllCapture();
+            StopApiLaunch();
             StopChildFollow();
             StopHwbp();
             _captureFocus = 0;
@@ -3511,7 +3705,7 @@ namespace Cda.App
         // Launch & capture / Capture DLL after load), a DLL-at-load debug loop before
         // the DLL maps, a child-follow tree, or a hardware-breakpoint debugger.
         private bool IsCaptureRunning() =>
-            _capture != null || _dllCapture != null || _childFollow != null || _hwbp != null;
+            _capture != null || _dllCapture != null || _apiLaunch != null || _childFollow != null || _hwbp != null;
 
         // Enable "Clear calls" only while a live capture is running — there's nothing to
         // clear-and-continue otherwise. Called from every capture start/stop transition;
@@ -3676,6 +3870,7 @@ namespace Cda.App
             // Switching to an offline view: stop anything live and release the target.
             StopCaptureQuietly();
             StopDllCapture();
+            StopApiLaunch();
             StopChildFollow();
             _session?.Dispose();
             _session = null;
@@ -4003,6 +4198,7 @@ namespace Cda.App
         protected override void OnClosed(EventArgs e)
         {
             _dllCapture?.Stop();
+            _apiLaunch?.Stop();
             _childFollow?.Stop();
             _hwbp?.Stop();
             _hwbp?.WaitForExit(600); // let it clear debug registers + detach before we exit
