@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.Text;
 using System.Windows;
 using System.Windows.Controls;
@@ -19,7 +20,7 @@ namespace Cda.App.UI
     /// </summary>
     public partial class CallersView : UserControl
     {
-        public sealed class CallerNode
+        public sealed class CallerNode : INotifyPropertyChanged
         {
             /// <summary>Entry address of the calling function (or raw site if unknown).</summary>
             public ulong Address { get; init; }
@@ -28,6 +29,25 @@ namespace Cda.App.UI
             public long Count { get; init; }
             public bool IsRecursion { get; init; }
             public ObservableCollection<CallerNode> Children { get; } = new();
+
+            // Bound two-way to the TreeViewItem's IsExpanded (see CallersView.xaml).
+            // Driving expansion from the model \u2014 rather than poking the visual
+            // containers \u2014 is what lets Expand/Collapse all reach nodes the
+            // virtualizing panel hasn't realized yet.
+            private bool _isExpanded;
+            public bool IsExpanded
+            {
+                get => _isExpanded;
+                set
+                {
+                    if (_isExpanded == value) return;
+                    _isExpanded = value;
+                    PropertyChanged?.Invoke(this, _isExpandedChanged);
+                }
+            }
+
+            public event PropertyChangedEventHandler? PropertyChanged;
+            private static readonly PropertyChangedEventArgs _isExpandedChanged = new(nameof(IsExpanded));
 
             public string ModuleSuffix => string.IsNullOrEmpty(Module) ? "" : "   (" + Module + ")";
             public string CountSuffix => IsRecursion ? "   \u21BB recursion"
@@ -111,6 +131,24 @@ namespace Cda.App.UI
         {
             if (e.NewValue is CallerNode n && n.Address != 0 && !n.IsRecursion)
                 CallerSelected?.Invoke(this, n.Address);
+        }
+
+        private void OnExpandAll(object sender, RoutedEventArgs e) => SetExpanded(_roots, true);
+        private void OnCollapseAll(object sender, RoutedEventArgs e) => SetExpanded(_roots, false);
+
+        /// <summary>
+        /// Expand or collapse the whole tree by walking the data model. The tree is
+        /// fully materialized when built (depth- and node-bounded host-side), so this
+        /// reaches every node; the TwoWay IsExpanded binding then applies it to each
+        /// container as the virtualizing panel realizes it.
+        /// </summary>
+        private static void SetExpanded(IEnumerable<CallerNode> nodes, bool expanded)
+        {
+            foreach (var n in nodes)
+            {
+                n.IsExpanded = expanded;
+                if (n.Children.Count > 0) SetExpanded(n.Children, expanded);
+            }
         }
     }
 }

@@ -3,6 +3,12 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              Background="{StaticResource Surface}">
     <DockPanel>
+        <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="8,6,8,0">
+            <Button Content="Expand all" Padding="8,3" Margin="0,0,6,0" Click="OnExpandAll"
+                    ToolTip="Expand every caller in the tree." />
+            <Button Content="Collapse all" Padding="8,3" Click="OnCollapseAll"
+                    ToolTip="Collapse the tree back to the direct callers." />
+        </StackPanel>
         <TextBlock x:Name="Header" DockPanel.Dock="Top" Foreground="{StaticResource TextSecondary}"
                    Margin="8,6" FontFamily="Cascadia Mono, Consolas" FontSize="12"
                    TextWrapping="NoWrap"
@@ -14,6 +20,11 @@
                   VirtualizingPanel.VirtualizationMode="Recycling"
                   ScrollViewer.HorizontalScrollBarVisibility="Auto"
                   ScrollViewer.VerticalScrollBarVisibility="Visible">
+            <TreeView.ItemContainerStyle>
+                <Style TargetType="TreeViewItem">
+                    <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
+                </Style>
+            </TreeView.ItemContainerStyle>
             <TreeView.ItemTemplate>
                 <HierarchicalDataTemplate ItemsSource="{Binding Children}">
                     <TextBlock TextWrapping="NoWrap"><Run Text="{Binding Caller, Mode=OneWay}" Foreground="{StaticResource TextPrimary}" /><Run Text="{Binding ModuleSuffix, Mode=OneWay}" Foreground="{StaticResource TextMuted}" /><Run Text="{Binding CountSuffix, Mode=OneWay}" Foreground="{StaticResource TextSecondary}" /></TextBlock>
