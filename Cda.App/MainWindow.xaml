@@ -1,0 +1,133 @@
+<Window x:Class="Cda.App.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vis="clr-namespace:Cda.App.Visualization"
+        xmlns:ui="clr-namespace:Cda.App.UI"
+        Title="CDA — Dynamic Analysis (modern preview)"
+        Width="1480" Height="900"
+        MinWidth="760" MinHeight="480"
+        WindowStartupLocation="CenterScreen"
+        Background="{StaticResource Background}"
+        TextOptions.TextFormattingMode="Ideal"
+        TextOptions.TextRenderingMode="ClearType"
+        UseLayoutRounding="True">
+
+    <DockPanel>
+        <!-- Toolbar -->
+        <Border DockPanel.Dock="Top" Background="{StaticResource Surface}" Padding="10,8">
+            <WrapPanel Orientation="Horizontal">
+                <Button Content="Load demo trace" Padding="12,4" Margin="0,0,8,6" Click="OnLoadDemo" />
+                <Button Content="Open module (PE)…" Padding="12,4" Margin="0,0,8,6" Click="OnOpenModule"
+                        ToolTip="Statically load an EXE/DLL: lists its functions and shows its bytes. Does NOT run it — use Launch &amp; capture for that." />
+                <Button Content="Launch &amp; capture…" Padding="12,4" Margin="0,0,8,6" Click="OnLaunchCapture"
+                        ToolTip="Launch an executable SUSPENDED, arm a broad set of its functions before it runs, then resume — so the startup call flow is captured from the first instruction. Click any function afterward to focus the trace on just it." />
+                <Button Content="Capture DLL…" Padding="12,4" Margin="0,0,8,6" Click="OnLaunchDllCapture"
+                        ToolTip="Launch a host under a debugger and instrument a chosen DLL the instant it loads — capturing its DllMain and startup from the first instruction. Pick the DLL, then optionally a host EXE that loads it (Cancel = use rundll32)." />
+                <Button Content="Follow children…" Padding="12,4" Margin="0,0,8,6" Click="OnFollowChildren"
+                        ToolTip="Launch an executable under a debugger that follows every process it spawns AND instruments each one the instant it starts (frozen at creation, before its code runs). Per-process call counts stream into the diagnostics. Use Stop capture to remove the hooks and detach (leaves the tree running)." />
+                <CheckBox x:Name="FollowSkipSystem" Content="Skip system" IsChecked="True"
+                          Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" Margin="0,0,8,6"
+                          ToolTip="When following a process tree, don't instrument OS helper processes (those whose image is under \Windows\, e.g. conhost.exe, WerFault.exe) — they're still followed and listed in the diagnostics, just not hooked. The executable you launch is always instrumented. Read when you click Follow children." />
+                <CheckBox x:Name="DisableAslr" Content="Disable ASLR" IsChecked="False"
+                          Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" Margin="0,0,8,6"
+                          ToolTip="For the launch commands (Launch &amp; capture, Capture DLL, Follow children), start the target with ASLR off so its modules load at the same base every run — making the absolute addresses in a capture reproducible across runs and comparable across saved .cdatrace files. CDA launches a throwaway copy of the image with its /DYNAMICBASE opt-in stripped (so the loader uses its preferred base), and also applies a per-process bottom-up mitigation policy. It affects only programs CDA launches; nothing global is changed. Requires Windows mandatory ASLR (force-relocate) to be OFF, which is the default. Only the launched image (and, for Follow children, the root) is pinned — spawned children keep their own ASLR." />
+                <StackPanel x:Name="ChildTargetPanel" Orientation="Horizontal" Visibility="Collapsed" VerticalAlignment="Center" Margin="0,0,8,6">
+                    <TextBlock Text="Target:" Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" Margin="0,0,4,0" FontSize="12" />
+                    <ComboBox x:Name="ChildTargetBox" Width="300" VerticalAlignment="Center" FontSize="12"
+                              DisplayMemberPath="Display" SelectionChanged="OnChildTargetChanged"
+                              ToolTip="Choose which followed process to view. Its captured calls drive the function list, call graph, calls log, caller tree, and timeline. The other followed processes keep recording in the background; switch between them any time, including after they exit." />
+                </StackPanel>
+                <Button Content="Fit graph" Padding="12,4" Margin="0,0,8,6" Click="OnFit" />
+                <Button Content="Self-test" Padding="12,4" Margin="0,0,8,6" Click="OnSelfTest"
+                        ToolTip="In-process validation (no target) of the inline-hook codegen and the capture stub + ring buffer — the byte-exact pieces everything else depends on. A failure here means the codegen needs fixing before trusting a live capture." />
+                <Button Content="Attach to process…" Padding="12,4" Margin="0,0,8,6" Click="OnAttach"
+                        ToolTip="Attach to a running process and discover its call graph (read-only). Active call recording is the next, gated step." />
+                <Button Content="Start capture" Padding="12,4" Margin="0,0,8,6" Click="OnStartCapture"
+                        ToolTip="Instrument ONLY the function selected on the left and record its live calls with decoded arguments." />
+                <Button Content="Capture Windows API" Padding="12,4" Margin="0,0,8,6" Click="OnCaptureApi"
+                        ToolTip="On the attached process, hook the Windows API functions it imports (kernel32, user32, ntdll, …) and record every call to them — with arguments and decoded strings. Attach to a process first. Ultra-hot primitives (critical-section/heap/last-error) are skipped to avoid flooding; click one to trace it specifically." />
+                <Button Content="Capture imports (IAT)" Padding="12,4" Margin="0,0,8,6" Click="OnCaptureIat"
+                        ToolTip="Like Capture Windows API, but reroutes calls by overwriting the import-address-table SLOTS in the target's own modules instead of patching code. It writes only to the import table (data), never to .text — so it captures targets that checksum their own code (anti-tamper) and self-terminate when patched. Attach to a process first." />
+                <Button Content="Capture (hardware bp)" Padding="12,4" Margin="0,0,8,6" Click="OnCaptureHwbp"
+                        ToolTip="Trace the SELECTED function using a CPU debug register (hardware breakpoint) — writes NOTHING to the target's memory, so it captures binaries that both checksum their code and can't be IAT-hooked. Attaches as a debugger (an anti-debug target may notice), watches up to 4 addresses, x64 only. Attach, click a function, then click this." />
+                <Button Content="Stop capture" Padding="12,4" Margin="0,0,8,6" Click="OnStopCapture" />
+                <Button Content="Copy results" Padding="12,4" Margin="0,0,8,6" Click="OnCopyResults"
+                        ToolTip="Copy the captured calls (and the current diagnostic state) to the clipboard as text, so you can paste them elsewhere." />
+                <Button Content="Save trace…" Padding="12,4" Margin="0,0,8,6" Click="OnSaveTrace"
+                        ToolTip="Save the recorded calls — with arguments, decoded strings, and stack snapshots — to a .cdatrace file you can reopen and review later." />
+                <Button Content="Export CSV…" Padding="12,4" Margin="0,0,8,6" Click="OnExportCsv"
+                        ToolTip="Export the recorded calls to a spreadsheet-friendly CSV (one row per call: time, caller, callee, arguments, decoded strings) for Excel, pandas, or grep. One-way — use Save trace… for a file you can reopen in CDA." />
+                <Button Content="Open trace…" Padding="12,4" Margin="0,0,8,6" Click="OnOpenTrace"
+                        ToolTip="Open a saved .cdatrace file and review it offline: functions, call graph, timeline, calls log, and caller tree (no live target needed)." />
+                <Button Content="Compare trace…" Padding="12,4" Margin="0,0,8,6" Click="OnCompareTrace"
+                        ToolTip="Compare two traces (A vs B): the current trace is A, or — with nothing loaded — pick two saved .cdatrace files (no capture needed). Shows a per-function call-count diff (which functions ran only in one run, and which ran a different number of times) and a chart of where they differ, and recolours the butterfly graph by edge changes. Double-click a row to jump to that function." />
+                <CheckBox x:Name="AutoCapture" Content="Auto-capture on select" IsChecked="True"
+                          Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" Margin="4,0,8,6"
+                          ToolTip="When on, clicking a function in the list immediately starts tracing it — no Start button needed." />
+                <CheckBox x:Name="AutoBisectCrashes" Content="Auto-bisect crashes" IsChecked="False"
+                          Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" Margin="4,0,8,6"
+                          ToolTip="OFF by default. When a Launch &amp; capture crash can't be pinned to a single hook (a deferred culprit), binary-search the armed hooks to isolate it — relaunching the target HIDDEN (no window pop-ups / focus stealing), bounded, and cancellable with Stop capture. The culprit's RVA is written to cda_hook_skip.txt; you then re-launch to trace past it. The only way to find a deferred culprit is by re-running, so this relaunches — just invisibly." />
+                <TextBlock Text="Capture only:" Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" Margin="4,0,4,6" FontSize="12" />
+                <TextBox x:Name="CaptureCondBox" Width="200" VerticalAlignment="Center" FontSize="12" Margin="0,0,0,6"
+                         ToolTip="Record only calls matching these space-separated clauses (all must match): argN==V / argN!=V / argN&lt;V / argN&gt;V / argN&amp;V (V is 0x-hex or decimal; &amp; is a flag test); name~TEXT or name!~TEXT (callee name contains); str~TEXT or str!~TEXT (decoded string arg contains). Blank = record everything. Applies live during capture."
+                         TextChanged="OnCaptureConditionChanged" />
+                <TextBlock Foreground="{StaticResource TextMuted}" VerticalAlignment="Center" Margin="8,0,0,6"
+                           Text="graph: click a node to focus · timeline: click=scrub, ←→=step (Ctrl=bigger), right-drag=select" />
+            </WrapPanel>
+        </Border>
+
+        <!-- Status bar -->
+        <Border DockPanel.Dock="Bottom" Background="{StaticResource Surface}" Padding="10,4">
+            <DockPanel>
+                <TextBlock x:Name="DpiText" Foreground="{StaticResource TextMuted}" DockPanel.Dock="Right" />
+                <TextBlock x:Name="StatusText" Foreground="{StaticResource TextSecondary}" Text="Ready." />
+            </DockPanel>
+        </Border>
+
+        <!-- Playback timeline -->
+        <Border DockPanel.Dock="Bottom" Background="{StaticResource Surface2}" Padding="6">
+            <vis:PlaybackBar x:Name="PlayBar" />
+        </Border>
+
+        <!-- Main work area: function list | (graph / hex+args) -->
+        <Grid>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="560" MinWidth="340" />
+                <ColumnDefinition Width="4" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <ui:FunctionListView x:Name="FunctionList" Grid.Column="0" />
+            <GridSplitter Grid.Column="1" Width="4" HorizontalAlignment="Stretch" Background="{StaticResource Outline}" />
+
+            <Grid Grid.Column="2">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="*" MinHeight="160" />
+                    <RowDefinition Height="4" />
+                    <RowDefinition Height="360" MinHeight="140" />
+                </Grid.RowDefinitions>
+
+                <vis:CallGraphView x:Name="GraphView" Grid.Row="0" />
+                <GridSplitter Grid.Row="1" Height="4" HorizontalAlignment="Stretch" Background="{StaticResource Outline}" />
+
+                <TabControl x:Name="Tabs" Grid.Row="2" Background="{StaticResource Surface}" BorderThickness="0">
+                    <TabItem Header="Calls">
+                        <ui:CallListView x:Name="CallList" />
+                    </TabItem>
+                    <TabItem Header="Called by">
+                        <ui:CallersView x:Name="Callers" />
+                    </TabItem>
+                    <TabItem Header="Call stack">
+                        <ui:CallStackView x:Name="CallStack" />
+                    </TabItem>
+                    <TabItem x:Name="MemoryTab" Header="Memory">
+                        <ui:HexView x:Name="Hex" />
+                    </TabItem>
+                    <TabItem x:Name="StringsTab" Header="Strings">
+                        <ui:StringsView x:Name="StringsPanel" />
+                    </TabItem>
+                </TabControl>
+            </Grid>
+        </Grid>
+    </DockPanel>
+</Window>

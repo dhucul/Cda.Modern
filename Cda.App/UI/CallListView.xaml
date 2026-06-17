@@ -1,0 +1,58 @@
+<UserControl x:Class="Cda.App.UI.CallListView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             Background="{StaticResource Surface}">
+    <DockPanel>
+        <DockPanel DockPanel.Dock="Top" LastChildFill="True">
+            <CheckBox x:Name="FollowTail" DockPanel.Dock="Right" Content="Follow" IsChecked="True"
+                      Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" Margin="8,6"
+                      ToolTip="Auto-scroll to the newest call as capture runs." />
+            <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,4,0">
+                <TextBlock Text="Keep last:" Foreground="{StaticResource TextSecondary}"
+                           VerticalAlignment="Center" Margin="0,0,4,0" FontSize="12" />
+                <TextBox x:Name="CapBox" Width="90" VerticalAlignment="Center" FontSize="12"
+                         ToolTip="Maximum calls to keep in this list. Blank or 0 = unlimited (keep all). When exceeded, the oldest rows drop off; the full trace is still kept for the timeline and Copy results."
+                         TextChanged="OnCapChanged" />
+            </StackPanel>
+            <CheckBox x:Name="BookmarkOnly" DockPanel.Dock="Right" Content="★ only"
+                      Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" Margin="8,6"
+                      ToolTip="Show only the calls you've bookmarked (★)."
+                      Checked="OnBookmarkOnlyChanged" Unchecked="OnBookmarkOnlyChanged" />
+            <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center" Margin="0,0,8,0">
+                <TextBlock Text="Filter:" Foreground="{StaticResource TextSecondary}"
+                           VerticalAlignment="Center" Margin="0,0,4,0" FontSize="12" />
+                <TextBox x:Name="FilterBox" Width="180" VerticalAlignment="Center" FontSize="12"
+                         ToolTip="Show only calls whose caller, callee, arguments, or strings contain this text (case-insensitive). Clear to show all."
+                         TextChanged="OnFilterChanged" />
+            </StackPanel>
+            <TextBlock x:Name="Header" Foreground="{StaticResource TextPrimary}"
+                       Margin="8,6" FontFamily="Cascadia Mono, Consolas" FontSize="12"
+                       Text="No calls captured yet." TextWrapping="NoWrap" />
+        </DockPanel>
+        <DataGrid x:Name="Grid" AutoGenerateColumns="False" IsReadOnly="True"
+                  HeadersVisibility="Column" GridLinesVisibility="None"
+                  Background="{StaticResource Surface}" RowBackground="{StaticResource Surface}" AlternatingRowBackground="{StaticResource SurfaceAlt}"
+                  Foreground="{StaticResource TextPrimary}" BorderThickness="0"
+                  EnableRowVirtualization="True" EnableColumnVirtualization="True"
+                  VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+                  FontFamily="Cascadia Mono, Consolas" FontSize="12">
+            <DataGrid.Columns>
+                <DataGridTemplateColumn Header="★" Width="32" SortMemberPath="Bookmarked">
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate>
+                            <CheckBox IsChecked="{Binding Bookmarked, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                      HorizontalAlignment="Center" VerticalAlignment="Center"
+                                      ToolTip="Bookmark this call" Click="OnBookmarkClick" />
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
+                <DataGridTextColumn Header="#" Binding="{Binding Seq}" SortMemberPath="SeqNum" Width="60" />
+                <DataGridTextColumn Header="Time (s)" Binding="{Binding Time}" SortMemberPath="Record.Time" Width="90" />
+                <DataGridTextColumn Header="Caller" Binding="{Binding Source}" Width="170" />
+                <DataGridTextColumn Header="Callee" Binding="{Binding Dest}" Width="170" />
+                <DataGridTextColumn Header="Args" Binding="{Binding Args}" Width="240" />
+                <DataGridTextColumn Header="Strings" Binding="{Binding Strings}" Width="*" />
+            </DataGrid.Columns>
+        </DataGrid>
+    </DockPanel>
+</UserControl>

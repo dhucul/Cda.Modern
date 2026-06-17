@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>Cda.Core</AssemblyName>
+    <RootNamespace>Cda.Core</RootNamespace>
+    <Platforms>x64;x86</Platforms>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <!-- The engine is the only assembly that touches the target process. It has
+         no WPF/UI dependency so it can be unit-tested headlessly and reused by a
+         future CLI. The recommended deployment is an x64 host that analyzes both
+         x64 and (via WOW64-aware reads) x86 targets; an x86 build is kept for the
+         edge case of instrumenting a 32-bit target from a 32-bit host. -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Iced is the de-facto x86/x64 disassembler + assembler for .NET. It powers
+         both the discovery tier (decode to find call sites / instruction
+         boundaries) and the codegen tier (relocate stolen bytes, assemble
+         trampolines), for both 32- and 64-bit, replacing the legacy hand-rolled
+         LengthDecoder / oAssemblyGenerator. Version may be bumped on restore. -->
+    <PackageReference Include="Iced" Version="1.21.0" />
+  </ItemGroup>
+
+</Project>

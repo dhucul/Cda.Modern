@@ -1,0 +1,51 @@
+<UserControl x:Class="Cda.App.UI.FunctionListView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             Background="{StaticResource Surface}">
+    <DockPanel>
+        <Border DockPanel.Dock="Top" Padding="6">
+            <StackPanel>
+                <TextBox x:Name="Filter" Padding="4"
+                         ToolTip="Filter by function or module name"
+                         TextChanged="OnFilterChanged" />
+
+                <!-- Call-count filter: prune the list by how many times each
+                     function was hit. Non-destructive (it hides rows, never drops
+                     them) so "Show all" fully restores the list and live counting,
+                     the graph, and the dataset are untouched. -->
+                <WrapPanel Margin="0,6,0,0">
+                    <Button Content="Hide 0-hit" Padding="8,3" Margin="0,0,6,0" Click="OnHideZeroHit"
+                            ToolTip="Hide every function with 0 recorded calls, leaving only the ones that were actually hit. Snapshots the current counts — re-click to re-apply after more calls arrive. Use 'Show all' to bring them back." />
+                    <TextBlock Text="Only" Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" Margin="0,0,4,0" />
+                    <TextBox x:Name="CountBox" Width="60" Padding="4,3" Margin="0,0,4,0" VerticalAlignment="Center"
+                             ToolTip="Type a call count, then click 'hits' (or press Enter) to show only the functions hit exactly that many times."
+                             KeyDown="OnCountBoxKeyDown" />
+                    <Button Content="hits" Padding="8,3" Margin="0,0,6,0" Click="OnShowOnlyCount"
+                            ToolTip="Show only functions whose call count equals the number on the left; hide everything else." />
+                    <Button Content="Show all" Padding="8,3" Margin="0,0,6,0" Click="OnShowAllCounts"
+                            ToolTip="Clear the call-count filter and restore the full function list." />
+                    <Button Content="Call order" Padding="8,3" Margin="0,0,6,0" Click="OnSortCallOrder"
+                            ToolTip="Sort the list by the order functions were first called (see the 'Order' column). A snapshot — click again to re-apply after more calls arrive; click any column header to sort another way. Never-called functions sort to the bottom." />
+                    <TextBlock x:Name="MatchInfo" Foreground="{StaticResource TextMuted}" VerticalAlignment="Center" FontSize="11" />
+                </WrapPanel>
+            </StackPanel>
+        </Border>
+
+        <DataGrid x:Name="Grid" AutoGenerateColumns="False" IsReadOnly="True"
+                  HeadersVisibility="Column" GridLinesVisibility="None"
+                  Background="{StaticResource Surface}" RowBackground="{StaticResource Surface}" AlternatingRowBackground="{StaticResource SurfaceAlt}"
+                  Foreground="{StaticResource TextPrimary}" BorderThickness="0"
+                  EnableRowVirtualization="True" EnableColumnVirtualization="True"
+                  VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+                  SelectionMode="Single" SelectionChanged="OnSelectionChanged"
+                  FontFamily="Cascadia Mono, Consolas" FontSize="12">
+            <DataGrid.Columns>
+                <DataGridTextColumn Header="Order" Binding="{Binding CallOrderText}" SortMemberPath="FirstCallSeq" Width="Auto" MinWidth="44" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Address" Binding="{Binding AddressHex}" Width="Auto" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Module" Binding="{Binding Module}" Width="Auto" MaxWidth="220" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Function" Binding="{Binding Name}" Width="*" MinWidth="180" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Calls" Binding="{Binding CallCount}" Width="84" ElementStyle="{StaticResource GridCellText}" />
+            </DataGrid.Columns>
+        </DataGrid>
+    </DockPanel>
+</UserControl>
