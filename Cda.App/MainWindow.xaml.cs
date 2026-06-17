@@ -34,6 +34,7 @@ namespace Cda.App
         private int _maxCursorSeen;  // diagnostic: high-water mark of in-target buffer writes
         private bool _captureBursting; // true while polls are draining a heavy startup flood
         private bool _polling;         // true while a background Poll() is in flight (re-entrancy guard)
+        private int _captureClearGen;  // bumped by "Clear calls"; a poll batch decoded across a clear is dropped
         private CaptureChainResolver? _chainResolver;  // worker-thread caller-chain resolver for live polls
         private LiveSession? _chainResolverSession;    // session the resolver was built for (rebuild on change)
         private ModuleMap? _chainResolverMap;          // module map the resolver was built for
@@ -237,6 +238,7 @@ namespace Cda.App
             InitializeComponent();
             PlayBar.WindowChanged += OnWindowChanged;
             FunctionList.FunctionSelected += OnFunctionSelected;
+            FunctionList.CountFilterChanged += OnFunctionFilterChanged;
             GraphView.NeighborSelected += OnGraphNeighborSelected;
             CallList.CallSelected += (_, rec) => { Hex.GoTo(rec.Destination); ShowCallStack(rec); };
             // Reverse of the function-click → call sync: when the user clicks a row in
@@ -821,6 +823,7 @@ namespace Cda.App
             // sees _capture != cap); closing the handle here would pull it out from
             // under an in-progress ReadProcessMemory.
             if (cap != null && !_polling) { try { cap.Dispose(); } catch { } }
+            UpdateClearCallsState();
         }
 
         // --- attach to a live process (read-only discovery) ------------------
@@ -1530,6 +1533,7 @@ namespace Cda.App
             }));
             _dllCapture.DllHooked += h => Dispatcher.BeginInvoke(new Action(() => OnDllHooked(h)));
             _dllCapture.Start();
+            UpdateClearCallsState();
         }
 
         // Raised (marshalled to the UI thread) once the target DLL is hooked at
@@ -1586,6 +1590,7 @@ namespace Cda.App
         private void StopDllCapture()
         {
             if (_dllCapture != null) { _dllCapture.Stop(); _dllCapture = null; }
+            UpdateClearCallsState();
         }
 
         // --- follow a process and its children (instrument the whole tree) ----
@@ -1660,11 +1665,13 @@ namespace Cda.App
             }));
             _childFollow = follow;
             follow.Start();
+            UpdateClearCallsState();
         }
 
         private void StopChildFollow()
         {
             if (_childFollow != null) { _childFollow.Stop(); _childFollow = null; }
+            UpdateClearCallsState();
         }
 
         // --- child-follow multi-target view (Stage 3) -------------------------
@@ -2344,6 +2351,7 @@ namespace Cda.App
             Diag($"hardware bp: watching 0x{_selectedFunctionAddr:X} via a CPU debug register (no memory modified). " +
                  "Attaching as a debugger — if the target also anti-debugs, it may notice.");
             hb.Start();
+            UpdateClearCallsState();
             StatusText.Text = $"Capturing (hardware bp) · 0x{_selectedFunctionAddr:X} · 0 calls";
         }
 
@@ -2372,6 +2380,7 @@ namespace Cda.App
         private void StopHwbp()
         {
             if (_hwbp != null) { _hwbp.Stop(); _hwbp = null; }
+            UpdateClearCallsState();
         }
 
         // --- "Called by" tree (B) and per-call "Call stack" (A) ----------------
@@ -3134,6 +3143,8 @@ namespace Cda.App
             var cap = _capture;
             if (cap == null || _polling) return; // skip if a previous poll is still draining
 
+            UpdateClearCallsState(); // a live poll loop is running — Clear calls is available
+
             // Stop cleanly if the target has exited. A dead target makes Poll() drain
             // nothing without error, which would otherwise leave the trace stuck on
             // "running" and let a later click-to-refocus try to allocate in a gone
@@ -3229,6 +3240,10 @@ namespace Cda.App
             // for the chains — and the _polling guard keeps the poll and the
             // resolver's caches touched by one thread at a time. The UI thread is
             // left with only cheap dictionary folds and the WPF row adds.
+            // Snapshot the clear generation BEFORE going off the UI thread: if a
+            // "Clear calls" runs while this poll is decoding, the batch we drained
+            // belongs to the pre-clear trace and must be dropped (see below).
+            int clearGen = _captureClearGen;
             _polling = true;
             PolledBatch batch;
             try
@@ -3253,6 +3268,13 @@ namespace Cda.App
             // StopCaptureQuietly handed off to us (they couldn't close its handle
             // while Poll was still reading through it).
             if (!ReferenceEquals(_capture, cap)) { try { cap.Dispose(); } catch { } return; }
+
+            // "Clear calls" ran while this batch was decoding off the UI thread. The
+            // records were drained from the ring before the clear, so showing them now
+            // would resurrect the very calls the user just cleared. Drop the batch —
+            // Poll() already advanced the ring read cursor, so the same capture keeps
+            // recording from where it is; only this stale batch is discarded.
+            if (clearGen != _captureClearGen) return;
 
             var recs = batch.Records;
             var chains = batch.Chains;
@@ -3408,6 +3430,128 @@ namespace Cda.App
             {
                 StatusText.Text = "Capture stopped · no calls recorded.";
             }
+
+            UpdateClearCallsState();
+        }
+
+        // --- clear captured calls, keep capturing ---------------------------
+
+        // Reset everything the host has accumulated for the current trace — the calls
+        // log, per-function counts + first-call order, the caller tree, and the
+        // butterfly graph — WITHOUT tearing down the live capture. The hooks stay
+        // installed and the poll loop keeps running, so subsequent calls are recorded
+        // fresh. This is the "clear previous calls and continue" action: reset the log,
+        // then exercise one path in the target and see only what that triggers.
+        // Contrast Stop capture, which removes the hooks and freezes the trace.
+        private void OnClearCalls(object sender, RoutedEventArgs e)
+        {
+            // Defensive: the button is greyed out when nothing is running, but a stale
+            // click could still arrive — don't wipe a loaded/stopped trace out from
+            // under the user.
+            if (!IsCaptureRunning())
+            {
+                StatusText.Text = _offlineTrace
+                    ? "Clear calls is for a live capture — this is an offline trace. Open it again to start fresh."
+                    : "No live capture running — start a capture, then Clear calls resets the log while it keeps recording.";
+                return;
+            }
+
+            // Bump the clear generation so a batch already drained from the ring but
+            // still decoding off the UI thread is dropped instead of reappearing. (Only
+            // the _capture poll loop reads this; the callback-driven captures — hardware
+            // bp and child-follow — run on the UI thread, so it's a harmless no-op there.)
+            _captureClearGen++;
+
+            // Child-follow drives the views from the SELECTED child's retained records
+            // (not _captured alone), so reset that target's records + running count too;
+            // the follow engine keeps instrumenting and repopulates as calls arrive.
+            if (_childView && _childSelectedPid >= 0 &&
+                _childTargets.TryGetValue(_childSelectedPid, out var t))
+            {
+                t.Records.Clear();
+                t.TotalCalls = 0;
+                t.Item.Display = ChildLabel(t);
+            }
+
+            ClearCapturedCalls();
+
+            string what =
+                _capture != null ? $"{_capture.HookedCount} hook(s)" :
+                _hwbp != null    ? $"{_hwbp.BreakpointCount} breakpoint(s)" :
+                _childView       ? $"pid {_childSelectedPid}" : "live capture";
+            Diag($"✓ Cleared captured calls — capturing continues · {what} · 0 calls");
+        }
+
+        // "Only new on left" toggled by the user (Click fires on real interaction only —
+        // never on the XAML initial value or a programmatic change — so this can't misfire
+        // at startup). Apply it to the function list right away: ticked hides functions
+        // with no calls (and reveals each live as it's first called); unticked restores
+        // the full list. It also still gates what Clear calls does to the left (see
+        // ClearCapturedCalls). Works during a live capture and on a loaded/offline trace.
+        private void OnFilterLeftOnClearClicked(object sender, RoutedEventArgs e)
+        {
+            if (FilterLeftOnClear.IsChecked == true) FunctionList.HideZeroHit();
+            else FunctionList.ShowAllCounts();
+        }
+
+        // Keep the toolbar checkbox in lockstep with the function list's own filter
+        // buttons: ticked iff the list is hiding 0-hit functions, else unticked (a
+        // plain "Show all" or an "Only N hits" filter is not the "only new" state).
+        // Setting IsChecked programmatically raises Checked/Unchecked but NOT Click, so
+        // this never loops back into OnFilterLeftOnClearClicked. The event isn't raised
+        // on dataset loads / ResetCounts, so launching or clearing won't flip the
+        // checkbox out from under the user.
+        private void OnFunctionFilterChanged(object? sender, EventArgs e)
+        {
+            if (FilterLeftOnClear != null) FilterLeftOnClear.IsChecked = FunctionList.IsHidingZeroHit;
+        }
+
+        // A live capture of any kind is active — matches the concurrency guard the start
+        // handlers use: the _capture poll loop (Start capture / Windows API / IAT /
+        // Launch & capture / Capture DLL after load), a DLL-at-load debug loop before
+        // the DLL maps, a child-follow tree, or a hardware-breakpoint debugger.
+        private bool IsCaptureRunning() =>
+            _capture != null || _dllCapture != null || _childFollow != null || _hwbp != null;
+
+        // Enable "Clear calls" only while a live capture is running — there's nothing to
+        // clear-and-continue otherwise. Called from every capture start/stop transition;
+        // the Stop paths recompute (rather than blindly disable), so it stays enabled if
+        // another capture mode is still active (e.g. selecting a child while following).
+        private void UpdateClearCallsState()
+        {
+            if (ClearCallsButton != null) ClearCallsButton.IsEnabled = IsCaptureRunning();
+        }
+
+        // Reset the host-side accumulated trace (calls log, function counts, caller
+        // tree, and butterfly graph) shared by the clear paths. Leaves the live
+        // session / hooks / poll loop untouched.
+        private void ClearCapturedCalls()
+        {
+            _captured.Clear();
+            CallList.Clear();
+            FunctionList.ResetCounts(); // zeroes counts AND first-call ranks (resets to "show all")
+            // Optionally show only the calls captured SINCE the clear on the left, too:
+            // hide every function with no post-clear calls, and (live) reveal each one as
+            // it is first called. Controlled by the "Only new on left" toggle; "Show all"
+            // in the function list restores the rest. (When off, ResetCounts above already
+            // left the full list visible with counts zeroed.)
+            if (FilterLeftOnClear?.IsChecked == true) FunctionList.HideZeroHit();
+
+            // Caller tree + per-call stack: drop the folded reverse-edge map and the
+            // panels. Keep _callersFor so the tree refills for the same function as new
+            // calls arrive; show an empty tree now for immediate feedback.
+            ClearCallerGraph();
+            CallStack.Clear();
+            if (_callersFor != 0) { EnsureCallerIndex(); RefreshCallersView(); }
+            else Callers.Clear();
+
+            // Butterfly graph: it aggregates from _model.Records, which points at
+            // _captured by reference, so re-point at the now-empty list (this also
+            // clears the active node/link highlight) and rebuild the centred
+            // neighbourhood with zero counts.
+            _model.UseLiveRecords(_captured);
+            if (_selectedFunctionAddr != 0) GraphView.SetSelected(_selectedFunctionAddr);
+            else GraphView.RefreshActive();
         }
 
         // --- copy results to clipboard --------------------------------------

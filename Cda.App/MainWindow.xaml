@@ -51,6 +51,11 @@
                 <Button Content="Capture (hardware bp)" Padding="12,4" Margin="0,0,8,6" Click="OnCaptureHwbp"
                         ToolTip="Trace the SELECTED function using a CPU debug register (hardware breakpoint) — writes NOTHING to the target's memory, so it captures binaries that both checksum their code and can't be IAT-hooked. Attaches as a debugger (an anti-debug target may notice), watches up to 4 addresses, x64 only. Attach, click a function, then click this." />
                 <Button Content="Stop capture" Padding="12,4" Margin="0,0,8,6" Click="OnStopCapture" />
+                <Button Content="Clear calls" x:Name="ClearCallsButton" IsEnabled="False" Padding="12,4" Margin="0,0,8,6" Click="OnClearCalls"
+                        ToolTip="Clear the recorded calls, counts, caller tree, and graph shown so far and KEEP capturing — the hooks stay installed, so subsequent calls are recorded fresh. Use it to reset the log, then exercise one action in the target to see only what that triggers. (Live capture only; Stop capture removes the hooks and freezes the trace for review instead.)" />
+                <CheckBox x:Name="FilterLeftOnClear" Content="Only new on left" IsChecked="True" Click="OnFilterLeftOnClearClicked"
+                          Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" Margin="0,0,8,6"
+                          ToolTip="Filter the function list (left) to show only functions that have calls — they appear live as they run (equivalent to the list's Hide 0-hit; Show all restores the rest). Toggling applies to the list immediately, and also controls whether Clear calls filters the left to just the functions hit since the clear. Uncheck to show the full function list." />
                 <Button Content="Copy results" Padding="12,4" Margin="0,0,8,6" Click="OnCopyResults"
                         ToolTip="Copy the captured calls (and the current diagnostic state) to the clipboard as text, so you can paste them elsewhere." />
                 <Button Content="Save trace…" Padding="12,4" Margin="0,0,8,6" Click="OnSaveTrace"

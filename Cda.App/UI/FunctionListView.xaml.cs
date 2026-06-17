@@ -109,11 +109,29 @@ namespace Cda.App.UI
 
         public event EventHandler<ulong>? FunctionSelected;
 
+        /// <summary>
+        /// Raised when one of the call-count filter operations runs (Hide 0-hit / Only N
+        /// hits / Show all), so a host can mirror the state — e.g. keep a toolbar
+        /// "only new" checkbox in lockstep. NOT raised on dataset loads or
+        /// <see cref="ResetCounts"/> (which reset to "show all" but must not disturb that
+        /// preference), since those don't go through the filter methods below.
+        /// </summary>
+        public event EventHandler? CountFilterChanged;
+
+        /// <summary>True while the list is hiding never-called functions (Hide 0-hit).</summary>
+        public bool IsHidingZeroHit => _countMode == CountFilterMode.NonZero;
+
         public FunctionListView()
         {
             InitializeComponent();
             _view = CollectionViewSource.GetDefaultView(_rows);
             _view.Filter = FilterRow;
+            // Register CallCount for live filtering so "Hide 0-hit" updates as calls
+            // arrive: a function that goes from 0 to >0 calls appears the moment it's
+            // first called, without re-applying the filter. Live filtering is toggled
+            // on only for that mode (see SetLiveFiltering); the other modes stay snapshots.
+            if (_view is ICollectionViewLiveShaping shaping)
+                shaping.LiveFilteringProperties.Add(nameof(FunctionRow.CallCount));
             Grid.ItemsSource = _view;
             GridCopy.Enable(Grid, selectRowOnRightClick: false); // selecting a function refocuses a live trace
         }
@@ -137,6 +155,7 @@ namespace Cda.App.UI
                 _byAddress[fn.Address] = row;
             }
             _countMode = CountFilterMode.All; // a fresh dataset always starts fully visible
+            SetLiveFiltering(false);          // snapshot default until "Hide 0-hit" is applied
             _firstCallOrderNext = 0;          // ranks restart with the new dataset
             _view.SortDescriptions.Clear();   // drop any call-order/column sort; show natural order
             _view.Refresh();
@@ -160,6 +179,7 @@ namespace Cda.App.UI
                 _byAddress[fn.Address] = row;
             }
             _countMode = CountFilterMode.All; // a fresh dataset always starts fully visible
+            SetLiveFiltering(false);          // snapshot default until "Hide 0-hit" is applied
             _firstCallOrderNext = 0;          // ranks restart with the new dataset
             _view.SortDescriptions.Clear();   // drop any call-order/column sort; show natural order
             _view.Refresh();
@@ -206,6 +226,12 @@ namespace Cda.App.UI
             }
             if (hits == null) return;
             foreach (var kv in hits) kv.Key.AddCalls(kv.Value);
+
+            // In the live "Hide 0-hit" view (e.g. after Clear calls), rows appear as
+            // their counts cross zero; refresh the "showing X of Y" readout so it tracks
+            // the functions revealed so far instead of going stale at the post-clear 0.
+            // Gated to that mode so a normal capture keeps paying nothing per poll.
+            if (_countMode == CountFilterMode.NonZero) UpdateMatchInfo();
         }
 
         /// <summary>
@@ -227,8 +253,10 @@ namespace Cda.App.UI
             foreach (var r in _rows) { r.SetCalls(0); r.ResetFirstCall(); }
             _firstCallOrderNext = 0; // first-call ranks restart with the new capture
             // The counts just went to zero; a stale count filter (e.g. "Hide 0-hit")
-            // would now hide almost everything, so fall back to showing all.
+            // would now hide almost everything, so fall back to showing all. (A caller
+            // that wants only the post-reset calls re-applies HideZeroHit afterwards.)
             _countMode = CountFilterMode.All;
+            SetLiveFiltering(false);
             _view.Refresh();
             UpdateMatchInfo();
         }
@@ -282,11 +310,17 @@ namespace Cda.App.UI
 
         // --- call-count filter (Hide 0-hit / Only N hits / Show all) ---------
 
-        /// <summary>Hide functions with zero recorded calls (keep only those hit).</summary>
+        /// <summary>
+        /// Hide functions with zero recorded calls (keep only those hit). Updates live:
+        /// a function appears the moment its count crosses zero, so after a capture
+        /// reset only the functions called since then are shown, filling in as they run.
+        /// </summary>
         public void HideZeroHit()
         {
             _countMode = CountFilterMode.NonZero;
+            SetLiveFiltering(true); // reveal newly-called functions as calls arrive
             ApplyCountFilter();
+            CountFilterChanged?.Invoke(this, EventArgs.Empty);
         }
 
         /// <summary>Show only functions whose call count equals <paramref name="n"/>.</summary>
@@ -294,14 +328,27 @@ namespace Cda.App.UI
         {
             _countMode = CountFilterMode.Exact;
             _countExact = n;
+            SetLiveFiltering(false); // a snapshot of the count when applied (no live flicker)
             ApplyCountFilter();
+            CountFilterChanged?.Invoke(this, EventArgs.Empty);
         }
 
         /// <summary>Clear the call-count filter — restore the full function list.</summary>
         public void ShowAllCounts()
         {
             _countMode = CountFilterMode.All;
+            SetLiveFiltering(false);
             ApplyCountFilter();
+            CountFilterChanged?.Invoke(this, EventArgs.Empty);
+        }
+
+        // Toggle live filtering on the view. On (only in "Hide 0-hit" mode) re-evaluates
+        // a row's visibility whenever its CallCount changes, so newly-called functions
+        // appear live during capture. Off restores snapshot behaviour for the other modes.
+        private void SetLiveFiltering(bool on)
+        {
+            if (_view is ICollectionViewLiveShaping shaping && shaping.IsLiveFiltering != on)
+                shaping.IsLiveFiltering = on;
         }
 
         private void OnHideZeroHit(object sender, RoutedEventArgs e) => HideZeroHit();

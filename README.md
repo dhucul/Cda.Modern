@@ -197,6 +197,19 @@ calls you care about (e.g. by callee or argument). Every call is still recorded 
 the target; the filter is applied host-side as batches arrive, so it narrows the
 log live without re-instrumenting.
 
+**Clear calls (reset, keep capturing).** Reset the recorded calls, per-function
+counts, caller tree, and graph shown so far **without** removing the hooks — the
+capture keeps running, so subsequent calls are recorded fresh. Use it to clear the
+noise, then exercise one action in the target and see only what that triggers (any
+batch already drained from the ring but mid-decode is dropped, so pre-clear calls
+can't reappear). With **Only new on left** ticked (the default, beside the button),
+the function list also switches to its live **Hide 0-hit** view, so the left pane
+fills in with just the functions hit *since* the clear, as they run; untick it to keep
+the full list with counts zeroed. Toggling that checkbox also applies to the list
+immediately (tick = hide 0-hit, untick = show all), during a live capture or on a
+loaded trace. The button is enabled only while a capture is live; **Stop capture**
+instead removes the hooks and freezes the trace for review.
+
 **Strings (cross-references).** After **Open module**, **Launch & capture**, or
 **Attach** (the latter two read the live process straight through
 `ReadProcessMemory`), the Strings tab lists every printable string found in the
@@ -300,9 +313,11 @@ the current build's architecture.
   Enter), and **Show all** restores the list. The count filter is non-destructive — it
   hides rows rather than deleting them, composes with the text filter, and leaves live
   counting, the graph, and the dataset untouched — and a "showing X of Y" readout
-  reports how many remain. It's a snapshot of the counts when applied, so re-click it
-  to re-prune as more calls arrive (the **Call order** sort is likewise a snapshot —
-  re-click to re-apply once more functions have been hit).
+  reports how many remain. **Hide 0-hit** updates **live** — a function appears the
+  moment it's first called — so it pairs with **Clear calls** to watch only the
+  functions a specific action exercises. **Only _N_ hits** is a snapshot of the counts
+  when applied, so re-click it to re-prune as more calls arrive (the **Call order** sort
+  is likewise a snapshot — re-click to re-apply once more functions have been hit).
 - **Call graph (center)** — a **caller/callee ("butterfly") view** centered on the
   selected function: who calls it (left) and what it calls (right), each labeled
   and weighted by observed call count. Click a neighbor to walk the call
