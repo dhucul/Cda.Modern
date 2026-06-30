@@ -41,12 +41,12 @@ namespace Cda.App.UI
         private bool _hasSelection;
         private const long MaxCopyBytes = 1 << 20; // cap a copy at 1 MB
 
-        private static readonly Brush BgBrush = Frozen(Color.FromRgb(0x10, 0x14, 0x1B));
-        private static readonly Brush AddrBrush = Frozen(Color.FromRgb(0x6B, 0x8F, 0xD6));
-        private static readonly Brush HexBrush = Frozen(Color.FromRgb(0xE6, 0xEA, 0xF0));
-        private static readonly Brush AsciiBrush = Frozen(Color.FromRgb(0x8F, 0xC1, 0x8A));
-        private static readonly Brush DimBrush = Frozen(Color.FromRgb(0x4A, 0x54, 0x62));
-        private static readonly Brush SelBrush = Frozen(Color.FromArgb(0x66, 0x4D, 0x8D, 0xF7));
+        private static readonly Brush BgBrush = Frozen(Color.FromRgb(0x1B, 0x20, 0x28));
+        private static readonly Brush AddrBrush = Frozen(Color.FromRgb(0x88, 0xAE, 0xDE));
+        private static readonly Brush HexBrush = Frozen(Color.FromRgb(0xF2, 0xF5, 0xFA));
+        private static readonly Brush AsciiBrush = Frozen(Color.FromRgb(0xB4, 0xDC, 0x90));
+        private static readonly Brush DimBrush = Frozen(Color.FromRgb(0x4F, 0x59, 0x6B));
+        private static readonly Brush SelBrush = Frozen(Color.FromArgb(0x66, 0x60, 0x90, 0xD4));
 
         public HexView()
         {

@@ -36,13 +36,13 @@ namespace Cda.App.Visualization
 
         // --- palette (frozen) ----------------------------------------------
         private static readonly Brush Bg = VisualTheme.Background;
-        private static readonly Brush MoreFill = Frozen(Color.FromRgb(0x3F, 0xB9, 0x50)); // green: more in B / new
-        private static readonly Brush LessFill = Frozen(Color.FromRgb(0xF8, 0x51, 0x49)); // red: fewer in B / removed
-        private static readonly Brush LabelText = Frozen(Color.FromRgb(0xE6, 0xEA, 0xF0));
-        private static readonly Brush SubText = Frozen(Color.FromRgb(0xAE, 0xB7, 0xC4));
-        private static readonly Brush HintText = Frozen(Color.FromRgb(0x79, 0x82, 0x8F));
-        private static readonly Pen ZeroPen = FrozenPen(Color.FromRgb(0x3A, 0x44, 0x52), 1.0);
-        private static readonly Pen HoverPen = FrozenPen(Color.FromRgb(0xE6, 0xEA, 0xF0), 1.4);
+        private static readonly Brush MoreFill = Frozen(Color.FromRgb(0xB4, 0xDC, 0x90)); // green: more in B / new
+        private static readonly Brush LessFill = Frozen(Color.FromRgb(0xD8, 0x5F, 0x6A)); // red: fewer in B / removed
+        private static readonly Brush LabelText = Frozen(Color.FromRgb(0xF2, 0xF5, 0xFA));
+        private static readonly Brush SubText = Frozen(Color.FromRgb(0xDC, 0xE2, 0xEC));
+        private static readonly Brush HintText = Frozen(Color.FromRgb(0x8A, 0x95, 0xA9));
+        private static readonly Pen ZeroPen = FrozenPen(Color.FromRgb(0x40, 0x49, 0x59), 1.0);
+        private static readonly Pen HoverPen = FrozenPen(Color.FromRgb(0xF2, 0xF5, 0xFA), 1.4);
 
         private readonly Typeface _face =
             new(new FontFamily("Segoe UI"), FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);

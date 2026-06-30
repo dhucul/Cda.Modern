@@ -7,9 +7,9 @@
         WindowStartupLocation="CenterOwner"
         Background="{StaticResource Background}">
     <Window.Resources>
-        <SolidColorBrush x:Key="MoreBrush"   Color="#3FB950" />
-        <SolidColorBrush x:Key="LessBrush"   Color="#F85149" />
-        <SolidColorBrush x:Key="ChangeBrush" Color="#E0B341" />
+        <SolidColorBrush x:Key="MoreBrush"   Color="#B4DC90" />
+        <SolidColorBrush x:Key="LessBrush"   Color="#D85F6A" />
+        <SolidColorBrush x:Key="ChangeBrush" Color="#F2D08A" />
 
         <!-- Status-cell colouring shared by both tables (keys off the row's Kind). -->
         <Style x:Key="StatusCell" TargetType="TextBlock" BasedOn="{StaticResource GridCellText}">

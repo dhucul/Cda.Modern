@@ -13,14 +13,14 @@ namespace Cda.App.Visualization
     /// </summary>
     public static class VisualTheme
     {
-        public static readonly Brush Background = Freeze(new SolidColorBrush(Color.FromRgb(0x0E, 0x11, 0x16)));
-        public static readonly Brush IdleNode = Freeze(new SolidColorBrush(Color.FromRgb(0x4A, 0x54, 0x62)));
-        public static readonly Brush ActiveNode = Freeze(new SolidColorBrush(Color.FromRgb(0xE0, 0xB3, 0x41)));
-        public static readonly Brush ModuleLabel = Freeze(new SolidColorBrush(Color.FromRgb(0xAE, 0xB7, 0xC4)));
+        public static readonly Brush Background = Freeze(new SolidColorBrush(Color.FromRgb(0x1B, 0x20, 0x28)));
+        public static readonly Brush IdleNode = Freeze(new SolidColorBrush(Color.FromRgb(0x4F, 0x59, 0x6B)));
+        public static readonly Brush ActiveNode = Freeze(new SolidColorBrush(Color.FromRgb(0xF2, 0xD0, 0x8A)));
+        public static readonly Brush ModuleLabel = Freeze(new SolidColorBrush(Color.FromRgb(0xDC, 0xE2, 0xEC)));
 
         // Warm source -> cool destination, so an edge still encodes call direction.
-        public static readonly Color LinkSource = Color.FromRgb(0xCB, 0x6B, 0x52);
-        public static readonly Color LinkDest = Color.FromRgb(0x4D, 0x8D, 0xF7);
+        public static readonly Color LinkSource = Color.FromRgb(0xE0, 0x92, 0x6F);
+        public static readonly Color LinkDest = Color.FromRgb(0x60, 0x90, 0xD4);
 
         // Two-tone pens let us show call direction (source half warm, dest half
         // blue) without allocating a gradient brush per edge per frame.
@@ -28,7 +28,7 @@ namespace Cda.App.Visualization
         public static readonly Pen LinkDestPen = Freeze(new Pen(new SolidColorBrush(LinkDest), 1.0));
 
         public static readonly Pen ModuleBoxPen =
-            Freeze(new Pen(new SolidColorBrush(Color.FromArgb(0x3A, 0xAE, 0xB7, 0xC4)), 1.0));
+            Freeze(new Pen(new SolidColorBrush(Color.FromArgb(0x3A, 0x8A, 0x95, 0xA9)), 1.0));
 
         public const double NodeSize = 4.0;        // DIPs
         public const double LabelFontSize = 11.0;  // DIPs

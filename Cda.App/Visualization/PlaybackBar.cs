@@ -44,13 +44,13 @@ namespace Cda.App.Visualization
 
         private bool _draggingCursor, _draggingSelection;
 
-        private static readonly Brush Bg = Frozen(Color.FromRgb(0x12, 0x16, 0x1D));
-        private static readonly Brush Density = Frozen(Color.FromArgb(0xFF, 0x4E, 0x7A, 0xC0));
-        private static readonly Brush CursorBand = Frozen(Color.FromArgb(0x55, 0xE0, 0xB3, 0x41));
-        private static readonly Pen CursorPen = FrozenPen(Color.FromRgb(0xE0, 0xB3, 0x41), 1.0);
-        private static readonly Brush SelectionBand = Frozen(Color.FromArgb(0x33, 0x4D, 0x8D, 0xF7));
-        private static readonly Pen AxisPen = FrozenPen(Color.FromArgb(0x55, 0xAE, 0xB7, 0xC4), 1.0);
-        private static readonly Pen FocusPen = FrozenPen(Color.FromArgb(0x99, 0x4D, 0x8D, 0xF7), 1.0);
+        private static readonly Brush Bg = Frozen(Color.FromRgb(0x21, 0x27, 0x2F));
+        private static readonly Brush Density = Frozen(Color.FromArgb(0xFF, 0x60, 0x90, 0xD4));
+        private static readonly Brush CursorBand = Frozen(Color.FromArgb(0x55, 0xF2, 0xD0, 0x8A));
+        private static readonly Pen CursorPen = FrozenPen(Color.FromRgb(0xF2, 0xD0, 0x8A), 1.0);
+        private static readonly Brush SelectionBand = Frozen(Color.FromArgb(0x33, 0x60, 0x90, 0xD4));
+        private static readonly Pen AxisPen = FrozenPen(Color.FromArgb(0x55, 0x8A, 0x95, 0xA9), 1.0);
+        private static readonly Pen FocusPen = FrozenPen(Color.FromArgb(0x99, 0x60, 0x90, 0xD4), 1.0);
 
         public PlaybackBar()
         {
@@ -272,7 +272,7 @@ namespace Cda.App.Visualization
                 var ft = new FormattedText(t.ToString("0.000") + "s",
                     System.Globalization.CultureInfo.CurrentUICulture,
                     FlowDirection.LeftToRight, tf, 9,
-                    new SolidColorBrush(Color.FromArgb(0xAA, 0xAE, 0xB7, 0xC4)), dpi);
+                    new SolidColorBrush(Color.FromArgb(0xAA, 0x8A, 0x95, 0xA9)), dpi);
                 double tx = Math.Min(Math.Max(0, x - ft.Width / 2), w - ft.Width);
                 dc.DrawText(ft, new Point(tx, h - 11));
             }

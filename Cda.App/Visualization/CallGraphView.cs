@@ -63,22 +63,22 @@ namespace Cda.App.Visualization
 
         // --- palette (frozen) ----------------------------------------------
         private static readonly Brush Bg = VisualTheme.Background;
-        private static readonly Brush NodeFill = Frozen(Color.FromRgb(0x1B, 0x22, 0x30));
-        private static readonly Brush NodeText = Frozen(Color.FromRgb(0xE6, 0xEA, 0xF0));
-        private static readonly Brush SubText = Frozen(Color.FromRgb(0xAE, 0xB7, 0xC4));
-        private static readonly Brush HintText = Frozen(Color.FromRgb(0x79, 0x82, 0x8F));
+        private static readonly Brush NodeFill = Frozen(Color.FromRgb(0x27, 0x2D, 0x37));
+        private static readonly Brush NodeText = Frozen(Color.FromRgb(0xF2, 0xF5, 0xFA));
+        private static readonly Brush SubText = Frozen(Color.FromRgb(0xDC, 0xE2, 0xEC));
+        private static readonly Brush HintText = Frozen(Color.FromRgb(0x8A, 0x95, 0xA9));
         private static readonly Brush CallerBrush = Frozen(VisualTheme.LinkSource);
         private static readonly Brush CalleeBrush = Frozen(VisualTheme.LinkDest);
-        private static readonly Brush CenterBrush = Frozen(Color.FromRgb(0xE0, 0xB3, 0x41));
+        private static readonly Brush CenterBrush = Frozen(Color.FromRgb(0xF2, 0xD0, 0x8A));
         private static readonly Pen CallerPen = FrozenPen(VisualTheme.LinkSource, 1.4);
         private static readonly Pen CalleePen = FrozenPen(VisualTheme.LinkDest, 1.4);
-        private static readonly Pen CenterPen = FrozenPen(Color.FromRgb(0xE0, 0xB3, 0x41), 1.6);
-        private static readonly Pen HoverPen = FrozenPen(Color.FromRgb(0xE6, 0xEA, 0xF0), 1.6);
+        private static readonly Pen CenterPen = FrozenPen(Color.FromRgb(0xF2, 0xD0, 0x8A), 1.6);
+        private static readonly Pen HoverPen = FrozenPen(Color.FromRgb(0xF2, 0xF5, 0xFA), 1.6);
 
         // Diff palette: green = more / new, red = fewer / removed, grey = unchanged.
-        private static readonly Color MoreColor = Color.FromRgb(0x3F, 0xB9, 0x50);
-        private static readonly Color LessColor = Color.FromRgb(0xF8, 0x51, 0x49);
-        private static readonly Color SameColor = Color.FromRgb(0x6A, 0x73, 0x80);
+        private static readonly Color MoreColor = Color.FromRgb(0xB4, 0xDC, 0x90);
+        private static readonly Color LessColor = Color.FromRgb(0xD8, 0x5F, 0x6A);
+        private static readonly Color SameColor = Color.FromRgb(0x78, 0x86, 0xA2);
         private static readonly Brush MoreBrush = Frozen(MoreColor);
         private static readonly Brush LessBrush = Frozen(LessColor);
         private static readonly Brush SameBrush = Frozen(SameColor);
