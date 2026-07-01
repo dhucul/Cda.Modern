@@ -11,28 +11,45 @@
              reference these keys rather than hardcoding hex values.
              ===================================================================== -->
 
+        <!-- ============================================================
+             Palette: KvArcDark (the Arc Dark look). Cool blue-grey window
+             and view tones, dark hairline borders, and the signature Arc
+             blue (#5294E2) as the accent/selection colour.
+             ============================================================ -->
+
         <!-- Surfaces (back to front) -->
-        <SolidColorBrush x:Key="Background"    Color="#1B2028" />
-        <SolidColorBrush x:Key="Surface"       Color="#272D37" />
-        <SolidColorBrush x:Key="Surface2"      Color="#343C4A" />
-        <SolidColorBrush x:Key="SurfaceAlt"    Color="#21272F" />
+        <SolidColorBrush x:Key="Background"    Color="#383C4A" />  <!-- window bg_color -->
+        <SolidColorBrush x:Key="Surface"       Color="#2F343F" />  <!-- headerbar / toolbar / panels -->
+        <SolidColorBrush x:Key="Surface2"      Color="#404552" />  <!-- raised: column headers, tracks -->
+        <SolidColorBrush x:Key="SurfaceAlt"    Color="#353A47" />  <!-- alt rows / inset -->
 
         <!-- Lines / outlines -->
-        <SolidColorBrush x:Key="Outline"       Color="#404959" />
-        <SolidColorBrush x:Key="OutlineStrong" Color="#4F596B" />
+        <SolidColorBrush x:Key="Outline"       Color="#2B2E39" />  <!-- Arc dark border -->
+        <SolidColorBrush x:Key="OutlineStrong" Color="#4B5162" />
 
         <!-- Text tiers -->
-        <SolidColorBrush x:Key="TextPrimary"   Color="#F0F3F8" />
-        <SolidColorBrush x:Key="OnSurface"     Color="#F0F3F8" />
-        <SolidColorBrush x:Key="TextSecondary" Color="#DCE2EC" />
-        <SolidColorBrush x:Key="TextMuted"     Color="#8A95A9" />
+        <SolidColorBrush x:Key="TextPrimary"   Color="#D3DAE3" />  <!-- Arc fg_color -->
+        <SolidColorBrush x:Key="OnSurface"     Color="#D3DAE3" />
+        <SolidColorBrush x:Key="TextSecondary" Color="#C4CBD6" />
+        <SolidColorBrush x:Key="TextMuted"     Color="#7C818C" />  <!-- Arc insensitive fg -->
 
-        <!-- Accent + states -->
-        <SolidColorBrush x:Key="Accent"        Color="#6090D4" />
-        <SolidColorBrush x:Key="AccentHover"   Color="#84AEEC" />
-        <SolidColorBrush x:Key="AccentPressed" Color="#4A78B8" />
-        <SolidColorBrush x:Key="AccentSoft"    Color="#2C3C55" />
-        <SolidColorBrush x:Key="Selection"     Color="#36496A" />
+        <!-- Accent + states (Arc blue) -->
+        <SolidColorBrush x:Key="Accent"        Color="#5294E2" />
+        <SolidColorBrush x:Key="AccentHover"   Color="#6BA5E7" />
+        <SolidColorBrush x:Key="AccentPressed" Color="#4884CC" />
+        <SolidColorBrush x:Key="AccentSoft"    Color="#3A4358" />
+        <SolidColorBrush x:Key="Selection"     Color="#4E82C4" />
+
+        <!-- Arc button gradient (subtle top-lit vertical fill) and its states -->
+        <LinearGradientBrush x:Key="ButtonFace" StartPoint="0,0" EndPoint="0,1">
+            <GradientStop Offset="0" Color="#444A59" />
+            <GradientStop Offset="1" Color="#3A3F4D" />
+        </LinearGradientBrush>
+        <LinearGradientBrush x:Key="ButtonFaceHover" StartPoint="0,0" EndPoint="0,1">
+            <GradientStop Offset="0" Color="#4E5568" />
+            <GradientStop Offset="1" Color="#434A5A" />
+        </LinearGradientBrush>
+        <SolidColorBrush x:Key="ButtonFacePressed" Color="#33373F" />
 
         <!-- TreeView selection (the "Called by" caller tree). The stock TreeViewItem
              template colours a selected node from the system Highlight* brush keys,
@@ -40,16 +57,19 @@
              focused, washed-out light grey when not) made the light item text
              unreadable. Re-point those keys at the theme so a selected node matches
              the lists/grids. Colours mirror Selection / TextPrimary above. -->
-        <SolidColorBrush x:Key="{x:Static SystemColors.HighlightBrushKey}"                  Color="#36496A" />
-        <SolidColorBrush x:Key="{x:Static SystemColors.HighlightTextBrushKey}"              Color="#F0F3F8" />
-        <SolidColorBrush x:Key="{x:Static SystemColors.InactiveSelectionHighlightBrushKey}" Color="#36496A" />
-        <SolidColorBrush x:Key="{x:Static SystemColors.InactiveSelectionHighlightTextBrushKey}" Color="#F0F3F8" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.HighlightBrushKey}"                  Color="#4E82C4" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.HighlightTextBrushKey}"              Color="#FFFFFF" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.InactiveSelectionHighlightBrushKey}" Color="#4E82C4" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.InactiveSelectionHighlightTextBrushKey}" Color="#FFFFFF" />
 
         <!-- ============================ Button ============================ -->
+        <!-- Arc Dark button: subtle top-lit gradient face, dark hairline border,
+             ~3px rounding, light-grey label. Hover lifts the face and rings it in
+             Arc blue; pressed sinks to a flat dark inset. -->
         <Style TargetType="Button">
-            <Setter Property="Background" Value="{StaticResource SurfaceAlt}" />
+            <Setter Property="Background" Value="{StaticResource ButtonFace}" />
             <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
-            <Setter Property="BorderBrush" Value="#81A1C1" />
+            <Setter Property="BorderBrush" Value="{StaticResource Outline}" />
             <Setter Property="BorderThickness" Value="1" />
             <Setter Property="Padding" Value="12,5" />
             <Setter Property="FontSize" Value="12.5" />
@@ -61,20 +81,18 @@
                         <Border x:Name="bd" Background="{TemplateBinding Background}"
                                 BorderBrush="{TemplateBinding BorderBrush}"
                                 BorderThickness="{TemplateBinding BorderThickness}"
-                                CornerRadius="5" SnapsToDevicePixels="True">
+                                CornerRadius="3" SnapsToDevicePixels="True">
                             <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"
                                               Margin="{TemplateBinding Padding}" RecognizesAccessKey="True" />
                         </Border>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
-                                <Setter TargetName="bd" Property="Background" Value="{StaticResource Accent}" />
-                                <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource AccentHover}" />
-                                <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
+                                <Setter TargetName="bd" Property="Background" Value="{StaticResource ButtonFaceHover}" />
+                                <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource Accent}" />
                             </Trigger>
                             <Trigger Property="IsPressed" Value="True">
-                                <Setter TargetName="bd" Property="Background" Value="{StaticResource AccentPressed}" />
+                                <Setter TargetName="bd" Property="Background" Value="{StaticResource ButtonFacePressed}" />
                                 <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource AccentPressed}" />
-                                <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
                             </Trigger>
                             <Trigger Property="IsEnabled" Value="False">
                                 <Setter TargetName="bd" Property="Opacity" Value="0.45" />
