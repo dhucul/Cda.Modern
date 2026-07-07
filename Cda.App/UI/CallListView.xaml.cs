@@ -27,6 +27,7 @@ namespace Cda.App.UI
             public string Source { get; set; } = "";
             public string Dest { get; set; } = "";
             public string Args { get; set; } = "";
+            public string Return { get; set; } = "";
             public string Strings { get; set; } = "";
             public bool Bookmarked { get; set; }
             public CallRecord Record { get; set; } = null!;
@@ -204,6 +205,7 @@ namespace Cda.App.UI
                 Source = Describe(r.Source),
                 Dest = DescribeCallee(r.Destination, name),
                 Args = FormatArgs(r, name, strByArg),
+                Return = FormatReturn(r),
                 Strings = strs.ToString(),
                 Record = r,
             };
@@ -244,6 +246,19 @@ namespace Cda.App.UI
                     sb.Append("0x").Append(args[i].ToString("X"));
             }
             return sb.ToString();
+        }
+
+        // Return value column: the integer result (RAX/EAX) once the call has
+        // returned, with a decoded string if the value pointed at one. Blank when
+        // return capture was off, or while the return is still outstanding. (A return
+        // that lands in a later poll than its call updates the record but not this
+        // already-built row — most fast calls pair within one poll.)
+        private static string FormatReturn(CallRecord r)
+        {
+            if (!r.HasReturned) return "";
+            string s = "0x" + r.ReturnValue.ToString("X");
+            string? str = r.ReturnDereference?.AsString();
+            return str != null ? $"{s} \"{str}\"" : s;
         }
 
         // Callee label: "module!Name" when a real name is known, else module+0xRVA.
@@ -299,7 +314,7 @@ namespace Cda.App.UI
             if (o is not CallRow row) return true;
             if (_bookmarkedOnly && !row.Bookmarked) return false;
             if (_filterText.Length == 0) return true;
-            return Has(row.Source) || Has(row.Dest) || Has(row.Args) || Has(row.Strings) || Has(row.Seq);
+            return Has(row.Source) || Has(row.Dest) || Has(row.Args) || Has(row.Return) || Has(row.Strings) || Has(row.Seq);
 
             bool Has(string s) => s != null && s.Contains(_filterText, StringComparison.OrdinalIgnoreCase);
         }

@@ -35,6 +35,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Cda.Core\Cda.Core.csproj" />
+    <ProjectReference Include="..\Cda.Managed\Cda.Managed.csproj" />
   </ItemGroup>
 
 </Project>

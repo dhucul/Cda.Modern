@@ -40,6 +40,24 @@ namespace Cda.Core.Engine
         private bool _haveBase;
         private uint _readSeq;
 
+        // Return-value pairing: a call record is remembered by correlation id until
+        // its return record arrives (usually the same poll batch, sometimes a later
+        // one), whose value is folded into the call and then dropped. Bounded so a
+        // never-returning call (exception/tail-call) can't grow the map unboundedly.
+        private readonly bool _captureReturns;
+        private readonly Dictionary<uint, CallRecord> _outstanding = new();
+        private readonly Queue<uint> _outstandingOrder = new();
+        private const int MaxOutstanding = 200_000;
+
+        // x64 exception-safety for return capture: a first-chance VEH in the target that
+        // restores a redirected return address before an exception unwinds through it
+        // (see CaptureStub.BuildReturnVehX64). _vehRegistry is the target address of the
+        // ctx registry the handler iterates (0 when not installed — x86, or on failure).
+        private ulong _vehRegistry;
+        private int _vehCount;
+        private const int MaxVehContexts = 16384;
+        private const int VehScanBytes = 0x800000; // 8 MB: how far above the fault SP a redirected slot is looked for
+
         /// <summary>Records overwritten before a poll could read them (0 in normal use).</summary>
         public long RecordsLost { get; private set; }
 
@@ -79,13 +97,18 @@ namespace Cda.Core.Engine
         /// a 0xCxxxxxxx value is an NTSTATUS crash code, not a normal exit.</summary>
         public bool TryGetTargetExitCode(out uint code) => _process.TryGetExitCode(out code);
 
+        /// <summary>True if this session installs return-value capture (a return
+        /// stub + per-hook return slot on every inline hook).</summary>
+        public bool CapturesReturns => _captureReturns;
+
         private CaptureSession(TargetProcess process, RemoteCodeMemory code,
-            CaptureBuffer buffer, int argCount)
+            CaptureBuffer buffer, int argCount, bool captureReturns = false)
         {
             _process = process;
             _code = code;
             _buffer = buffer;
             ArgCount = argCount;
+            _captureReturns = captureReturns;
         }
 
         // Candidate locations for the bisection range file, checked in this order.
@@ -107,7 +130,7 @@ namespace Cda.Core.Engine
         public static CaptureSession Start(
             int pid, IEnumerable<ulong> functions, int maxFunctions, int bufferRecords,
             out int instrumented, out int skipped, out string? firstError,
-            IReadOnlyList<ModuleInfo>? knownModules = null)
+            IReadOnlyList<ModuleInfo>? knownModules = null, bool captureReturns = false)
         {
             var proc = TargetProcess.Attach(pid, forWrite: true);
             try
@@ -119,7 +142,11 @@ namespace Cda.Core.Engine
                 int recordSize = CaptureStub.RecordSize(argCount);
 
                 var buffer = CaptureBuffer.Create(code, bufferRecords, recordSize);
-                var session = new CaptureSession(proc, code, buffer, argCount);
+                var session = new CaptureSession(proc, code, buffer, argCount, captureReturns);
+
+                // Install the exception-safety VEH before any hook is armed, so it is live
+                // before the first return redirect (no-op unless return capture + x64).
+                session.TryRegisterReturnVeh();
 
                 // Validate that each candidate is a real function entry before we
                 // splice it. Discovery (CallSiteScanner) yields direct-call
@@ -233,37 +260,9 @@ namespace Cda.Core.Engine
                                 continue;
                             }
 
-                            // The stub is the detour the entry E9 jumps to, so it
-                            // must sit within +/-2GB of the function for that jump to
-                            // be the 5-byte form (and not the 14-byte FF25 that forces
-                            // a deep, fragile 14-byte steal). Allocate it near.
-                            ulong stub = memory.AllocateNear(StubBytesMax, func);
-
-                            // Build the trampoline + patch, but DO NOT arm the entry
-                            // yet. TryInstall reports the routine "can't safely hook
-                            // this site" outcomes (undecodable patch, branch into the
-                            // patch, un-relocatable trampoline) without throwing, so a
-                            // broad candidate sweep doesn't spray first-chance
-                            // exceptions into a debugger on every start.
-                            if (!InlineHook.TryInstall(arch, code, func, stub, activate: false,
-                                    out var hook, out string? skipReason, maxPatch))
-                            {
-                                skipped++;
-                                firstError ??= skipReason;
-                                continue;
-                            }
-
-                            byte[] stubBytes = CaptureStub.Build(proc.Is64Bit, stub, func,
-                                buffer.ControlAddress, buffer.DataAddress, hook!.Trampoline, argCount, buffer.SlotCount);
-                            if (stubBytes.Length > StubBytesMax) { skipped++; continue; }
-
-                            code.Write(stub, stubBytes);
-                            code.Flush(stub, stubBytes.Length);
-
-                            // Stub is fully written; now arm the entry detour.
-                            hook.Activate();
-                            session._hooks.Add(hook);
-                            instrumented++;
+                            if (session.InstallHook(func, arch, maxPatch, out string? skipReason))
+                                instrumented++;
+                            else { skipped++; firstError ??= skipReason; }
                         }
                         catch (Exception ex)
                         {
@@ -359,6 +358,151 @@ namespace Cda.Core.Engine
         }
 
         /// <summary>
+        /// Install one entry hook + capture stub (and, when return capture is on, a
+        /// return stub + per-hook return context) on a function entry, adding it to
+        /// <c>_hooks</c>. Shared by <see cref="Start"/> and <see cref="HookMore"/>.
+        /// The caller freezes the target's threads and is responsible for validating
+        /// that <paramref name="func"/> is a real entry — Start via the
+        /// <c>EntryPointGuard</c>; HookMore trusts ClrMD's managed-method entries,
+        /// which are authoritative but have no .pdata to validate against.
+        /// </summary>
+        private bool InstallHook(ulong func, ICpuArchitecture arch, int maxPatch, out string? skipReason)
+        {
+            skipReason = null;
+
+            // Stub within +/-2GB of the function so the entry jump is the 5-byte form.
+            ulong stub = _code.AllocateNear(StubBytesMax, func);
+
+            if (!InlineHook.TryInstall(arch, _code, func, stub, activate: false,
+                    out var hook, out skipReason, maxPatch))
+                return false;
+
+            // Return-value capture (opt-in): a private return context (zeroed → free)
+            // + a shared return stub; on failure, fall back to entry-only for this hook.
+            ulong retStub = 0, retCtx = 0;
+            if (_captureReturns)
+            {
+                try
+                {
+                    retCtx = _code.Allocate(CaptureStub.ReturnContextSize, executable: false);
+                    retStub = _code.Allocate(StubBytesMax, executable: true);
+                    byte[] rsb = CaptureStub.BuildReturnStub(_process.Is64Bit, retStub, func,
+                        _buffer.ControlAddress, _buffer.DataAddress, ArgCount, _buffer.SlotCount, retCtx);
+                    if (rsb.Length > StubBytesMax) { retStub = 0; retCtx = 0; }
+                    else { _code.Write(retStub, rsb); _code.Flush(retStub, rsb.Length); }
+                }
+                catch { retStub = 0; retCtx = 0; }
+
+                // Register this hook's return context with the x64 exception-safety VEH,
+                // so a fault unwinding through its redirected return is fixed up (see
+                // TryRegisterReturnVeh). Write the address, THEN bump the count, so the
+                // in-target handler never reads a half-added entry.
+                if (retCtx != 0 && _vehRegistry != 0 && _vehCount < MaxVehContexts)
+                {
+                    try
+                    {
+                        _code.Write(_vehRegistry + 8 + (ulong)_vehCount * 8, BitConverter.GetBytes(retCtx));
+                        _vehCount++;
+                        _code.Write(_vehRegistry, BitConverter.GetBytes((ulong)_vehCount));
+                    }
+                    catch { /* best effort — the hook still works without VEH coverage */ }
+                }
+            }
+
+            byte[] stubBytes = CaptureStub.Build(_process.Is64Bit, stub, func,
+                _buffer.ControlAddress, _buffer.DataAddress, hook!.Trampoline, ArgCount, _buffer.SlotCount,
+                retStub, retCtx);
+            if (stubBytes.Length > StubBytesMax) { skipReason = "capture stub exceeded size budget"; return false; }
+
+            _code.Write(stub, stubBytes);
+            _code.Flush(stub, stubBytes.Length);
+
+            hook.Activate();          // stub fully written; arm the entry detour
+            _hooks.Add(hook);
+            return true;
+        }
+
+        /// <summary>
+        /// Instrument additional function entries on a live session, reusing the same
+        /// inline-hook pipeline as <see cref="Start"/>. This is how managed (.NET)
+        /// methods are captured: their JIT-compiled native entries (from ClrMD) are
+        /// hooked exactly like native functions. Managed JIT code has no .pdata to
+        /// validate against, so the <c>EntryPointGuard</c> is bypassed (a JIT entry is
+        /// authoritative) — only the codegen safety checks in <c>InlineHook</c> apply,
+        /// and a generous fixed steal budget is used. Already-hooked and null addresses
+        /// are skipped. Returns the number newly instrumented. Safe to call from the
+        /// poll thread between polls (freezes the target's threads for the install).
+        /// </summary>
+        /// <summary>
+        /// Register the x64 first-chance VEH that makes return capture exception-safe:
+        /// while a call's return is redirected, its on-stack return address points at the
+        /// return stub (no <c>.pdata</c>), so an exception unwinding through that live
+        /// frame would mis-unwind and crash. The VEH restores such slots before the
+        /// unwind. Best-effort and idempotent-per-session; on any failure return capture
+        /// still works, just without the exception-unwind net. x64 only. Call once, before
+        /// any hook is armed, so the handler is live before the first redirect.
+        /// </summary>
+        private void TryRegisterReturnVeh()
+        {
+            if (!_captureReturns || !_process.Is64Bit || _vehRegistry != 0) return;
+            try
+            {
+                IntPtr k32 = NativeMethods.GetModuleHandleW("kernel32.dll");
+                if (k32 == IntPtr.Zero) return;
+                ulong addVeh = (ulong)NativeMethods.GetProcAddress(k32, "AddVectoredExceptionHandler").ToInt64();
+                if (addVeh == 0) return;
+
+                ulong registry = _code.Allocate(8 + MaxVehContexts * 8, executable: false); // zeroed → count 0
+                ulong veh = _code.Allocate(512, executable: true);
+                byte[] vehBytes = CaptureStub.BuildReturnVehX64(veh, registry, VehScanBytes);
+                if (vehBytes.Length > 512) return;
+                _code.Write(veh, vehBytes); _code.Flush(veh, vehBytes.Length);
+
+                ulong boot = _code.Allocate(64, executable: true);
+                byte[] bootBytes = CaptureStub.BuildVehBootstrapX64(boot, veh, addVeh);
+                _code.Write(boot, bootBytes); _code.Flush(boot, bootBytes.Length);
+
+                IntPtr th = NativeMethods.CreateRemoteThread(_process.Handle, IntPtr.Zero, IntPtr.Zero,
+                    (IntPtr)unchecked((long)boot), IntPtr.Zero, 0, out _);
+                if (th == IntPtr.Zero) return; // registry stays 0 → InstallHook skips VEH bookkeeping
+                NativeMethods.WaitForSingleObject(th, 5000); // let AddVectoredExceptionHandler complete
+                NativeMethods.CloseHandle(th);
+                _vehRegistry = registry; // only now is the handler live and the registry usable
+            }
+            catch { _vehRegistry = 0; }
+        }
+
+        public int HookMore(IEnumerable<ulong> addresses, out int skipped, out string? firstError)
+        {
+            skipped = 0;
+            firstError = null;
+            int added = 0;
+
+            var arch = CpuArchitectures.For(_process.Is64Bit);
+            var have = new HashSet<ulong>();
+            foreach (var h in _hooks) have.Add(h.Target);
+
+            // No .pdata bound for JIT code; allow a generous steal (InlineHook still
+            // refuses a site it can't relocate safely, so this can't corrupt code).
+            int maxPatch = _process.Is64Bit ? 24 : 16;
+
+            using (new ThreadSuspender(_process.Pid))
+            {
+                foreach (ulong func in addresses)
+                {
+                    if (func == 0 || !have.Add(func)) continue; // skip null / already hooked
+                    try
+                    {
+                        if (InstallHook(func, arch, maxPatch, out string? skipReason)) added++;
+                        else { skipped++; firstError ??= skipReason; }
+                    }
+                    catch (Exception ex) { skipped++; firstError ??= ex.Message; }
+                }
+            }
+            return added;
+        }
+
+        /// <summary>
         /// Diagnostic: bytes the in-target stubs have written so far (claimed
         /// slots × record size). If this grows, stubs ARE executing — the hooked
         /// functions are being called. If it stays 0, no hook ever fired.
@@ -447,7 +591,41 @@ namespace Cda.Core.Engine
             // timeline monotonic and roughly seconds-shaped. Exact timing later.
             var records = RingBufferReader.Decode(data, _tscBase, 1_000_000_000.0);
             EnrichDereferences(records);
-            return records;
+            return _captureReturns ? PairReturns(records) : records;
+        }
+
+        /// <summary>
+        /// Fold each return record into its originating call (by correlation id) and
+        /// drop it, so the returned list is calls only — each carrying its return
+        /// value once observed. A return usually arrives in the same batch as its
+        /// call, but may lag a poll or two, so outstanding calls are remembered
+        /// across polls (bounded). A call whose return never arrives (exception /
+        /// tail-call) simply keeps <see cref="CallRecord.HasReturned"/> false.
+        /// </summary>
+        private List<CallRecord> PairReturns(List<CallRecord> records)
+        {
+            var visible = new List<CallRecord>(records.Count);
+            foreach (var r in records)
+            {
+                if (r.IsReturn)
+                {
+                    if (_outstanding.TryGetValue(r.CorrelationId, out var call))
+                    {
+                        call.HasReturned = true;
+                        call.ReturnValue = r.IntegerArgs.Length > 0 ? r.IntegerArgs[0] : 0;
+                        if (r.Dereferences.Length > 0) call.ReturnDereference = r.Dereferences[0];
+                        _outstanding.Remove(r.CorrelationId);
+                    }
+                    continue; // return records are never shown as their own row
+                }
+
+                _outstanding[r.CorrelationId] = r;
+                _outstandingOrder.Enqueue(r.CorrelationId);
+                if (_outstandingOrder.Count > MaxOutstanding)
+                    _outstanding.Remove(_outstandingOrder.Dequeue()); // no-op if already paired
+                visible.Add(r);
+            }
+            return visible;
         }
 
         private const int DerefReadLength = 260;
@@ -491,9 +669,14 @@ namespace Cda.Core.Engine
                 // NUL-terminated run (Classify), which rejects return addresses and the
                 // non-string words a frame holds. The reach is the snapshot depth
                 // (CaptureStub.StackSlots words ⇒ up to that many args).
-                ulong[] snap = rec.StackSnapshot;
-                for (int i = Math.Max(args.Length, 4); i + 1 < snap.Length; i++)
-                    TryDeref(snap[i + 1], i, ref derefs, cache, buf, ref budget);
+                // A return record has no meaningful snapshot (it carries only the return
+                // value in args[0], already dereferenced by pass (a) above), so skip it.
+                if (!rec.IsReturn)
+                {
+                    ulong[] snap = rec.StackSnapshot;
+                    for (int i = Math.Max(args.Length, 4); i + 1 < snap.Length; i++)
+                        TryDeref(snap[i + 1], i, ref derefs, cache, buf, ref budget);
+                }
 
                 if (derefs != null) rec.Dereferences = derefs.ToArray();
             }

@@ -67,8 +67,27 @@ Working and validated on real targets. Implemented and confirmed:
   available, and search / filter / bookmarks in the call log. The function list
   also has a **call-count filter** (hide never-called functions, or isolate those
   hit exactly _N_ times) for pruning a busy list after a capture.
-- **Self-tests** for the inline-hook codegen and the capture stub + ring buffer
-  pass for the current build's architecture.
+- **Disassembly view** — an Iced-formatted instruction listing (address · bytes ·
+  mnemonic) for the selected function, beside the hex view. Reads through the same
+  on-demand memory source (file image or live process), so it works on an opened PE
+  or a running target; decodes a bounded window stopping at the function's first
+  `ret`/`jmp`/`int3`.
+- **Return-value capture** — optionally record what each hooked function *returns*
+  (integer `RAX`/`EAX`, host-side string-dereferenced like arguments), shown in the
+  Calls log's **Return** column. A return trampoline intercepts the callee's `ret`; one
+  outstanding return per hooked function is tracked at a time (concurrent / recursive
+  returns are sampled). Toggle **Capture returns** before starting. On x64 a first-chance
+  vectored exception handler is installed in the target so an exception unwinding *through*
+  a hooked frame is handled safely (it un-redirects that call rather than crashing); on an
+  exception-heavy target this can reduce how many returns are captured, but it won't crash.
+  (x86 is unaffected; float/double returns show a meaningless integer.)
+- **C#/.NET (managed) support** — open a managed assembly and browse its real methods
+  (not garbage `sub_*`), with each method's **IL** and **decompiled C#** in the
+  Disassembly pane; and **capture a live .NET process** — discover its JIT-compiled
+  app methods and hook their native entries through the same pipeline as a native
+  capture, recording managed calls (and, with return capture on, their return values).
+- **Self-tests** for the inline-hook codegen, the capture stub + ring buffer, and the
+  return trampoline, for the current build's architecture.
 
 The build compiles and runs in Visual Studio 2022 on .NET 8.
 
@@ -95,7 +114,11 @@ dependency, not to avoid the GPU.)
 - **Per-Monitor v2 DPI** awareness (`Cda.App/app.manifest`) — re-renders crisply
   across monitors of different scale factors; the status bar shows the live DPI
 - **Iced** (`Iced` NuGet) for x86/x64 instruction decoding, call-site discovery,
-  and trampoline (block) encoding
+  trampoline (block) encoding, and the disassembly view's instruction formatting
+- **`Cda.Managed`** for .NET support — **ILSpy** (`ICSharpCode.Decompiler`) for a
+  managed image's IL + decompiled C#, and **ClrMD** (`Microsoft.Diagnostics.Runtime`)
+  to discover a live .NET target's JIT-compiled method addresses for hooking. Kept in
+  a separate assembly so these dependencies stay out of the native engine.
 - `requireAdministrator` in the manifest — instrumenting another process needs
   debug privilege, so run Visual Studio (and the app) **elevated**
 
@@ -363,6 +386,10 @@ the current build's architecture.
   - **Memory** — the on-demand hex viewer (file image or live process). Select a
     byte range (click, drag, or shift-click) and copy it as hex or text (Ctrl+C, or
     the right-click menu).
+  - **Disassembly** — the selected function's instructions (address · bytes ·
+    mnemonic), Iced-formatted from the same memory source as the hex view. For a
+    managed method (an opened .NET assembly) it shows the method's IL and decompiled
+    C# instead.
   - **Strings** — every string mined from the image, searchable, with the
     functions that reference each; double-click a string (or pick a referencing
     function) to jump to that code. Selecting a string shows its **full value**
@@ -399,6 +426,13 @@ exercisable. From there:
   imports, those same calls via IAT slots, or the calls into the functions its own
   modules export — use these instead of the attach-time buttons when the calls you
   want happen at startup and attaching after the fact shows nothing.
+- **Launch .NET & capture…** to launch a managed (.NET) EXE from disk and trace its
+  managed method calls — the managed counterpart of Launch & capture. Or, for an
+  already-running .NET app, **Attach to process…** then **Capture .NET (managed)**.
+  Managed capture needs a **same-bitness CDA build** as the target: ClrMD's live attach
+  (used to discover JIT'd method addresses) is bitness-locked, so run the **x64** CDA
+  build for 64-bit apps and the **x86** build for 32-bit apps — CDA says which is needed
+  if they don't match. (Native captures are cross-bitness; only managed discovery isn't.)
 - **Capture DLL…** to trace a DLL from the moment it loads.
 - **Follow children…** to trace a program and every process it spawns.
 - **Open / Save trace…** to review a captured `.cdatrace` offline or keep one.
@@ -480,6 +514,9 @@ are the complete set the tool depends on, grouped by the library they come from.
 
 ```
 Cda.Modern/
+├─ Cda.Managed/              .NET support (ICSharpCode.Decompiler + ClrMD)
+│  ├─ ManagedImage           static: enumerate methods, IL + decompiled C#, resources
+│  └─ ManagedMethodScanner   live: ClrMD JIT-address discovery for hooking managed methods
 ├─ Cda.Core/                 engine (no WPF)
 │  ├─ Cpu/                   ICpuArchitecture, X86/X64Architecture, decoder, conventions
 │  ├─ Engine/                instrumentation: InlineHook + CaptureStub (entry hook + stack

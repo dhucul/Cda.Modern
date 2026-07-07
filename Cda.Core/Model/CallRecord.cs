@@ -40,6 +40,25 @@ namespace Cda.Core.Model
         /// <summary>Pointer-follow captures (strings, structures) for arguments.</summary>
         public Dereference[] Dereferences = Array.Empty<Dereference>();
 
+        /// <summary>
+        /// Claim-sequence id that pairs a call record with the return record written
+        /// when it returns. Both carry the same value; the return record is dropped
+        /// host-side after its value is folded into the call (see <see cref="ReturnValue"/>).
+        /// </summary>
+        public uint CorrelationId;
+
+        /// <summary>True for a raw return record (transient — folded into its call, never shown as a row).</summary>
+        public bool IsReturn;
+
+        /// <summary>True once this call's return has been observed and <see cref="ReturnValue"/> set.</summary>
+        public bool HasReturned;
+
+        /// <summary>The integer return value (RAX/EAX) once the call has returned.</summary>
+        public ulong ReturnValue;
+
+        /// <summary>A string/pointer dereference of the return value, if it resolved to one.</summary>
+        public Dereference? ReturnDereference;
+
         public CallRecord() { }
 
         public CallRecord(double time, ulong source, ulong destination)

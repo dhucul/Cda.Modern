@@ -68,5 +68,9 @@ namespace Cda.Core.Cpu
 
         public int GetMinimumHookLength(IMemorySource memory, ulong address)
             => Disasm.HookLength(32, memory, address, 5); // E9 rel32 jmp = 5 bytes
+
+        public IReadOnlyList<DisasmLine> FormatRange(
+            IMemorySource memory, ulong readStart, ulong ipBase, int maxBytes)
+            => Disasm.DecodeFormatted(32, memory, readStart, ipBase, maxBytes);
     }
 }

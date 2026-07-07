@@ -182,6 +182,69 @@ namespace Cda.Core.Cpu
             }
             return list;
         }
+
+        /// <summary>
+        /// Decode and MASM-format a bounded run of instructions for display (the
+        /// Disassembly view). Bytes are read from <paramref name="memory"/> at
+        /// <paramref name="readStart"/> (a file offset for a mapped image, a VA for a
+        /// live process), while instruction addresses/branch targets are reported
+        /// against <paramref name="ipBase"/> (the function's virtual address) — the
+        /// same read-at-offset / decode-as-VA split the discovery scan uses. Decoding
+        /// stops at <paramref name="maxBytes"/> or the first function boundary
+        /// (<see cref="EndsFunction"/>), since a discovered function carries no size.
+        /// </summary>
+        public static List<DisasmLine> DecodeFormatted(
+            int bitness, IMemorySource memory, ulong readStart, ulong ipBase, int maxBytes)
+        {
+            var lines = new List<DisasmLine>();
+            if (maxBytes <= 0) return lines;
+
+            byte[] buf = new byte[maxBytes];
+            int read = memory.ReadMemory(readStart, buf);
+            if (read <= 0) return lines;
+
+            var reader = new ByteArrayCodeReader(buf, 0, read);
+            var decoder = Decoder.Create(bitness, reader, ipBase, DecoderOptions.None);
+            var formatter = new MasmFormatter();
+            var output = new StringOutput();
+
+            int consumed = 0;
+            while (consumed < read)
+            {
+                decoder.Decode(out Instruction instr);
+                if (instr.Code == Code.INVALID) break;
+                int len = instr.Length;
+                if (len <= 0 || consumed + len > read) break;
+
+                var bytes = new byte[len];
+                Array.Copy(buf, consumed, bytes, 0, len);
+
+                formatter.Format(instr, output);
+                lines.Add(new DisasmLine(instr.IP, bytes, output.ToStringAndReset()));
+
+                consumed += len;
+                if (EndsFunction(instr)) break; // ret / uncond-jmp / int3 — end of function
+            }
+            return lines;
+        }
+    }
+
+    /// <summary>One decoded, formatted instruction line for the Disassembly view.</summary>
+    public readonly struct DisasmLine
+    {
+        /// <summary>Virtual address of the instruction.</summary>
+        public readonly ulong Address;
+        /// <summary>Raw instruction bytes.</summary>
+        public readonly byte[] Bytes;
+        /// <summary>MASM-formatted mnemonic + operands.</summary>
+        public readonly string Text;
+
+        public DisasmLine(ulong address, byte[] bytes, string text)
+        {
+            Address = address;
+            Bytes = bytes;
+            Text = text;
+        }
     }
 
     /// <summary>A <see cref="CodeWriter"/> that accumulates encoded bytes.</summary>

@@ -70,6 +70,15 @@ namespace Cda.Core.Cpu
         /// must cover whole instructions). Requires the disassembler.
         /// </summary>
         int GetMinimumHookLength(IMemorySource memory, ulong address);
+
+        /// <summary>
+        /// Decode and format up to <paramref name="maxBytes"/> of code for display.
+        /// Bytes are read from <paramref name="memory"/> at <paramref name="readStart"/>
+        /// (file offset for a mapped image, VA for a live process); instruction
+        /// addresses are reported against <paramref name="ipBase"/> (the function VA).
+        /// </summary>
+        IReadOnlyList<DisasmLine> FormatRange(
+            IMemorySource memory, ulong readStart, ulong ipBase, int maxBytes);
     }
 
     public static class CpuArchitectures

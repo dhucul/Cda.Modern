@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>Cda.Managed</AssemblyName>
+    <RootNamespace>Cda.Managed</RootNamespace>
+    <Platforms>x64;x86</Platforms>
+
+    <!-- Managed (.NET) analysis is isolated in its own assembly so the heavy
+         decompiler + CLR-runtime dependencies stay out of the native engine
+         (Cda.Core, which is Iced + P/Invoke only). Cda.App references this and
+         bridges managed results into the same views. Mirrors DisasmStudio.Managed. -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- ILSpy's decompiler engine: enumerate a managed image's types/methods and
+         render IL + decompiled C#. Pulls System.Reflection.Metadata. -->
+    <PackageReference Include="ICSharpCode.Decompiler" Version="10.1.0.8386" />
+    <!-- ClrMD: attach passively to a live .NET target to discover each JIT-compiled
+         method's native code address, so the native hook pipeline can hook it
+         (managed live capture, Phase 3b). -->
+    <PackageReference Include="Microsoft.Diagnostics.Runtime" Version="4.0.732401" />
+  </ItemGroup>
+
+</Project>

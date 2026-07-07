@@ -51,6 +51,7 @@
                 <DataGridTextColumn Header="Caller" Binding="{Binding Source}" Width="170" />
                 <DataGridTextColumn Header="Callee" Binding="{Binding Dest}" Width="170" />
                 <DataGridTextColumn Header="Args" Binding="{Binding Args}" Width="240" />
+                <DataGridTextColumn Header="Return" Binding="{Binding Return}" Width="130" />
                 <DataGridTextColumn Header="Strings" Binding="{Binding Strings}" Width="*" />
             </DataGrid.Columns>
         </DataGrid>

@@ -17,8 +17,10 @@ namespace Cda.Core.Engine
     ///   u64 source        call site
     ///   u64 destination   callee entry
     ///   u64 stackPointer  ESP/RSP at entry
-    ///   u32 argCount
-    ///   u64[argCount]     captured integer args (zero-extended on x86)
+    ///   u32 argCount      high bit (<see cref="CaptureStub.KindReturn"/>) marks a return record
+    ///   u32 correlationId claim sequence of the call — pairs a return with its call
+    ///   u64[argCount]     captured integer args (zero-extended on x86); args[0] is the
+    ///                     return value in a return record
     ///   u32 stackSlots
     ///   u64[stackSlots]   raw stack words from the entry SP upward (zero-extended)
     ///   u32 derefCount
@@ -52,9 +54,13 @@ namespace Cda.Core.Engine
                 ulong src = BinaryPrimitives.ReadUInt64LittleEndian(buffer.Slice(pos)); pos += 8;
                 ulong dst = BinaryPrimitives.ReadUInt64LittleEndian(buffer.Slice(pos)); pos += 8;
                 ulong sp = BinaryPrimitives.ReadUInt64LittleEndian(buffer.Slice(pos)); pos += 8;
-                uint argc = BinaryPrimitives.ReadUInt32LittleEndian(buffer.Slice(pos)); pos += 4;
+                uint argcRaw = BinaryPrimitives.ReadUInt32LittleEndian(buffer.Slice(pos)); pos += 4;
+                bool isReturn = (argcRaw & CaptureStub.KindReturn) != 0;
+                uint argc = argcRaw & ~CaptureStub.KindReturn;
 
                 if (argc > 256) break; // corrupt / wrapped; stop
+                if (pos + 4 > buffer.Length) { pos = start; break; }        // room for the correlation id
+                uint corrId = BinaryPrimitives.ReadUInt32LittleEndian(buffer.Slice(pos)); pos += 4;
                 if (pos + (int)argc * 8 + 4 > buffer.Length) { pos = start; break; }
 
                 var args = new ulong[argc];
@@ -99,7 +105,10 @@ namespace Cda.Core.Engine
                 }
                 if (truncated) { pos = start; break; }
 
-                double time = (double)(ts - qpcBase) / freq;
+                // Clamp: cross-core rdtsc skew (or the base not being the earliest record)
+                // can make ts < qpcBase; an unsigned subtraction would then wrap to a huge
+                // time and misplace the row on the timeline.
+                double time = ts >= qpcBase ? (double)(ts - qpcBase) / freq : 0;
                 result.Add(new CallRecord
                 {
                     Time = time,
@@ -109,6 +118,8 @@ namespace Cda.Core.Engine
                     StackSnapshot = snapshot,
                     IntegerArgs = args,
                     Dereferences = derefs.ToArray(),
+                    CorrelationId = corrId,
+                    IsReturn = isReturn,
                 });
             }
 

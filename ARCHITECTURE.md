@@ -117,26 +117,30 @@ snapshot, then a host-filled dereference payload.
 | 8 | 8 | source — return address (caller) |
 | 16 | 8 | destination — hooked entry (callee) |
 | 24 | 8 | stack pointer at entry |
-| 32 | 4 | argCount |
-| 36 | 8 × argCount | integer args, each zero-extended to u64 |
-| 36 + 8·argCount | 4 | stackSlots (always `CaptureStub.StackSlots`) |
-| 40 + 8·argCount | 8 × stackSlots | stack snapshot from entry SP upward, zero-extended |
-| 40 + 8·argCount + 8·stackSlots | 4 | derefCount (0 in-target; filled host-side) |
+| 32 | 4 | argCount — **high bit** (`CaptureStub.KindReturn`) marks a *return* record |
+| 36 | 4 | correlationId — the claim sequence; pairs a return record with its call |
+| 40 | 8 × argCount | integer args, each zero-extended to u64 (args[0] is the *return value* in a return record) |
+| 40 + 8·argCount | 4 | stackSlots (always `CaptureStub.StackSlots`) |
+| 44 + 8·argCount | 8 × stackSlots | stack snapshot from entry SP upward, zero-extended |
+| 44 + 8·argCount + 8·stackSlots | 4 | derefCount (0 in-target; filled host-side) |
 | … | derefCount × | dereference: u32 argIndex, u32 kind, u32 dataLen, u8[dataLen] |
 
 ```
-RecordSize = 36 + argCount*8 + 4 + StackSlots*8 + 4   (before host dereferences)
+RecordSize = 40 + argCount*8 + 4 + StackSlots*8 + 4   (before host dereferences)
 ```
 
 `CaptureStub.StackSlots` is **64** (512 bytes on x64, 256 on x86). For the usual
-`argCount = 4`, that makes a fixed record of **588 bytes** before any dereference
+`argCount = 4`, that makes a fixed record of **592 bytes** before any dereference
 payload — the figure the capture Self-test reports. A 65,536-slot ring is therefore
-~38 MB in the target. The stack snapshot is what lets the host walk back past
+~38 MB in the target. The `argCount` field carries a **kind flag** in its high bit
+(so a value > 256 never collides with a real arity, which the decoder already rejects)
+and a **correlationId** follows it, so both a call and its later return decode through
+the same fixed layout and pair up host-side. The stack snapshot is what lets the host walk back past
 runtime/CRT wrapper frames to the program's own caller (see *Caller attribution*
 below) **and** recover string arguments that sit past the captured integer args (see
 *Capture session lifecycle*); raising `StackSlots` deepens both at a linear memory
 cost. **Because it changes the record format, re-run the capture Self-test after
-changing it** — the 588-byte figure is the end-to-end check that the stub writes and
+changing it** — the 592-byte figure is the end-to-end check that the stub writes and
 the reader decodes the same layout.
 
 The stub saves flags + GP registers (so the function sees its entry state intact),
@@ -173,7 +177,7 @@ are reported as `recordsLost`. A short read of the control block (e.g. the targe
 exited) returns empty rather than misreading a zero counter.
 
 The ring is sized so a hooked function can't lap the reader between 100 ms polls.
-At the defaults (65,536 slots × a 588-byte record) that is ~38 MB in the target. The
+At the defaults (65,536 slots × a 592-byte record) that is ~38 MB in the target. The
 byte size is computed in 64-bit and bounded by a **256 MB ceiling** — a larger record
 (a deeper `StackSlots` snapshot) or a big `bufferRecords` drops the slot count to fit
 rather than overflow the 32-bit allocation size, which would otherwise hand the stub a
@@ -506,6 +510,76 @@ ring (one record per call, then chain to the trampoline). Run them after any cod
 change.
 
 ---
+
+## Return-value capture
+
+Optionally, each call also records what its function **returned** (`RAX`/`EAX`). The
+entry stub is normally entry-only — it chains to the trampoline and the callee's `ret`
+goes straight back to the real caller — so seeing a return means regaining control
+*after* the callee runs. A per-thread TLS shadow stack (the textbook approach) isn't
+usable here: Iced's fluent assembler can't emit a segment override (`gs:`/`fs:`) to
+reach the TEB, and hand-encoding a branchy TLS block as raw bytes is too risky. Instead
+each hook gets a **single return slot** guarded by an atomic `lock cmpxchg`:
+
+1. On entry (when return capture is on), the stub tries to claim the hook's slot
+   (0 → 1). If it **wins**, it stashes the real return address + correlationId in a
+   per-hook return context and overwrites the on-stack return address so the callee
+   returns into a shared **return stub**.
+2. If it **loses** (a concurrent or recursive call already owns the slot), it does not
+   redirect — so at most one outstanding return per hooked function is tracked at a
+   time (concurrent/recursive returns are *sampled*, not all captured).
+3. The return stub records the return value as a *return record* (kind bit set,
+   correlationId = the call's), releases the slot, and resumes at the real caller —
+   preserving `RAX`/flags (x64 uses volatile `r11` for the resume address; x86 reserves
+   a stack slot and `ret`s to it, race-free since only one thread owns a hook's slot).
+
+The slot mechanism itself is **safe**: an exception/tail-call that never returns just
+leaves the slot owned (return capture quietly stops for that hook) — it never jumps to a
+stale address.
+
+**x64 exception safety.** While a call's return is redirected, its on-stack return address
+points at the return stub, which has no `.pdata` unwind info — so a C++/SEH exception
+unwinding *through* that live frame would make the table-based x64 unwinder mis-unwind and
+crash. This is handled by a **first-chance vectored exception handler** installed in the
+target (`CaptureStub.BuildReturnVehX64`, registered by `CaptureSession.TryRegisterReturnVeh`
+via a one-shot remote thread calling `AddVectoredExceptionHandler`). On any exception, the
+handler walks a registry of return contexts and restores every outstanding redirected
+return address at/above the faulting SP to its real value (releasing the slot) *before* the
+unwind proceeds, so the unwinder sees the correct address. Restoring a slot only
+un-redirects that one call — never a crash or corruption — so no per-thread stack-bounds
+check is needed and touching another thread's slot merely costs that call its return value.
+It's best-effort (if the handler can't be installed, return capture still runs) and x64-only
+(x86's chain-based SEH is unaffected). Validated by `CaptureVehSelfTest` (the fixup logic)
+and a cross-process return-capture run. `CaptureSession.Poll` folds each return record into its originating call
+(`ReturnValue`/`HasReturned`) by correlationId and drops it. Enabled with the
+`captureReturns` flag on `CaptureSession.Start` (the "Capture returns" toggle);
+`Engine/CaptureReturnSelfTest` validates the redirect/record/resume end to end.
+
+## Managed (.NET) capture (`Cda.Managed`)
+
+.NET assemblies are handled in a separate assembly, **`Cda.Managed`** (ILSpy's
+`ICSharpCode.Decompiler` + ClrMD `Microsoft.Diagnostics.Runtime`), so those heavy
+dependencies stay out of `Cda.Core` (Iced + P/Invoke only). `Pe/PeImage.IsManaged`
+(optional-header data directory 14, the CLR header) routes a managed image away from
+the native Iced scan, which would decode its IL/metadata `.text` as garbage.
+
+- **Static** (`ManagedImage`): enumerate a file's methods (`System.Reflection.Metadata`),
+  render a selected method's **IL** (`ReflectionDisassembler`) and decompiled **C#**
+  (`CSharpDecompiler`) in the Disassembly pane, and extract embedded resources. Methods
+  are surfaced in the function list by a *tagged* synthetic address
+  (`0x4000_0000_0000_0000 | token`) that can't collide with a real address.
+- **Live** (`ManagedMethodScanner`): the elegant part — managed methods reuse the
+  **entire native hook pipeline**. ClrMD attaches passively (`DataTarget.AttachToProcess`,
+  `suspend: false` — read-only, not a debugger, so it coexists with the write handle and
+  `ThreadSuspender`) and reports each JIT-compiled method's **native code address**
+  (`ClrMethod.NativeCode`). `CaptureSession.HookMore` then inline-hooks those addresses
+  exactly like native functions — bypassing the `EntryPointGuard` (JIT code has no
+  `.pdata`, and a JIT entry is authoritative) while keeping the codegen safety checks.
+  Return-value capture applies unchanged. Methods JIT lazily and tiered compilation
+  re-JITs to a new address, so a slow re-scan timer hooks newly-compiled methods (launch
+  the target with `DOTNET_TieredCompilation=0` for stable addresses). x64 CLR uses the
+  platform ABI (`this` in RCX), so the existing RCX/RDX/R8/R9 capture yields the useful
+  integer/pointer/string args; struct/generic decoding is best-effort.
 
 ## Legacy → modern mapping
 

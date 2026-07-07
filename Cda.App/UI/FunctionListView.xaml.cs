@@ -187,6 +187,35 @@ namespace Cda.App.UI
         }
 
         /// <summary>
+        /// Append functions to the list WITHOUT clearing existing rows or their
+        /// accumulated live call counts — used by managed live capture's re-scan, which
+        /// discovers newly-JIT'd methods over time. Rows already present (by address)
+        /// are skipped. Returns the number actually added. (Unlike
+        /// <see cref="LoadFromDataset"/>/<see cref="LoadFunctions"/>, this preserves
+        /// counts, the current sort, and the count filter.)
+        /// </summary>
+        public int AddFunctions(IEnumerable<TracedFunction> functions, ModuleMap? map = null)
+        {
+            int added = 0;
+            foreach (var fn in functions)
+            {
+                if (_byAddress.ContainsKey(fn.Address)) continue;
+                var row = new FunctionRow
+                {
+                    Address = fn.Address,
+                    Module = map?.Resolve(fn.Address)?.Name ?? "",
+                    Name = fn.Name ?? fn.DisplayName,
+                    CallCount = fn.CallCount,
+                };
+                _rows.Add(row);
+                _byAddress[fn.Address] = row;
+                added++;
+            }
+            if (added > 0) UpdateMatchInfo();
+            return added;
+        }
+
+        /// <summary>
         /// Select the row for <paramref name="address"/> and scroll it into view
         /// (used when a node is clicked in the call-graph). Returns false if no
         /// such function is listed. The selection is applied silently — it does

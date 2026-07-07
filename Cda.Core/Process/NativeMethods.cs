@@ -15,6 +15,7 @@ namespace Cda.Core.Process
         public enum ProcessAccess : uint
         {
             Terminate = 0x0001,
+            CreateThread = 0x0002,
             QueryInformation = 0x0400,
             QueryLimitedInformation = 0x1000,
             VmRead = 0x0010,
@@ -24,6 +25,23 @@ namespace Cda.Core.Process
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern IntPtr OpenProcess(ProcessAccess access, bool inherit, int pid);
+
+        // --- Remote thread + symbol resolution (used to register the return-capture VEH
+        //     in the target: a one-shot remote thread runs a bootstrap stub that calls
+        //     AddVectoredExceptionHandler). ---
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern IntPtr GetModuleHandleW(string moduleName);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Ansi)]
+        public static extern IntPtr GetProcAddress(IntPtr module, string procName);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr CreateRemoteThread(
+            IntPtr process, IntPtr threadAttributes, IntPtr stackSize,
+            IntPtr startAddress, IntPtr parameter, uint creationFlags, out uint threadId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
 
         // Used by the startup trace's auto-bisection to discard a hidden test instance
         // that ran clean (we only want the search verdict, not a survivor left running).

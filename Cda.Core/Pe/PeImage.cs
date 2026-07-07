@@ -70,7 +70,17 @@ namespace Cda.Core.Pe
 
         private int _optionalHeaderOffset;
 
-        public enum DataDirectory { Export = 0, Import = 1, Resource = 2, Exception = 3, BaseReloc = 5, Debug = 6, Iat = 12 }
+        public enum DataDirectory { Export = 0, Import = 1, Resource = 2, Exception = 3, BaseReloc = 5, Debug = 6, Iat = 12, ComDescriptor = 14 }
+
+        /// <summary>
+        /// True if this is a managed (.NET / CLI) image — i.e. it has a COM descriptor
+        /// (CLR header) in optional-header data directory 14. A managed image's
+        /// executable sections hold IL + metadata (plus a tiny native startup stub),
+        /// NOT native x86/x64 code, so the native call-site scan must be skipped for it
+        /// (it would decode metadata as garbage instructions). Its methods are surfaced
+        /// through the managed path (System.Reflection.Metadata / ILSpy) instead.
+        /// </summary>
+        public bool IsManaged => GetDirectory(DataDirectory.ComDescriptor).Rva != 0;
 
         private PeImage(byte[] data, bool mapped, ulong actualBase)
         {

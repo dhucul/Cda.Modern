@@ -81,7 +81,8 @@ namespace Cda.Core.Process
             var access = NativeMethods.ProcessAccess.QueryLimitedInformation |
                          NativeMethods.ProcessAccess.VmRead;
             if (forWrite)
-                access |= NativeMethods.ProcessAccess.VmWrite | NativeMethods.ProcessAccess.VmOperation;
+                access |= NativeMethods.ProcessAccess.VmWrite | NativeMethods.ProcessAccess.VmOperation
+                        | NativeMethods.ProcessAccess.CreateThread; // to register the return-capture VEH remotely
 
             IntPtr h = NativeMethods.OpenProcess(access, false, pid);
             if (h == IntPtr.Zero)

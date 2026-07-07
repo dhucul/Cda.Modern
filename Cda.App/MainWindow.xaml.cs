@@ -15,6 +15,7 @@ using Cda.Core.Memory;
 using Cda.Core.Model;
 using Cda.Core.Pe;
 using Cda.Core.Process;
+using Cda.Managed;
 
 namespace Cda.App
 {
@@ -49,6 +50,26 @@ namespace Cda.App
         private bool _offlineTrace; // a saved trace loaded for review (no live session/target)
         private UI.CompareWindow? _compareWindow; // the open trace-comparison window, if any
         private Model.GraphDiff? _graphDiff;       // diff overlay driving the butterfly while comparing
+
+        // --- Managed (.NET) static view -------------------------------------
+        // When a managed assembly is opened, its methods are surfaced through the
+        // function list keyed by a TAGGED synthetic address (this tag OR the method's
+        // metadata token) that can never collide with a real user-space address, so a
+        // later native attach/open can't be mistaken for a managed selection even if
+        // this map isn't cleared. Selecting one renders IL + decompiled C# in the
+        // Disassembly pane instead of native disassembly.
+        private const ulong ManagedAddrTag = 0x4000_0000_0000_0000UL;
+        private ManagedImage? _managedImage;
+        private readonly Dictionary<ulong, ManagedMethod> _managedByAddr = new();
+
+        // --- Managed (.NET) LIVE capture ------------------------------------
+        // A live managed trace hooks JIT-compiled method entries (native addresses
+        // from ClrMD) through the same native pipeline as a native capture, and a
+        // slow timer re-scans for newly-JIT'd methods and hooks them too.
+        private DispatcherTimer? _managedRescanTimer;
+        private bool _managedRescanning;                              // re-entrancy guard for OnManagedRescan
+        private readonly HashSet<ulong> _managedHooked = new();       // JIT addresses already hooked
+        private readonly Dictionary<ulong, string> _managedLiveNames = new(); // JIT address → method name
 
         // --- Strings tab (deferred) -----------------------------------------
         // The Strings tab is scanned lazily — only when the user first opens that
@@ -241,7 +262,15 @@ namespace Cda.App
             FunctionList.FunctionSelected += OnFunctionSelected;
             FunctionList.CountFilterChanged += OnFunctionFilterChanged;
             GraphView.NeighborSelected += OnGraphNeighborSelected;
-            CallList.CallSelected += (_, rec) => { Hex.GoTo(rec.Destination); ShowCallStack(rec); };
+            CallList.CallSelected += (_, rec) =>
+            {
+                // Mirror the hex view's VA-vs-file-offset branch (as NavigateDisasm does),
+                // so both agree even in a mapped-image mode.
+                if (_currentPe != null && _currentPe.TryVaToFileOffset(rec.Destination, out uint off)) Hex.GoTo(off);
+                else Hex.GoTo(rec.Destination);
+                NavigateDisasm(rec.Destination);
+                ShowCallStack(rec);
+            };
             // Reverse of the function-click → call sync: when the user clicks a row in
             // the Calls log, follow that call's callee in the function list and the graph.
             // Scoped to CallClicked (a deliberate row pick) rather than the broader
@@ -284,7 +313,9 @@ namespace Cda.App
             // everything else depends on. Run this after any codegen change.
             string hook = HookSelfTest.Run();
             string capture = CaptureStubSelfTest.Run();
-            StatusText.Text = $"Self-test · hook: {hook} · capture: {capture}";
+            string returns = CaptureReturnSelfTest.Run();
+            string veh = CaptureVehSelfTest.Run();
+            StatusText.Text = $"Self-test · hook: {hook} · capture: {capture} · returns: {returns} · veh: {veh}";
         }
 
         private void LoadDemo()
@@ -303,6 +334,7 @@ namespace Cda.App
             FunctionList.LoadFromDataset(data);
             DisposeFileMap();
             Hex.SetSource(null);
+            Disasm.SetSource(null);
             ClearStringsTab(); // the demo has no backing image to mine strings from
 
             StatusText.Text =
@@ -333,6 +365,7 @@ namespace Cda.App
             _session?.Dispose();
             _session = null;
             Hex.SetSource(null);
+            Disasm.SetSource(null);
             SetCallersTarget(0);
             _offlineTrace = false;
             _childView = false;
@@ -402,6 +435,7 @@ namespace Cda.App
                     PlayBar.SetData(ds);
                     FunctionList.LoadFromDataset(ds);
                     Hex.SetSource(_fileMap, 0);
+                    Disasm.SetSource(_fileMap, 0);
 
                     StatusText.Text =
                         $"{name} · {FormatSize(length)} · {(is64 ? "PE32+ (x64)" : "PE32 (x86)")} · base 0x{pe.PreferredImageBase:X} · " +
@@ -424,6 +458,8 @@ namespace Cda.App
                 _currentPe = r.Pe;
                 _is64 = r.Pe.Is64Bit;
                 _moduleMap = new ModuleMap(new[] { r.Module });
+
+                SetManaged(r.Managed); // managed image → IL/C# view; native → clears any prior managed state
 
                 _liveDataset = null; // static file view, not a live session
                 _model.Load(r.Dataset);
@@ -448,10 +484,13 @@ namespace Cda.App
                 DisposeFileMap();
                 _fileMap = new MappedFileMemorySource(path, r.Pe.Is64Bit);
                 Hex.SetSource(_fileMap, 0);
+                Disasm.SetSource(_fileMap, 0);
 
-                StatusText.Text =
-                    $"{name} · {FormatSize(length)} · {(r.Pe.Is64Bit ? "PE32+ (x64)" : "PE32 (x86)")} · base 0x{r.Pe.PreferredImageBase:X} · " +
-                    $"{r.Dataset.Functions.Count} functions ({r.ExportCount} exports) · {r.Imports} imports · {r.Pe.Sections.Count} sections";
+                StatusText.Text = r.Managed != null
+                    ? $"{name} · {FormatSize(length)} · managed (.NET) · {r.Dataset.Functions.Count} methods · " +
+                      $"{r.Imports} resources · select a method for its IL + decompiled C#"
+                    : $"{name} · {FormatSize(length)} · {(r.Pe.Is64Bit ? "PE32+ (x64)" : "PE32 (x86)")} · base 0x{r.Pe.PreferredImageBase:X} · " +
+                      $"{r.Dataset.Functions.Count} functions ({r.ExportCount} exports) · {r.Imports} imports · {r.Pe.Sections.Count} sections";
             }
             catch (Exception ex)
             {
@@ -460,8 +499,10 @@ namespace Cda.App
         }
 
         // Runs on a background thread: read + parse + statically scan the file,
-        // returning everything the UI needs. Must not touch UI elements.
-        private static (PeImage Pe, ModuleInfo Module, TraceDataset Dataset, int ExportCount, int Imports)
+        // returning everything the UI needs. Must not touch UI elements. For a
+        // managed (.NET) image the native call-site scan is skipped and Managed is
+        // non-null (its methods populate the list; selecting one shows IL/C#).
+        private static (PeImage Pe, ModuleInfo Module, TraceDataset Dataset, int ExportCount, int Imports, ManagedImage? Managed)
             OpenModuleCore(string path, string name)
         {
             // Read once into a right-sized buffer (peak ~1x the file size, versus
@@ -488,6 +529,26 @@ namespace Cda.App
 
             var pe = PeImage.FromFile(bytes);
             var module = new ModuleInfo(name, pe.PreferredImageBase, pe.SizeOfImage, path);
+
+            // Managed (.NET) image: its executable sections are IL + metadata, not
+            // native code, so the Iced call-site scan would produce garbage functions.
+            // Enumerate its real methods instead and surface them by tagged synthetic
+            // address (the metadata token). Falls through to the native scan if the
+            // managed load fails (e.g. NativeAOT, which is an ordinary native PE).
+            if (pe.IsManaged)
+            {
+                ManagedImage? mi = null;
+                try { mi = ManagedImage.Load(path); } catch { mi = null; }
+                if (mi != null)
+                {
+                    var mds = new TraceDataset { TimeStart = 0, TimeEnd = 1 };
+                    mds.Modules.Add(module);
+                    foreach (var m in mi.Methods)
+                        mds.Functions.Add(new TracedFunction(
+                            ManagedAddrTag | (uint)m.Token, pe.PreferredImageBase, m.FullName));
+                    return (pe, module, mds, mi.Methods.Count, mi.Resources.Count, mi);
+                }
+            }
 
             // Discover functions two ways: the export table (named) and a static
             // scan of the code sections for direct-call targets. An EXE typically
@@ -519,7 +580,7 @@ namespace Cda.App
                 ds.Records.Add(new CallRecord((double)i / en, edges[i].Site, edges[i].Target));
 
             int imports = pe.ReadImports().Count;
-            return (pe, module, ds, exportCount, imports);
+            return (pe, module, ds, exportCount, imports, (ManagedImage?)null);
         }
 
         // Cheap PE header parse from just a prefix — used for very large files we
@@ -720,19 +781,432 @@ namespace Cda.App
             try { return Environment.GetFolderPath(f); } catch { return ""; }
         }
 
+        /// <summary>Point the Disassembly view at a function, mirroring the hex view's
+        /// VA-vs-file-offset branch (a mapped image reads by file offset; a live process by VA).</summary>
+        private void NavigateDisasm(ulong address)
+        {
+            if (_currentPe != null && _currentPe.TryVaToFileOffset(address, out uint off))
+                Disasm.ShowFunction(address, off);
+            else
+                Disasm.ShowFunction(address, address);
+        }
+
+        /// <summary>Switch the managed (.NET) view on/off. When set, each method is
+        /// mapped by its tagged synthetic address so a selection resolves to IL/C#.</summary>
+        private void SetManaged(ManagedImage? mi)
+        {
+            if (!ReferenceEquals(_managedImage, mi)) _managedImage?.Dispose();
+            _managedImage = mi;
+            _managedByAddr.Clear();
+            if (mi != null)
+                foreach (var m in mi.Methods)
+                    _managedByAddr[ManagedAddrTag | (uint)m.Token] = m;
+        }
+
+        /// <summary>Render a managed method's decompiled C# and IL in the Disassembly
+        /// pane, and navigate the hex view to its IL body.</summary>
+        private void ShowManagedMethod(ManagedMethod mm)
+        {
+            if (_managedImage == null) return;
+
+            var lines = new List<string> { "// ===== Decompiled C# =====", "" };
+            lines.AddRange(_managedImage.DecompileCSharp(mm).Replace("\r\n", "\n").Split('\n'));
+            lines.Add("");
+            lines.Add("// ===== IL =====");
+            lines.Add("");
+            lines.AddRange(_managedImage.DisassembleIL(mm).Replace("\r\n", "\n").Split('\n'));
+            Disasm.ShowText(lines);
+
+            if (mm.BodyRva != 0 && _currentPe != null)
+            {
+                ulong va = _currentPe.RvaToVa(mm.BodyRva);
+                if (_currentPe.TryVaToFileOffset(va, out uint off)) Hex.GoTo(off);
+            }
+            if (DisasmTab != null) DisasmTab.IsSelected = true; // reveal the IL/C# immediately
+        }
+
+        // Lightweight, ClrMD-free .NET detection: is a CLR runtime module loaded in the
+        // target? Uses CDA's own module enumeration (works cross-bitness and needs no DAC),
+        // so it's a robust "is this a .NET process" signal even when ClrMD can't attach
+        // (a missing/mismatched DAC otherwise makes ClrMD.IsManaged silently return false).
+        private static bool IsClrLoaded(int pid)
+        {
+            try
+            {
+                using var proc = TargetProcess.Attach(pid, forWrite: false);
+                foreach (var m in proc.EnumerateModules())
+                {
+                    string n = System.IO.Path.GetFileName(m.Path ?? m.Name ?? "");
+                    if (n.Equals("coreclr.dll", StringComparison.OrdinalIgnoreCase)
+                     || n.Equals("clr.dll", StringComparison.OrdinalIgnoreCase)
+                     || n.Equals("mscorwks.dll", StringComparison.OrdinalIgnoreCase)
+                     || n.Equals("clrjit.dll", StringComparison.OrdinalIgnoreCase))
+                        return true;
+                }
+            }
+            catch { /* process not ready / unreadable — caller retries */ }
+            return false;
+        }
+
+        // Managed (.NET) live capture on an ALREADY-ATTACHED target: discover its
+        // JIT-compiled app methods (ClrMD) and hook their native entries through the
+        // same pipeline as a native capture. (To start a target from disk instead, use
+        // "Launch .NET & capture".) Honors "Capture returns"; behaves as a broad trace.
+        private async void OnCaptureManaged(object sender, RoutedEventArgs e)
+        {
+            if (_session == null)
+            {
+                Diag("Attach to a running .NET process first, or use \"Launch .NET & capture\" to start one from disk.");
+                if (StatusText != null) StatusText.Text = "Attach first, or use Launch .NET & capture.";
+                return;
+            }
+            await StartManagedCapture();
+        }
+
+        // Launch a .NET executable from disk and capture its managed calls from startup —
+        // the managed counterpart of the native "Launch & capture". The target is started
+        // with DOTNET_TieredCompilation=0 (stable JIT addresses, so a hook isn't bypassed
+        // by a tiered re-JIT); we wait briefly for the CLR to come up and app code to JIT,
+        // then attach and hook. Methods that JIT later are picked up by the rescan timer.
+        private async void OnLaunchManaged(object sender, RoutedEventArgs e)
+        {
+            var dlg = new Microsoft.Win32.OpenFileDialog
+            {
+                Title = "Launch a .NET executable and capture its managed calls",
+                Filter = "Executables (*.exe)|*.exe|All files (*.*)|*.*",
+            };
+            if (dlg.ShowDialog() != true) return;
+            string exe = dlg.FileName;
+
+            // Pre-launch bitness gate. Managed capture is bitness-locked (ClrMD's live
+            // attach needs a same-bitness CDA). A .NET Core app's .exe is a NATIVE apphost
+            // whose machine is authoritative, so we can refuse a mismatch WITHOUT even
+            // launching it. A managed/AnyCPU image's file bitness may not reflect how it
+            // actually runs, so those are launched and checked at runtime (after attach).
+            try
+            {
+                var probe = ProbePeHeader(exe);
+                if (!probe.IsManaged && probe.Is64Bit != Environment.Is64BitProcess)
+                {
+                    string need = probe.Is64Bit ? "x64" : "x86";
+                    Diag($"{System.IO.Path.GetFileName(exe)} is a {need} executable, but this is the {(Environment.Is64BitProcess ? "x64" : "x86")} CDA build — managed capture is bitness-locked (ClrMD). Run the {need} build of CDA. (Not launched.)");
+                    if (StatusText != null) StatusText.Text = $"That's a {need} app — run the {need} CDA build for managed capture (not launched).";
+                    return;
+                }
+            }
+            catch { /* unparseable / not a PE — let it launch; the runtime check backstops */ }
+
+            // NOTE: we deliberately do NOT tear down any current capture yet — if the
+            // launch/wait fails, the running trace should be left untouched. The prior
+            // capture is stopped only once the new target is confirmed (just before the
+            // session swap below), which also avoids the old poll racing a replaced session.
+            _diag.Clear();
+            Diag($"launch .NET: {System.IO.Path.GetFileName(exe)} — starting with DOTNET_TieredCompilation=0…");
+            System.Windows.Input.Mouse.OverrideCursor = System.Windows.Input.Cursors.Wait;
+            try
+            {
+                int pid;
+                try
+                {
+                    var psi = new System.Diagnostics.ProcessStartInfo(exe)
+                    {
+                        UseShellExecute = false,
+                        WorkingDirectory = System.IO.Path.GetDirectoryName(exe) ?? Environment.CurrentDirectory,
+                    };
+                    // Stable JIT addresses: a method compiles once, so a hook on it isn't
+                    // bypassed when tiered compilation would otherwise re-JIT to a new address.
+                    psi.Environment["DOTNET_TieredCompilation"] = "0";
+                    psi.Environment["DOTNET_TieredPGO"] = "0";
+                    psi.Environment["DOTNET_ReadyToRun"] = "0";
+                    using var proc = System.Diagnostics.Process.Start(psi);
+                    if (proc == null)
+                    {
+                        Diag("launch failed: Process.Start returned null.");
+                        if (StatusText != null) StatusText.Text = "Launch failed.";
+                        return;
+                    }
+                    pid = proc.Id; // disposing the wrapper (end of scope) releases the handle, not the process
+                }
+                catch (Exception ex)
+                {
+                    Diag("launch failed: " + ex.Message);
+                    if (StatusText != null) StatusText.Text = "Launch failed: " + ex.Message;
+                    return;
+                }
+
+                Diag($"launched pid {pid} — waiting for the .NET runtime to come up…");
+                if (StatusText != null) StatusText.Text = $"Launched pid {pid} — waiting for the .NET runtime…";
+
+                // Wait (bounded, ~15s) only for a CLR runtime MODULE to load — NOT for
+                // ClrMD (whose attach can fail for reasons unrelated to "is this .NET"),
+                // and NOT for app methods (which JIT lazily). We hook whatever is JIT'd at
+                // this point; the re-scan timer catches the rest as they compile.
+                bool clrUp = await Task.Run(() =>
+                {
+                    for (int i = 0; i < 75; i++)
+                    {
+                        if (IsClrLoaded(pid)) return true;
+                        System.Threading.Thread.Sleep(200);
+                    }
+                    return false;
+                });
+
+                if (!clrUp)
+                {
+                    Diag("no CLR runtime module (coreclr.dll/clr.dll) loaded within ~15s — the target may be native or NativeAOT, may have exited, may launch the real app as a CHILD process (launch that directly), or is very slow to start.");
+                    if (StatusText != null) StatusText.Text = "No .NET runtime module detected in the launched process.";
+                    return;
+                }
+
+                // New target confirmed. Now tear down any prior capture (synchronously,
+                // right before the swap — no window for the old poll to hit a new session)
+                // and attach a fresh live session.
+                // Attach to learn the target's ACTUAL runtime bitness (authoritative, unlike
+                // a managed/AnyCPU file's header). Check the match BEFORE tearing down the
+                // current capture — on a mismatch, stop the target we launched (it can't be
+                // captured from this build) and leave any running trace untouched.
+                var session = await Task.Run(() => LiveSession.Attach(pid));
+                if (Environment.Is64BitProcess != session.Is64Bit)
+                {
+                    string need = session.Is64Bit ? "x64" : "x86";
+                    Diag($"the launched target is a {need} .NET process, but this is the {(Environment.Is64BitProcess ? "x64" : "x86")} CDA build — managed capture is bitness-locked (ClrMD). Stopped it; run the {need} build of CDA and Launch .NET & capture again.");
+                    if (StatusText != null) StatusText.Text = $"That's a {need} .NET app — run the {need} CDA build to capture it (the launched process was stopped).";
+                    session.Dispose();
+                    try { TargetProcess.Kill(pid); } catch { /* best effort */ }
+                    return;
+                }
+
+                // Bitness matches. Now tear down any prior capture (synchronously, right
+                // before the swap — no window for the old poll to hit a new session) and
+                // adopt the fresh live session.
+                StopCapture();
+                _session?.Dispose();
+                _session = session;
+                _offlineTrace = false;
+                _childView = false;
+                _currentPe = null;
+                _is64 = session.Is64Bit;
+                _moduleMap = session.Modules;
+                _selectedFunctionAddr = 0;
+                ClearStringsTab();
+
+                await StartManagedCapture();
+            }
+            catch (Exception ex)
+            {
+                Diag("launch .NET failed: " + ex.Message);
+                if (StatusText != null) StatusText.Text = "Launch .NET failed: " + ex.Message;
+            }
+            finally { System.Windows.Input.Mouse.OverrideCursor = null; }
+        }
+
+        // Shared core (requires _session set): discover the target's JIT-compiled app
+        // methods and hook them through the native pipeline; start the poll + rescan
+        // timers. Methods JIT lazily, so the timer re-scans and hooks new ones. Honors
+        // "Capture returns"; behaves as a broad trace (clicks inspect, don't refocus).
+        private async Task StartManagedCapture()
+        {
+            if (_session == null) return;
+
+            // Managed capture requires a SAME-BITNESS CDA build. ClrMD's live attach loads
+            // a bitness-specific DAC into CDA's own process, so it fails with "Mismatched
+            // architecture" across bitness — a 64-bit CDA can't discover a 32-bit .NET
+            // target's JIT'd method addresses, and vice versa. (Native hooking itself is
+            // cross-bitness — the x64 host hooks WOW64 targets fine — so this limit is only
+            // on discovering managed methods, not on hooking them.) Confirmed by repro.
+            if (Environment.Is64BitProcess != _session.Is64Bit)
+            {
+                string need = _session.Is64Bit ? "x64" : "x86";
+                Diag($"managed capture needs the {need} CDA build for this {need} .NET target — ClrMD's live attach is bitness-locked (\"Mismatched architecture\"). Native captures (Start capture / Capture Windows API / imports) DO work cross-bitness; only discovering managed method names/addresses requires a same-bitness CDA.");
+                if (StatusText != null)
+                    StatusText.Text = $"This is a {need} .NET target — run the {need} build of CDA to capture managed calls (native capture buttons work cross-bitness).";
+                return;
+            }
+
+            int pid = _session.Process.Pid;
+            bool captureReturns = CaptureReturns?.IsChecked == true;
+            System.Windows.Input.Mouse.OverrideCursor = System.Windows.Input.Cursors.Wait;
+            try
+            {
+                if (!await Task.Run(() => IsClrLoaded(pid)))
+                {
+                    Diag("No CLR runtime module (coreclr.dll/clr.dll) is loaded — the target is native or NativeAOT. Use the native capture buttons.");
+                    if (StatusText != null) StatusText.Text = "Not a managed (.NET) process.";
+                    return;
+                }
+
+                // ClrMD discovers the JIT'd method addresses. Surface any ClrMD error
+                // (a DAC / bitness / permission failure) instead of silently getting 0
+                // methods — the CLR IS loaded (checked above), so an empty result here
+                // means ClrMD itself failed, which the diagnostic log should show.
+                var (methods, scanErr) = await Task.Run(() =>
+                {
+                    var m = ManagedMethodScanner.ScanJitted(pid, out var err);
+                    return (m, err);
+                });
+                if (scanErr != null) Diag("managed method discovery (ClrMD): " + scanErr);
+                var app = methods.FindAll(m => !ManagedMethodScanner.IsFrameworkModule(m.ModuleName));
+
+                // Build the managed dataset + a JIT-address → name resolver for the call
+                // log. This may be empty if the app hasn't run its own code yet; the
+                // re-scan timer fills it in as methods JIT, so we still set up and capture.
+                _managedLiveNames.Clear();
+                _managedHooked.Clear();
+                var ds = new TraceDataset { TimeStart = 0, TimeEnd = 1 };
+                var modules = new Dictionary<ulong, ModuleInfo>();
+                foreach (var m in app)
+                {
+                    _managedLiveNames[m.NativeCode] = m.FullName;
+                    ds.Functions.Add(new TracedFunction(m.NativeCode, m.ModuleImageBase, m.FullName));
+                    if (!modules.ContainsKey(m.ModuleImageBase))
+                        modules[m.ModuleImageBase] = new ModuleInfo(m.ModuleName, m.ModuleImageBase, 0, m.ModuleName);
+                }
+                ds.Modules.AddRange(modules.Values);
+
+                // Tear down any prior capture and set up the live managed view. This is a
+                // live trace, not the static managed file view, so clear that.
+                StopCapture();
+                SetManaged(null);
+                _offlineTrace = false;
+                _childView = false;
+                _apiCaptureMode = true; // broad trace: clicking a method inspects, never re-hooks
+                _currentPe = null;
+                _liveDataset = ds;
+                _moduleMap = _session.Modules;
+                _selectedFunctionAddr = 0;
+
+                _model.Load(ds);
+                GraphView.SetModel(_model);
+                PlayBar.SetData(ds);
+                FunctionList.LoadFromDataset(ds);
+                CallList.Configure(_moduleMap);
+                CallList.SetNameResolver(a => _managedLiveNames.TryGetValue(a, out var n) ? n : null);
+                _captured.Clear();
+                CallList.Clear();
+                ClearCallerGraph();
+                _autoUnhooked.Clear();
+                DisposeFileMap();
+                ulong hexAt = app.Count > 0 ? app[0].NativeCode : _session.Process.MinAddress;
+                Hex.SetSource(_session.Process, hexAt);
+                Disasm.SetSource(_session.Process, hexAt);
+
+                // Empty guard-based Start (creates the session + ring), then hook the
+                // managed JIT entries directly (they have no .pdata for the guard).
+                _capture = CaptureSession.Start(pid, Array.Empty<ulong>(), maxFunctions: 0,
+                    bufferRecords: 65536, out _, out _, out _, knownModules: null, captureReturns: captureReturns);
+                int added = 0;
+                if (app.Count > 0)
+                {
+                    added = _capture.HookMore(app.ConvertAll(m => m.NativeCode), out _, out string? merr);
+                    if (merr != null) Diag("managed hook — first skip: " + merr);
+                }
+                foreach (var m in app) _managedHooked.Add(m.NativeCode);
+                Diag($"managed capture: {added} of {app.Count} app method(s) hooked" +
+                     $"{(captureReturns ? " · returns on" : "")} · re-scanning for methods that JIT later…");
+
+                // Always start the poll + re-scan timers, even with 0 hooks yet — the
+                // re-scan hooks methods as they JIT and the poll folds in their calls.
+                // (A reload of the list on re-scan would wipe live counts, so the re-scan
+                // APPENDS rows instead — see OnManagedRescan / FunctionListView.AddFunctions.)
+                _pollTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
+                _pollTimer.Tick += OnPollTick;
+                _pollTimer.Start();
+                _captureFocus = 0;
+
+                _managedRescanTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
+                _managedRescanTimer.Tick += OnManagedRescan;
+                _managedRescanTimer.Start();
+
+                if (StatusText != null)
+                    StatusText.Text = (added > 0
+                        ? $"Capturing .NET · {added} method(s) hooked · rescanning for newly-JIT'd methods…"
+                        : "Capturing .NET · waiting for the app to run its own code (rescanning every 1s)…")
+                        + (captureReturns ? " · returns on" : "");
+            }
+            catch (Exception ex)
+            {
+                Diag("managed capture failed: " + ex.Message);
+                if (StatusText != null) StatusText.Text = "Managed capture failed: " + ex.Message;
+            }
+            finally { System.Windows.Input.Mouse.OverrideCursor = null; }
+        }
+
+        // Re-scan the managed target for methods that have JIT-compiled since the last
+        // scan and hook them live, adding them to the function list. Runs off the UI
+        // thread for the scan; hooks (which briefly freeze the target) on the UI thread.
+        private async void OnManagedRescan(object? sender, EventArgs e)
+        {
+            var cap = _capture;
+            if (cap == null || _session == null || _managedRescanning) return; // skip if a scan is still running
+            int pid = _session.Process.Pid;
+
+            // A ClrMD scan of a large app can exceed the 1 s timer interval; the guard
+            // stops multiple heavy passive attaches from piling up under load.
+            _managedRescanning = true;
+            try
+            {
+                List<ManagedMethodInfo> methods;
+                try { methods = await Task.Run(() => ManagedMethodScanner.ScanJitted(pid, out _)); }
+                catch { return; }
+                if (_capture != cap || _liveDataset == null) return; // capture changed while scanning
+
+                var fresh = methods.FindAll(m => !ManagedMethodScanner.IsFrameworkModule(m.ModuleName)
+                                              && !_managedHooked.Contains(m.NativeCode));
+                if (fresh.Count == 0) return;
+
+                int added = cap.HookMore(fresh.ConvertAll(m => m.NativeCode), out _, out _);
+                var freshFns = new List<TracedFunction>(fresh.Count);
+                foreach (var m in fresh)
+                {
+                    _managedHooked.Add(m.NativeCode);
+                    _managedLiveNames[m.NativeCode] = m.FullName;
+                    var tf = new TracedFunction(m.NativeCode, m.ModuleImageBase, m.FullName);
+                    _liveDataset.Functions.Add(tf);
+                    freshFns.Add(tf);
+                }
+                // Append the new methods WITHOUT reloading the list — a reload would rebuild
+                // every row from the dataset (call count 0) and wipe the counts the poll has
+                // been folding into the existing rows.
+                FunctionList.AddFunctions(freshFns, _moduleMap);
+                if (added > 0)
+                    Diag($"managed rescan: +{added} newly-JIT'd method(s) hooked (total {_managedHooked.Count}).");
+            }
+            finally { _managedRescanning = false; }
+        }
+
+        private void StopManagedRescan()
+        {
+            if (_managedRescanTimer != null)
+            {
+                _managedRescanTimer.Stop();
+                _managedRescanTimer.Tick -= OnManagedRescan;
+                _managedRescanTimer = null;
+            }
+        }
+
         private void OnFunctionSelected(object? sender, ulong address)
         {
             _selectedFunctionAddr = address;
             GraphView.SetSelected(address); // re-centre the call-graph (butterfly) view
 
+            // Managed (.NET) method: render IL + decompiled C# instead of native
+            // disassembly, and stop (a static managed file has no live trace).
+            if (_managedImage != null && _managedByAddr.TryGetValue(address, out var mm))
+            {
+                ShowManagedMethod(mm);
+                StatusText.Text = $"Selected {mm.FullName} — IL + decompiled C# in the Disassembly tab.";
+                return;
+            }
+
             // Unconditional, immediate confirmation that the click registered.
             StatusText.Text = $"Selected {DescribeAddr(address)}.";
 
-            // Navigate the hex view (Memory tab) to the function.
+            // Navigate the hex view (Memory tab) and the Disassembly view to the function.
             if (_currentPe != null && _currentPe.TryVaToFileOffset(address, out uint off))
                 Hex.GoTo(off);
             else
                 Hex.GoTo(address);
+            NavigateDisasm(address);
 
             // Jump to this function's latest call in the Calls list. The full trace
             // is kept, so if it was ever called the row is present.
@@ -817,6 +1291,7 @@ namespace Cda.App
         {
             _startupActive = false;
             if (_debugWatch != null) { _debugWatch.Stop(); _debugWatch = null; }
+            StopManagedRescan();
             if (_captureBursting) { _captureBursting = false; System.Windows.Input.Mouse.OverrideCursor = null; }
             if (_pollTimer != null) { _pollTimer.Stop(); _pollTimer.Tick -= OnPollTick; _pollTimer = null; }
             var cap = _capture;
@@ -842,6 +1317,7 @@ namespace Cda.App
             SetCallersTarget(0);
             _offlineTrace = false;
             _childView = false;
+            SetManaged(null); // leaving any static managed view (frees its buffer; native addrs can't match tagged keys)
             ClearStringsTab(); // armed below to scan the live process image when the tab is opened
 
             System.Windows.Input.Mouse.OverrideCursor = System.Windows.Input.Cursors.Wait;
@@ -865,6 +1341,8 @@ namespace Cda.App
                 FunctionList.LoadFromDataset(data);
                 DisposeFileMap();
                 Hex.SetSource(session.Process,
+                    data.Functions.Count > 0 ? data.Functions[0].Address : session.Process.MinAddress);
+                Disasm.SetSource(session.Process,
                     data.Functions.Count > 0 ? data.Functions[0].Address : session.Process.MinAddress);
 
                 Diag($"✓ attached to {label} ({pid}) · {(session.Is64Bit ? "x64" : "x86")} · " +
@@ -1202,6 +1680,8 @@ namespace Cda.App
                 _moduleMap = session.Modules;
                 DisposeFileMap();
                 Hex.SetSource(session.Process,
+                    session.Dataset.Functions.Count > 0 ? session.Dataset.Functions[0].Address : session.Process.MinAddress);
+                Disasm.SetSource(session.Process,
                     session.Dataset.Functions.Count > 0 ? session.Dataset.Functions[0].Address : session.Process.MinAddress);
 
                 if (armed)
@@ -1586,6 +2066,7 @@ namespace Cda.App
                 CallList.Configure(_moduleMap);
                 DisposeFileMap();
                 Hex.SetSource(session.Process, h.Module.BaseAddress);
+                Disasm.SetSource(session.Process, h.Module.BaseAddress);
                 _diag.Add($"post-hook attach ok: {session.Dataset.Functions.Count} functions (UI/focus session)");
             }
             catch (Exception ex) { _diag.Add("post-hook attach failed: " + ex.Message); }
@@ -1797,6 +2278,7 @@ namespace Cda.App
             FunctionList.AddCounts(t.Records);
             DisposeFileMap();
             Hex.SetSource(null); // child targets have no live memory view
+            Disasm.SetSource(null);
 
             CallList.Configure(_moduleMap);
             CallList.Clear();
@@ -2409,6 +2891,8 @@ namespace Cda.App
                 CallList.Configure(_moduleMap);
                 DisposeFileMap();
                 Hex.SetSource(session.Process,
+                    session.Dataset.Functions.Count > 0 ? session.Dataset.Functions[0].Address : session.Process.MinAddress);
+                Disasm.SetSource(session.Process,
                     session.Dataset.Functions.Count > 0 ? session.Dataset.Functions[0].Address : session.Process.MinAddress);
                 _diag.Add($"post-hook attach ok: {session.Dataset.Functions.Count} functions (UI/focus session)");
             }
@@ -3237,6 +3721,7 @@ namespace Cda.App
             GraphView.SetSelected(address);
             if (_currentPe != null && _currentPe.TryVaToFileOffset(address, out uint off)) Hex.GoTo(off);
             else Hex.GoTo(address);
+            NavigateDisasm(address);
             StatusText.Text = inList
                 ? $"Caller {DescribeAddr(address)} — selected."
                 : $"Caller {DescribeAddr(address)} — shown in the Memory tab.";
@@ -3264,7 +3749,8 @@ namespace Cda.App
             {
                 _capture = CaptureSession.Start(_session.Process.Pid, candidates,
                     maxFunctions: maxFunctions, bufferRecords: bufferRecords,
-                    out int instrumented, out int skipped, out string? firstError);
+                    out int instrumented, out int skipped, out string? firstError,
+                    knownModules: null, captureReturns: CaptureReturns?.IsChecked == true);
                 CallList.Configure(_moduleMap);
                 // A refocus / single-function start within the same session keeps the
                 // accumulated call log (and the arguments it backs); only loading a
@@ -3571,6 +4057,7 @@ namespace Cda.App
             StopApiLaunch();
             StopChildFollow();
             StopHwbp();
+            StopManagedRescan();
             _captureFocus = 0;
             _apiCaptureMode = false;
             if (_captureBursting) { _captureBursting = false; System.Windows.Input.Mouse.OverrideCursor = null; }
@@ -3898,6 +4385,7 @@ namespace Cda.App
             FunctionList.StampCallOrder(ds.Records); // so "Call order" works on an offline trace
             DisposeFileMap();
             Hex.SetSource(null); // offline: no live memory to show
+            Disasm.SetSource(null);
 
             // Rebuild the Calls log and the caller graph from the loaded records.
             CallList.Configure(_moduleMap);
