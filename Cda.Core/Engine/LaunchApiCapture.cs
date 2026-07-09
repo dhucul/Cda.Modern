@@ -38,7 +38,10 @@ namespace Cda.Core.Engine
     ///     anti-tamper target that checksums its own code is captured cleanly;
     ///   * <see cref="HookMode.Exports"/> splices the functions the program's own
     ///     modules EXPORT (their public surface — see <see cref="ExportScanner"/>),
-    ///     capturing calls IN to the app's own libraries from startup.
+    ///     capturing calls IN to the app's own libraries from startup;
+    ///   * <see cref="HookMode.Dialogs"/> splices only the OS dialog-box-creating
+    ///     functions (see <see cref="DialogApiScanner"/>), so a startup nag/splash/
+    ///     error dialog is attributed to the app function that raised it.
     ///
     /// All Win32 debug calls must be made from the one thread that created the
     /// debuggee, so the whole loop lives on a dedicated background thread; progress
@@ -49,7 +52,7 @@ namespace Cda.Core.Engine
     /// </summary>
     public sealed class LaunchApiCapture : IDisposable
     {
-        public enum HookMode { Inline, Iat, Exports }
+        public enum HookMode { Inline, Iat, Exports, Dialogs }
 
         /// <summary>Everything the UI needs once the launched target's imports are hooked.</summary>
         public sealed class HookedApis
@@ -78,6 +81,15 @@ namespace Cda.Core.Engine
         public event Action? TargetExited;
 
         /// <summary>
+        /// (Dialogs mode) Raised when a dialog host that loads AFTER the first one is
+        /// hooked (e.g. comctl32 after user32) is discovered — carrying its new dialog
+        /// functions. The subscriber must install them with
+        /// <see cref="CaptureSession.HookMore"/> on the poll thread (hook-list mutation
+        /// isn't synchronized against the loop thread), so it can't be armed here.
+        /// </summary>
+        public event Action<IReadOnlyList<TracedFunction>>? MoreDialogsHooked;
+
+        /// <summary>
         /// Raised (with a reason) when the loader breakpoint was reached but nothing
         /// could be hooked — discovery found no matching surface, or the hook attempt
         /// threw. The target keeps running un-instrumented; the UI uses this to tear
@@ -99,7 +111,15 @@ namespace Cda.Core.Engine
         private volatile bool _stop;
         private int _pid;
         private bool _hooked;
-        private bool _loaderBpSeen; // the initial loader breakpoint has been consumed
+        private bool _loaderBpSeen;   // the initial loader breakpoint has been consumed
+        private bool _dialogHostSeen; // (Dialogs mode) a user32/comctl32 LOAD_DLL has arrived post-loader-BP
+
+        // (Dialogs mode) the live session, once the first dialog host is armed, and the
+        // set of dialog entries already hooked — so a later host is hooked additively
+        // (HookMore) and never double-hooked.
+        private CaptureSession? _dialogSession;
+        private readonly HashSet<ulong> _dialogHookedAddrs = new();
+        private readonly List<ModuleInfo> _dialogModules = new();
 
         public LaunchApiCapture(string exePath, string commandLine, HookMode mode,
             int maxFunctions, int bufferRecords, bool disableAslr = false)
@@ -178,8 +198,36 @@ namespace Cda.Core.Engine
                             break;
 
                         case NativeMethods.LOAD_DLL_DEBUG_EVENT:
-                            CloseEventFile(Marshal.ReadIntPtr(evt, U)); // LOAD_DLL_DEBUG_INFO.hFile
+                        {
+                            IntPtr hFile = Marshal.ReadIntPtr(evt, U);                   // LOAD_DLL_DEBUG_INFO.hFile
+                            IntPtr baseOfDll = Marshal.ReadIntPtr(evt, U + IntPtr.Size); // .lpBaseOfDll
+                            // Dialog capture: hook user32/comctl32 the instant it maps —
+                            // still frozen in this event, before the app can call into it —
+                            // off the event's AUTHORITATIVE base (the debugger's module list
+                            // can lag at a module's own load). A host that loads later
+                            // (e.g. comctl32 after user32) is armed additively too.
+                            if (_mode == HookMode.Dialogs && _loaderBpSeen)
+                            {
+                                try
+                                {
+                                    string fn = Path.GetFileName(ResolvePath(hFile));
+                                    bool isHost = fn.Equals("user32.dll", StringComparison.OrdinalIgnoreCase) ||
+                                                  fn.Equals("comctl32.dll", StringComparison.OrdinalIgnoreCase);
+                                    if (isHost)
+                                    {
+                                        _dialogHostSeen = true;
+                                        ArmDialogs((ulong)baseOfDll.ToInt64(), fn);
+                                    }
+                                    else if (!_hooked && _dialogHostSeen)
+                                    {
+                                        ArmDialogs(0, null); // safety retry before the first arm
+                                    }
+                                }
+                                catch (Exception ex) { Log?.Invoke("dialog hook-on-load failed: " + ex.Message); }
+                            }
+                            CloseEventFile(hFile);
                             break;
+                        }
 
                         case NativeMethods.EXCEPTION_DEBUG_EVENT:
                         {
@@ -200,15 +248,30 @@ namespace Cda.Core.Engine
                                 _loaderBpSeen = true;
                                 if (!_hooked)
                                 {
-                                    _hooked = true; // one attempt; don't retry on a later breakpoint
-                                    bool armed = false;
-                                    try { armed = HookSurface(); }
-                                    catch (Exception ex) { Log?.Invoke("startup hook failed: " + ex.Message); }
-                                    // Discovery found nothing to hook (or threw): the loop
-                                    // would otherwise sit attached to a running target with
-                                    // no capture. Tell the UI so it can detach and free up.
-                                    if (!armed)
-                                        Aborted?.Invoke("startup capture: nothing was hooked — detaching (the target keeps running).");
+                                    if (_mode == HookMode.Dialogs)
+                                    {
+                                        // Dialog capture: user32/comctl32 may not be mapped
+                                        // yet (a .NET, packed, or delay-loaded target). Arm
+                                        // any already loaded; if none, DON'T abort — the
+                                        // LOAD_DLL handler arms them the instant they map.
+                                        try { ArmDialogs(0, null); }
+                                        catch (Exception ex) { Log?.Invoke("startup dialog hook failed: " + ex.Message); }
+                                        if (!_hooked)
+                                            Log?.Invoke("dialog APIs (user32/comctl32) aren't loaded yet — " +
+                                                        "watching, and arming the moment they load…");
+                                    }
+                                    else
+                                    {
+                                        _hooked = true; // one attempt; don't retry on a later breakpoint
+                                        bool armed = false;
+                                        try { armed = HookSurface(); }
+                                        catch (Exception ex) { Log?.Invoke("startup hook failed: " + ex.Message); }
+                                        // Discovery found nothing to hook (or threw): the loop
+                                        // would otherwise sit attached to a running target with
+                                        // no capture. Tell the UI so it can detach and free up.
+                                        if (!armed)
+                                            Aborted?.Invoke("startup capture: nothing was hooked — detaching (the target keeps running).");
+                                    }
                                 }
                             }
                             else if (DebugExceptionInfo.IsCrash(exCode) || isBp)
@@ -256,6 +319,108 @@ namespace Cda.Core.Engine
                 NativeMethods.CloseHandle(h);
         }
 
+        // The on-disk path behind a LOAD_DLL event's file handle, to recognize which
+        // module just mapped (used to spot user32/comctl32 for dialog capture).
+        private static string ResolvePath(IntPtr hFile)
+        {
+            if (hFile == IntPtr.Zero || hFile == NativeMethods.INVALID_HANDLE_VALUE) return "";
+            char[] buf = new char[600];
+            uint n = NativeMethods.GetFinalPathNameByHandleW(hFile, buf, (uint)buf.Length, 0);
+            if (n == 0 || n >= buf.Length) return "";
+            return new string(buf, 0, (int)n);
+        }
+
+        // (Dialogs mode) Discover and hook the dialog-box functions currently mapped,
+        // optionally forcing a just-loaded module (from a LOAD_DLL event's authoritative
+        // base) into the scan so a lag in the debugger's module list at the module's own
+        // load event can't hide it. The FIRST host creates the session and raises
+        // <see cref="Hooked"/> here on the loop thread — safe because no poll runs yet.
+        // A LATER host (e.g. comctl32 after user32) is handed to the UI via
+        // <see cref="MoreDialogsHooked"/>, which installs it with HookMore on the poll
+        // thread (hook-list mutation isn't synchronized against the loop thread).
+        private void ArmDialogs(ulong ensureBase, string? ensureName)
+        {
+            ModuleMap map;
+            DialogApiScanner.Result dlg;
+            bool is64;
+            using (var probe = TargetProcess.Attach(_pid, forWrite: false))
+            {
+                is64 = probe.Is64Bit;
+                var mods = new List<ModuleInfo>(probe.EnumerateModules());
+                if (ensureBase != 0 && ensureName != null &&
+                    !mods.Exists(m => m.BaseAddress == ensureBase))
+                {
+                    uint size = ReadSizeOfImage(probe, ensureBase);
+                    if (size > 0) mods.Add(new ModuleInfo(ensureName, ensureBase, size, ensureName));
+                }
+                map = new ModuleMap(mods);
+                dlg = DialogApiScanner.Discover(probe, map);
+            }
+
+            var fresh = new List<TracedFunction>();
+            foreach (var f in dlg.Functions)
+                if (!_dialogHookedAddrs.Contains(f.Address)) fresh.Add(f);
+            if (fresh.Count == 0) return;
+
+            var addrs = new List<ulong>(fresh.Count);
+            foreach (var f in fresh) addrs.Add(f.Address);
+
+            if (_dialogSession == null)
+            {
+                // First host: safe to hook here — the UI hasn't started polling yet.
+                var session = CaptureSession.Start(_pid, addrs, _maxFunctions, _bufferRecords,
+                    out int instrumented, out int skipped, out string? firstError);
+                if (instrumented <= 0)
+                {
+                    session.Dispose();
+                    Log?.Invoke($"found {fresh.Count} dialog API(s) but none could be hooked ({firstError ?? "?"}); will retry.");
+                    return;
+                }
+                _dialogSession = session;
+                foreach (var f in fresh) _dialogHookedAddrs.Add(f.Address);
+                foreach (var m in dlg.Modules)
+                    if (!_dialogModules.Exists(x => x.BaseAddress == m.BaseAddress)) _dialogModules.Add(m);
+
+                var ds = new TraceDataset { TimeStart = 0, TimeEnd = 1 };
+                ds.Modules.AddRange(_dialogModules);
+                ds.Functions.AddRange(fresh);
+                ds.PruneUnreferencedModules();
+
+                _hooked = true;
+                Log?.Invoke($"dialog capture: hooked {instrumented} dialog function(s) — a dialog from here on " +
+                            "is attributed to the app function that raised it.");
+                Hooked?.Invoke(new HookedApis
+                {
+                    Pid = _pid, Is64Bit = is64, Mode = _mode, Session = session, Dataset = ds,
+                    ModuleMap = map, Instrumented = instrumented, Skipped = skipped, FirstError = firstError,
+                    DistinctApis = fresh.Count, ApiModules = dlg.Modules.Count,
+                });
+            }
+            else
+            {
+                // A later host: mark hooked and let the UI install them (HookMore must
+                // run on the poll thread). Marking now prevents re-raising on retries.
+                foreach (var f in fresh) _dialogHookedAddrs.Add(f.Address);
+                Log?.Invoke($"dialog capture: {fresh.Count} more dialog function(s) available (from " +
+                            $"{ensureName ?? "a newly-loaded module"}) — installing…");
+                MoreDialogsHooked?.Invoke(fresh);
+            }
+        }
+
+        // Read SizeOfImage from a mapped module's PE header at the given base. Lets a
+        // module just delivered by a LOAD_DLL event be scanned off its authoritative
+        // base even when the debugger's module list hasn't caught up. 0 on any problem.
+        private static uint ReadSizeOfImage(TargetProcess process, ulong baseAddr)
+        {
+            byte[] hdr = new byte[0x400];
+            if (process.ReadMemory(baseAddr, hdr) < hdr.Length) return 0;
+            if (hdr[0] != (byte)'M' || hdr[1] != (byte)'Z') return 0;
+            int e = BitConverter.ToInt32(hdr, 0x3C);
+            if (e <= 0 || e + 24 + 60 > hdr.Length) return 0;
+            if (hdr[e] != (byte)'P' || hdr[e + 1] != (byte)'E') return 0;
+            return BitConverter.ToUInt32(hdr, e + 24 + 56); // OptionalHeader.SizeOfImage
+        }
+
         // The target is frozen at the loader breakpoint: the loader has finished
         // (imports bound, static DllMains run) and the program's entry point has not
         // run. Discover the chosen call surface and arm the hooks before we continue.
@@ -266,6 +431,8 @@ namespace Cda.Core.Engine
         // because discovery found no matching surface at all.
         private bool HookSurface()
         {
+            // Dialogs mode is armed by ArmDialogs (which handles late-loaded user32/
+            // comctl32), not through here.
             ModuleMap map;
             ApiImportScanner.Result? imports = null;
             ApiImportScanner.SlotResult? slots = null;

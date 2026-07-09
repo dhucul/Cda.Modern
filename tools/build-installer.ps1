@@ -45,7 +45,14 @@ $arches = if ($Arch -eq 'both') { @('x64', 'x86') } else { @($Arch) }
 foreach ($a in $arches) {
     $publishDir = Join-Path $installDir "publish-$a"
 
-    if ($Clean -and (Test-Path $publishDir)) {
+    # Always wipe the publish dir first. A non-clean publish can leave a STALE
+    # assembly behind that dotnet publish doesn't overwrite — e.g. an old .NET 8
+    # runtime System.Reflection.Metadata.dll (8.0.x) surviving over the required
+    # package version (9.0.x from ICSharpCode.Decompiler), which then throws
+    # FileNotFoundException at startup. A release installer must ship only freshly
+    # resolved binaries, so cleaning is unconditional (the -Clean switch is kept
+    # for back-compat but no longer needed).
+    if (Test-Path $publishDir) {
         Write-Host "Cleaning $publishDir ..." -ForegroundColor Cyan
         Remove-Item $publishDir -Recurse -Force
     }

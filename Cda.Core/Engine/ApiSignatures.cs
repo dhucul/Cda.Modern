@@ -100,6 +100,15 @@ namespace Cda.Core.Engine
 
             // --- windows / messages -----------------------------------------
             ["MessageBox"] = new[] { P("hWnd", ApiParamKind.Handle), P("lpText", ApiParamKind.String), P("lpCaption", ApiParamKind.String), P("uType", ApiParamKind.Hex) },
+            ["MessageBoxEx"] = new[] { P("hWnd", ApiParamKind.Handle), P("lpText", ApiParamKind.String), P("lpCaption", ApiParamKind.String), P("uType", ApiParamKind.Hex), P("wLanguageId", ApiParamKind.Hex) },
+            ["MessageBoxTimeout"] = new[] { P("hWnd", ApiParamKind.Handle), P("lpText", ApiParamKind.String), P("lpCaption", ApiParamKind.String), P("uType", ApiParamKind.Hex), P("wLanguageId", ApiParamKind.Hex), P("dwMilliseconds", ApiParamKind.Int) },
+            ["MessageBoxIndirect"] = new[] { P("lpMsgBoxParams", ApiParamKind.Pointer) },
+            ["DialogBoxParam"] = new[] { P("hInstance", ApiParamKind.Handle), P("lpTemplateName", ApiParamKind.String), P("hWndParent", ApiParamKind.Handle), P("lpDialogFunc", ApiParamKind.Pointer), P("dwInitParam", ApiParamKind.Hex) },
+            ["DialogBoxIndirectParam"] = new[] { P("hInstance", ApiParamKind.Handle), P("hDialogTemplate", ApiParamKind.Pointer), P("hWndParent", ApiParamKind.Handle), P("lpDialogFunc", ApiParamKind.Pointer), P("dwInitParam", ApiParamKind.Hex) },
+            ["CreateDialogParam"] = new[] { P("hInstance", ApiParamKind.Handle), P("lpTemplateName", ApiParamKind.String), P("hWndParent", ApiParamKind.Handle), P("lpDialogFunc", ApiParamKind.Pointer), P("dwInitParam", ApiParamKind.Hex) },
+            ["CreateDialogIndirectParam"] = new[] { P("hInstance", ApiParamKind.Handle), P("lpTemplate", ApiParamKind.Pointer), P("hWndParent", ApiParamKind.Handle), P("lpDialogFunc", ApiParamKind.Pointer), P("dwInitParam", ApiParamKind.Hex) },
+            ["TaskDialog"] = new[] { P("hwndOwner", ApiParamKind.Handle), P("hInstance", ApiParamKind.Handle), P("pszWindowTitle", ApiParamKind.String), P("pszMainInstruction", ApiParamKind.String), P("pszContent", ApiParamKind.String), P("dwCommonButtons", ApiParamKind.Hex), P("pszIcon", ApiParamKind.Pointer), P("pnButton", ApiParamKind.Pointer) },
+            ["TaskDialogIndirect"] = new[] { P("pTaskConfig", ApiParamKind.Pointer), P("pnButton", ApiParamKind.Pointer), P("pnRadioButton", ApiParamKind.Pointer), P("pfVerificationFlagChecked", ApiParamKind.Pointer) },
             ["GetWindowText"] = new[] { P("hWnd", ApiParamKind.Handle), P("lpString", ApiParamKind.Pointer), P("nMaxCount", ApiParamKind.Int) },
             ["SetWindowText"] = new[] { P("hWnd", ApiParamKind.Handle), P("lpString", ApiParamKind.String) },
             ["SendMessage"] = new[] { P("hWnd", ApiParamKind.Handle), P("Msg", ApiParamKind.Hex), P("wParam", ApiParamKind.Hex), P("lParam", ApiParamKind.Hex) },

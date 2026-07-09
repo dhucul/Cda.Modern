@@ -19,7 +19,7 @@
   #define Arch "x64"
 #endif
 
-#define AppVersion   "1.7.0"
+#define AppVersion   "1.9.0"
 #define AppExeName   "Cda.App.exe"
 #define AppPublisher "CDA"
 #define PublishDir   "publish-" + Arch

@@ -185,6 +185,12 @@ namespace Cda.App
         // Broad "Capture Windows API" trace active: a click then inspects callers
         // (the follow-up) rather than refocusing the whole trace onto one API.
         private bool _apiCaptureMode;
+
+        // Dialog-caller capture active: the poll loop (CheckDialogCalls) surfaces each
+        // dialog the target raises — and the app function that raised it — into the
+        // Dialogs tab. _dialogApiAddrs is the set of hooked dialog-API entry addresses.
+        private bool _dialogMode;
+        private readonly HashSet<ulong> _dialogApiAddrs = new();
         private string? _winDir; // cached Windows directory, for app/system classification
         private readonly Dictionary<ulong, bool> _appModuleCache = new(); // module base -> is app code
         private readonly Dictionary<ulong, bool> _retAddrCache = new();   // code addr -> looks like a return address
@@ -288,6 +294,8 @@ namespace Cda.App
             CallList.SetNameResolver(ResolveCalleeName);
             Callers.CallerSelected += (_, addr) => OnCallerSelected(addr);
             CallStack.FrameSelected += (_, addr) => OnCallerSelected(addr);
+            DialogList.CallerSelected += (_, addr) => OnCallerSelected(addr);
+            DialogList.RowActivated += (_, rec) => ShowCallStack(rec);
             StringsPanel.FunctionActivated += OnStringFunctionActivated;
             StringsPanel.Shown += (_, _) => RunStringScan(); // lazy: scan when the tab is opened
             ChildTargetBox.ItemsSource = _childItems;
@@ -2629,6 +2637,98 @@ namespace Cda.App
             _apiCaptureMode = _capture != null; // a click now inspects callers, doesn't refocus
         }
 
+        // Hook ONLY the OS dialog-box functions on the attached process, so a dialog
+        // the target raises is attributed to the app function that created it (surfaced
+        // in the Dialogs tab). Mirrors OnCaptureApi, but discovers the dialog surface by
+        // address from user32/comctl32 (DialogApiScanner) instead of the whole imported
+        // API set — so it catches a dialog however the program reached the call (static
+        // import, GetProcAddress, delay-load, or a third-party DLL).
+        private async void OnDetectDialogCaller(object sender, RoutedEventArgs e)
+        {
+            if (_session == null)
+            {
+                StatusText.Text = "Attach to a process first (Attach to process…), then Detect dialog caller.";
+                return;
+            }
+            if (_capture != null || _dllCapture != null || _apiLaunch != null)
+            {
+                StatusText.Text = "Capture already running — stop it first.";
+                return;
+            }
+            if (!Environment.Is64BitProcess && _session.Is64Bit)
+            {
+                StatusText.Text = "A 32-bit build cannot instrument a 64-bit target. Rebuild as x64.";
+                return;
+            }
+
+            _offlineTrace = false;
+            _childView = false;
+            var session = _session;
+            Diag("Dialogs: resolving the OS dialog-box functions (user32/comctl32)…");
+
+            DialogApiScanner.Result dlg;
+            try
+            {
+                // Reads target memory + parses the user32/comctl32 export tables off the UI thread.
+                dlg = await Task.Run(() => DialogApiScanner.Discover(session.Process, session.Modules));
+            }
+            catch (Exception ex)
+            {
+                Diag("dialog-API discovery failed: " + ex.Message);
+                return;
+            }
+
+            if (_session != session) { Diag("target changed during dialog-API discovery — aborted."); return; }
+
+            if (dlg.Functions.Count == 0)
+            {
+                Diag("No dialog-box APIs found to hook — user32/comctl32 aren't loaded in the target " +
+                     "(a console app with no GUI, or the GUI DLLs aren't mapped yet). Attach after the app " +
+                     "has shown a window, or use Launch & detect dialogs… to catch dialogs raised at startup.");
+                return;
+            }
+
+            var addresses = new List<ulong>(dlg.Functions.Count);
+            foreach (var f in dlg.Functions) addresses.Add(f.Address);
+
+            // Dialog-only view: nodes are the dialog functions, under user32/comctl32.
+            var ds = new TraceDataset { TimeStart = 0, TimeEnd = 1 };
+            ds.Modules.AddRange(dlg.Modules);
+            ds.Functions.AddRange(dlg.Functions);
+            ds.PruneUnreferencedModules();
+
+            _currentPe = null;
+            _is64 = session.Is64Bit;
+            _liveDataset = ds;
+            _moduleMap = session.Modules; // full map: resolves both callers (app) and callees (OS)
+            _selectedFunctionAddr = 0;
+            _captureFocus = 0;
+
+            _model.Load(ds);
+            GraphView.SetModel(_model);
+            PlayBar.SetData(ds);
+            FunctionList.LoadFromDataset(ds);
+            SetCallersTarget(0);
+
+            _diag.Add($"dialog-API discovery: {dlg.Functions.Count} function(s) across {dlg.Modules.Count} " +
+                      "system module(s)" +
+                      (dlg.SkippedForwarders > 0 ? $"; skipped {dlg.SkippedForwarders} forwarder(s)" : ""));
+
+            // Arm the hooks (resets the call log + Dialogs tab; starts polling).
+            StartCaptureOn(addresses, $"{addresses.Count} dialog-box function(s)",
+                maxFunctions: ApiTraceFunctions, bufferRecords: StartupBufferRecords);
+
+            if (_capture != null)
+            {
+                _apiCaptureMode = true; // a click inspects callers, doesn't refocus onto one dialog API
+                _dialogMode = true;
+                _dialogApiAddrs.Clear(); // StartCaptureOn cleared it; repopulate with the hooked set
+                foreach (var f in dlg.Functions) _dialogApiAddrs.Add(f.Address);
+                Diag($"✓ Watching for dialogs · {_capture.HookedCount} dialog hook(s) armed — trigger a dialog " +
+                     "in the target and the Dialogs tab will name the function that raised it.");
+            }
+        }
+
         // Hook the IAT slots of the imports the attached process makes into the OS
         // — by overwriting import-table pointers (data), NEVER patching .text. This
         // captures the same Windows-API call flow as Capture Windows API, but works
@@ -2740,11 +2840,15 @@ namespace Cda.App
         private void OnLaunchExportCapture(object sender, RoutedEventArgs e) =>
             LaunchSurfaceCapture(LaunchApiCapture.HookMode.Exports, "exported-function calls");
 
+        private void OnLaunchDialogCapture(object sender, RoutedEventArgs e) =>
+            LaunchSurfaceCapture(LaunchApiCapture.HookMode.Dialogs, "dialog-box calls (from startup)");
+
         // A short noun for the surface a launch capture is tracing, for status lines.
         private static string SurfaceNoun(LaunchApiCapture.HookMode mode) => mode switch
         {
             LaunchApiCapture.HookMode.Inline => "Windows API",
             LaunchApiCapture.HookMode.Iat => "imports",
+            LaunchApiCapture.HookMode.Dialogs => "dialog APIs",
             _ => "exports",
         };
 
@@ -2823,6 +2927,7 @@ namespace Cda.App
                 StopCapture();
             }));
             _apiLaunch.Hooked += h => Dispatcher.BeginInvoke(new Action(() => OnApiLaunchHooked(h)));
+            _apiLaunch.MoreDialogsHooked += funcs => Dispatcher.BeginInvoke(new Action(() => OnMoreDialogsHooked(funcs)));
             _apiLaunch.Aborted += m => Dispatcher.BeginInvoke(new Action(() =>
             {
                 // Loader breakpoint reached but nothing was hooked: the loop is now a
@@ -2857,6 +2962,13 @@ namespace Cda.App
             _captureFocus = 0;          // broad trace
             _apiCaptureMode = true;     // a click inspects callers, doesn't refocus onto one API
             _moduleMap = h.ModuleMap;   // full map: resolves both callers (app) and callees (OS)
+
+            // Dialog-caller launch: arm the Dialogs-tab reporting for the hooked set.
+            _dialogApiAddrs.Clear();
+            DialogList.Clear();
+            _dialogMode = h.Mode == LaunchApiCapture.HookMode.Dialogs;
+            if (_dialogMode)
+                foreach (var f in h.Dataset.Functions) _dialogApiAddrs.Add(f.Address);
             _captured.Clear();
             _autoUnhooked.Clear();
             _maxCursorSeen = 0;
@@ -2899,6 +3011,28 @@ namespace Cda.App
             catch (Exception ex) { _diag.Add("post-hook attach failed: " + ex.Message); }
         }
 
+        // A dialog host that loaded AFTER the first one (e.g. comctl32 after user32):
+        // install its dialog functions HERE, on the poll thread, because CaptureSession's
+        // hook list isn't synchronized against the launch loop's thread. Fold them into
+        // the dialog-report address set and the dataset so their calls are recognized and
+        // named.
+        private void OnMoreDialogsHooked(IReadOnlyList<TracedFunction> funcs)
+        {
+            if (_capture == null || !_dialogMode || funcs.Count == 0) return;
+            var addrs = new List<ulong>(funcs.Count);
+            foreach (var f in funcs) addrs.Add(f.Address);
+            int added = _capture.HookMore(addrs, out _, out string? firstError);
+            foreach (var f in funcs) _dialogApiAddrs.Add(f.Address);
+            if (_liveDataset != null)
+            {
+                _liveDataset.Functions.AddRange(funcs);
+                _nameIndexFor = null; // force ResolveCalleeName to re-index so the new names resolve
+            }
+            Diag(added > 0
+                ? $"hooked {added} more dialog function(s) from a later-loaded module (e.g. comctl32)."
+                : $"later dialog module added no new hooks ({firstError ?? "already hooked"}).");
+        }
+
         private void StopApiLaunch()
         {
             if (_apiLaunch != null) { _apiLaunch.Stop(); _apiLaunch = null; }
@@ -2920,6 +3054,7 @@ namespace Cda.App
             }
 
             _maxCursorSeen = 0;
+            _dialogMode = false; // IAT capture is not a dialog capture
             try
             {
                 _capture = CaptureSession.StartIat(_session.Process.Pid, imports,
@@ -2930,6 +3065,8 @@ namespace Cda.App
                 CallList.Clear();
                 ClearCallerGraph();
                 _autoUnhooked.Clear();
+                _dialogApiAddrs.Clear();
+                DialogList.Clear();
                 _diag.Add($"IAT capture.Start({imports.Count} slot(s)): instrumented={instrumented} skipped={skipped} firstError={firstError ?? "(none)"}");
 
                 if (instrumented == 0)
@@ -3487,6 +3624,126 @@ namespace Cda.App
             CallStack.Show($"{CallerTitleFor(rec.Destination)}  (t={rec.Time:0.000000}s)", frames);
         }
 
+        // Per-batch reaction (like CheckRunaway) for a dialog-caller capture: for every
+        // record whose callee is a hooked dialog function, add a Dialogs-tab row naming
+        // the dialog, its caption/text, and the app function that raised it (chain[0],
+        // the nearest local frame). On the first dialog of the batch it also lights up
+        // the Called-by tree + Call-stack panels and brings the Dialogs tab forward, so
+        // the caller is in view while the (modal) dialog is still on screen.
+        private void CheckDialogCalls(List<CallRecord> recs, List<List<(ulong Addr, string Name)>>? chains)
+        {
+            if (_dialogApiAddrs.Count == 0 || recs.Count == 0) return;
+
+            bool focusedOne = false;
+            for (int i = 0; i < recs.Count; i++)
+            {
+                var rec = recs[i];
+                if (!_dialogApiAddrs.Contains(rec.Destination)) continue;
+
+                // Skip user32/comctl32's INTERNAL dispatch chain. Hooking the whole
+                // dialog family by address also catches its inner cross-calls (e.g.
+                // MessageBoxW → MessageBoxTimeoutW), which would emit a duplicate row
+                // for one logical dialog. Those inner calls come FROM the dialog API's
+                // own module, whereas a dialog the app (or another module like
+                // comdlg32) raised is a cross-module call — so reporting only
+                // cross-module calls collapses one dialog to one row without losing
+                // dialogs raised on the app's behalf by a different system DLL.
+                var destMod = _moduleMap?.Resolve(rec.Destination);
+                var srcMod = _moduleMap?.Resolve(rec.Source);
+                if (destMod != null && srcMod != null && destMod.BaseAddress == srcMod.BaseAddress)
+                    continue;
+
+                // The app function that raised it: prefer the worker-resolved chain,
+                // fall back to an on-demand extraction.
+                var chain = (chains != null && i < chains.Count) ? chains[i] : ExtractLocalChain(rec);
+                ulong callerAddr = chain.Count > 0 ? chain[0].Addr : 0;
+                string callerName = chain.Count > 0 ? chain[0].Name : "(unknown — no local frame captured)";
+                string callerModule = callerAddr != 0 ? (_moduleMap?.Resolve(callerAddr)?.Name ?? "") : "";
+                string callerDesc = callerAddr != 0 ? DescribeAddr(callerAddr) : "unknown";
+
+                string api = ResolveCalleeName(rec.Destination) ?? DescribeAddr(rec.Destination);
+                string caption = DialogCaption(rec, api);
+
+                DialogList.Add(new DialogListView.Row
+                {
+                    Time = $"{rec.Time:0.000}s",
+                    Api = api,
+                    Caption = caption,
+                    Caller = callerName,
+                    Module = callerModule,
+                    Address = callerAddr,
+                    Record = rec,
+                });
+
+                Diag(caption.Length > 0
+                    ? $"Dialog \"{caption}\" created by {callerName} ({callerDesc}) — {api}"
+                    : $"Dialog created by {callerName} ({callerDesc}) — {api}");
+
+                if (!focusedOne)
+                {
+                    focusedOne = true;
+                    SetCallersTarget(rec.Destination); // Called-by tree of the dialog API
+                    ShowCallStack(rec);                // this call's chain back into the app
+                    if (DialogsTab != null) Tabs.SelectedItem = DialogsTab;
+                }
+            }
+        }
+
+        // Best-effort caption/text for a dialog call, from the same decoded string
+        // arguments the Calls log shows. MessageBox-family: caption (arg2), else text
+        // (arg1). TaskDialog: window title (arg2), then instruction/content. Template
+        // dialogs (DialogBoxParam/CreateDialogParam): the template name if named, else
+        // its resource ordinal. Indirect / TaskDialogIndirect: params live behind a
+        // struct pointer, so there's nothing to decode directly — left blank.
+        private static string DialogCaption(CallRecord rec, string api)
+        {
+            string baseName = api;
+            int bang = baseName.IndexOf('!');
+            if (bang >= 0) baseName = baseName.Substring(bang + 1);
+            baseName = StripAwSuffix(baseName);
+
+            int[] argOrder = baseName switch
+            {
+                "MessageBox" or "MessageBoxEx" or "MessageBoxTimeout" => new[] { 2, 1 }, // caption, then text
+                "TaskDialog" => new[] { 2, 3 },                                          // title, then instruction
+                "DialogBoxParam" or "CreateDialogParam" => new[] { 1 },                  // template name (if named)
+                _ => Array.Empty<int>(),                                                  // *Indirect* / TaskDialogIndirect
+            };
+            foreach (int idx in argOrder)
+            {
+                string? s = StringArg(rec, idx);
+                if (!string.IsNullOrEmpty(s)) return s!;
+            }
+
+            // A template passed by ordinal (MAKEINTRESOURCE) has no string — show the id.
+            if ((baseName == "DialogBoxParam" || baseName == "CreateDialogParam") &&
+                rec.IntegerArgs.Length > 1)
+            {
+                ulong tmpl = rec.IntegerArgs[1];
+                if (tmpl != 0 && tmpl <= 0xFFFF) return $"(template #{tmpl})";
+            }
+            return "";
+        }
+
+        // The decoded string captured for argument argIndex, or null.
+        private static string? StringArg(CallRecord rec, int argIndex)
+        {
+            foreach (var d in rec.Dereferences)
+                if (d.ArgumentIndex == argIndex && d.IsString)
+                    return d.AsString();
+            return null;
+        }
+
+        private static string StripAwSuffix(string name)
+        {
+            if (name.Length > 1)
+            {
+                char last = name[name.Length - 1];
+                if (last == 'A' || last == 'W') return name.Substring(0, name.Length - 1);
+            }
+            return name;
+        }
+
         // Drop the whole caller graph + index (new capture / context switch).
         private void ClearCallerGraph()
         {
@@ -3744,6 +4001,7 @@ namespace Cda.App
             }
 
             _apiCaptureMode = false; // a focused/normal start; OnCaptureApi re-sets this when broad
+            _dialogMode = false;     // OnDetectDialogCaller re-sets this after arming
             _maxCursorSeen = 0;
             try
             {
@@ -3761,6 +4019,8 @@ namespace Cda.App
                     CallList.Clear();
                     ClearCallerGraph();
                     _autoUnhooked.Clear();
+                    _dialogApiAddrs.Clear();
+                    DialogList.Clear();
                 }
                 _diag.Add($"capture.Start({candidates.Count} candidate(s)): instrumented={instrumented} skipped={skipped} firstError={firstError ?? "(none)"}");
 
@@ -4010,6 +4270,11 @@ namespace Cda.App
             if (chains != null) FoldCallersPrecomputed(recs, chains);
             else FoldCallers(recs);
 
+            // Dialog-caller reporting: surface any dialog the target raised in this
+            // batch — and the app function that raised it — into the Dialogs tab. The
+            // chains are index-aligned to recs (the "Capture only" filter kept them so).
+            if (_dialogMode) CheckDialogCalls(recs, chains);
+
             // No host-side decode can keep up with a function called ~a million times
             // a second; such a runaway laps the ring and starves everything else.
             // Drop just that hook so the rest of the trace records cleanly.
@@ -4060,6 +4325,8 @@ namespace Cda.App
             StopManagedRescan();
             _captureFocus = 0;
             _apiCaptureMode = false;
+            bool wasDialogMode = _dialogMode;
+            _dialogMode = false; // stop reacting; the captured Dialogs rows stay for review
             if (_captureBursting) { _captureBursting = false; System.Windows.Input.Mouse.OverrideCursor = null; }
             if (_pollTimer != null) { _pollTimer.Stop(); _pollTimer.Tick -= OnPollTick; _pollTimer = null; }
             var cap = _capture;
@@ -4075,6 +4342,9 @@ namespace Cda.App
                     CallList.AddRecords(tail);
                     FunctionList.AddCounts(tail);
                     FoldCallers(tail);
+                    // A dialog raised right before the target exited can land only in
+                    // this final drain (the 100 ms poll never fired) — surface it too.
+                    if (wasDialogMode) CheckDialogCalls(tail, null);
                 }
                 catch { /* ignore final drain errors */ }
                 try { cap.Dispose(); } catch { }

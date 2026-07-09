@@ -34,6 +34,8 @@
                         ToolTip="LAUNCH an executable and hook its import-table SLOTS (IAT) BEFORE its entry point runs — capturing the imported-API calls it makes at startup from the first instruction. Like Launch &amp; capture API but writes only to the import table (data), never .text, so it captures anti-tamper targets that checksum their own code. Use when startup calls are what you need and the target self-terminates on a code patch." />
                 <Button Content="Launch &amp; capture exports…" Padding="12,4" Margin="0,0,8,6" Click="OnLaunchExportCapture"
                         ToolTip="LAUNCH an executable and hook the functions its OWN modules EXPORT (the EXE and its app DLLs — not the OS) BEFORE its entry point runs, capturing calls IN to the app's public surface from the first instruction. The mirror of Launch &amp; capture API: that hooks what the program calls out to (imports); this hooks what its own code exposes (exports). Forwarder exports are skipped; exports are authoritative entries, so the set is always safe to splice. Most useful for an app built from its own DLLs." />
+                <Button Content="Launch &amp; detect dialogs…" Padding="12,4" Margin="0,0,8,6" Click="OnLaunchDialogCapture"
+                        ToolTip="LAUNCH an executable and hook only the OS dialog-box functions (MessageBox, DialogBoxParam, CreateDialogParam, TaskDialog, …) BEFORE its entry point runs — so a dialog raised DURING STARTUP (a splash, nag, or error box) is caught from the first instruction and attributed to the app function that raised it. The dialogs it captures, with their caption and caller, appear in the Dialogs tab. Resolves the dialog functions by address from user32/comctl32, so it catches them however the program calls them." />
                 <Button Content="Capture DLL…" Padding="12,4" Margin="0,0,8,6" Click="OnLaunchDllCapture"
                         ToolTip="Launch a host under a debugger and instrument a chosen DLL the instant it loads — capturing its DllMain and startup from the first instruction. Pick the DLL, then optionally a host EXE that loads it (Cancel = use rundll32)." />
                 <Button Content="Follow children…" Padding="12,4" Margin="0,0,8,6" Click="OnFollowChildren"
@@ -63,6 +65,8 @@
                         ToolTip="Instrument ONLY the function selected on the left and record its live calls with decoded arguments." />
                 <Button Content="Capture Windows API" Padding="12,4" Margin="0,0,8,6" Click="OnCaptureApi"
                         ToolTip="On the attached process, hook the Windows API functions it imports (kernel32, user32, ntdll, …) and record every call to them — with arguments and decoded strings. Attach to a process first. Ultra-hot primitives (critical-section/heap/last-error) are skipped to avoid flooding; click one to trace it specifically." />
+                <Button Content="Detect dialog caller" Padding="12,4" Margin="0,0,8,6" Click="OnDetectDialogCaller"
+                        ToolTip="On the attached process, hook only the OS dialog-box functions (MessageBox, DialogBoxParam, CreateDialogParam, TaskDialog, …). When the target pops a dialog, the Dialogs tab shows its caption and — the point — the app function that raised it, with the caller lit up in the function list, graph, and call stack. Resolves the dialog functions by address from user32/comctl32, so it catches them however the program calls them (import, GetProcAddress, delay-load). Attach to a process first." />
                 <Button Content="Capture imports (IAT)" Padding="12,4" Margin="0,0,8,6" Click="OnCaptureIat"
                         ToolTip="Like Capture Windows API, but reroutes calls by overwriting the import-address-table SLOTS in the target's own modules instead of patching code. It writes only to the import table (data), never to .text — so it captures targets that checksum their own code (anti-tamper) and self-terminate when patched. Attach to a process first." />
                 <Button Content="Capture (hardware bp)" Padding="12,4" Margin="0,0,8,6" Click="OnCaptureHwbp"
@@ -159,6 +163,9 @@
                     </TabItem>
                     <TabItem Header="Call stack">
                         <ui:CallStackView x:Name="CallStack" />
+                    </TabItem>
+                    <TabItem x:Name="DialogsTab" Header="Dialogs">
+                        <ui:DialogListView x:Name="DialogList" />
                     </TabItem>
                     <TabItem x:Name="MemoryTab" Header="Memory">
                         <ui:HexView x:Name="Hex" />
