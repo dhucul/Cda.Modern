@@ -112,7 +112,7 @@ namespace Cda.Core.Engine
         private int _pid;
         private bool _hooked;
         private bool _loaderBpSeen;   // the initial loader breakpoint has been consumed
-        private bool _dialogHostSeen; // (Dialogs mode) a user32/comctl32 LOAD_DLL has arrived post-loader-BP
+        private bool _dialogHostSeen; // (Dialogs mode) a dialog-host LOAD_DLL (user32/comctl32/comdlg32/credui) has arrived post-loader-BP
 
         // (Dialogs mode) the live session, once the first dialog host is armed, and the
         // set of dialog entries already hooked — so a later host is hooked additively
@@ -201,18 +201,19 @@ namespace Cda.Core.Engine
                         {
                             IntPtr hFile = Marshal.ReadIntPtr(evt, U);                   // LOAD_DLL_DEBUG_INFO.hFile
                             IntPtr baseOfDll = Marshal.ReadIntPtr(evt, U + IntPtr.Size); // .lpBaseOfDll
-                            // Dialog capture: hook user32/comctl32 the instant it maps —
-                            // still frozen in this event, before the app can call into it —
-                            // off the event's AUTHORITATIVE base (the debugger's module list
-                            // can lag at a module's own load). A host that loads later
-                            // (e.g. comctl32 after user32) is armed additively too.
+                            // Dialog capture: hook a dialog host (user32/comctl32/
+                            // comdlg32/credui) the instant it maps — still frozen in this
+                            // event, before the app can call into it — off the event's
+                            // AUTHORITATIVE base (the debugger's module list can lag at a
+                            // module's own load). This is how the LAZY hosts (comdlg32,
+                            // credui, which load on first file/credential dialog rather than
+                            // at startup) get armed; a host that loads later is added too.
                             if (_mode == HookMode.Dialogs && _loaderBpSeen)
                             {
                                 try
                                 {
                                     string fn = Path.GetFileName(ResolvePath(hFile));
-                                    bool isHost = fn.Equals("user32.dll", StringComparison.OrdinalIgnoreCase) ||
-                                                  fn.Equals("comctl32.dll", StringComparison.OrdinalIgnoreCase);
+                                    bool isHost = DialogApiScanner.IsDialogHostModule(fn);
                                     if (isHost)
                                     {
                                         _dialogHostSeen = true;
@@ -250,14 +251,16 @@ namespace Cda.Core.Engine
                                 {
                                     if (_mode == HookMode.Dialogs)
                                     {
-                                        // Dialog capture: user32/comctl32 may not be mapped
-                                        // yet (a .NET, packed, or delay-loaded target). Arm
+                                        // Dialog capture: the host DLLs may not be mapped
+                                        // yet — the common dialogs (comdlg32) and credential
+                                        // prompts (credui) load on first use, and user32/
+                                        // comctl32 can be absent in a .NET/packed target. Arm
                                         // any already loaded; if none, DON'T abort — the
                                         // LOAD_DLL handler arms them the instant they map.
                                         try { ArmDialogs(0, null); }
                                         catch (Exception ex) { Log?.Invoke("startup dialog hook failed: " + ex.Message); }
                                         if (!_hooked)
-                                            Log?.Invoke("dialog APIs (user32/comctl32) aren't loaded yet — " +
+                                            Log?.Invoke("dialog hosts (user32/comctl32/comdlg32/credui) aren't loaded yet — " +
                                                         "watching, and arming the moment they load…");
                                     }
                                     else
@@ -320,7 +323,7 @@ namespace Cda.Core.Engine
         }
 
         // The on-disk path behind a LOAD_DLL event's file handle, to recognize which
-        // module just mapped (used to spot user32/comctl32 for dialog capture).
+        // module just mapped (used to spot a dialog host for dialog capture).
         private static string ResolvePath(IntPtr hFile)
         {
             if (hFile == IntPtr.Zero || hFile == NativeMethods.INVALID_HANDLE_VALUE) return "";

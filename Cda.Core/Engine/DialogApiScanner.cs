@@ -8,45 +8,85 @@ namespace Cda.Core.Engine
 {
     /// <summary>
     /// Discovers the operating system's <b>dialog-box-creating</b> functions in a
-    /// target — <c>user32!MessageBox*</c>, <c>DialogBoxParam*</c>,
-    /// <c>CreateDialogParam*</c>, and <c>comctl32!TaskDialog*</c> — resolved to their
-    /// live entry-point addresses, so a <see cref="CaptureSession"/> can inline-hook
-    /// them and attribute each dialog to the app function that raised it.
+    /// target — the <c>user32</c> message-box / resource-template family
+    /// (<c>MessageBox*</c>, <c>DialogBoxParam*</c>, <c>CreateDialogParam*</c>), the
+    /// <c>comctl32</c> task dialog and property sheet, the <c>comdlg32</c> common
+    /// dialogs (File Open/Save, Color, Font, Print, Page Setup, Find/Replace), and the
+    /// <c>credui</c> credential prompts — resolved to their live entry-point addresses,
+    /// so a <see cref="CaptureSession"/> can inline-hook them and attribute each dialog
+    /// to the app function that raised it.
     ///
     /// This is deliberately the mirror-image filter of <see cref="ExportScanner"/>:
     /// where that scans the app's OWN modules and skips the OS, this scans exactly the
-    /// two OS modules the dialog surface lives in and keeps only the dialog exports.
-    /// Resolving by <b>export address</b> (not by the app's import table) means a dialog
-    /// is caught however the program reached it — a static import, a
+    /// handful of OS modules the dialog surface lives in and keeps only the dialog
+    /// exports. Resolving by <b>export address</b> (not by the app's import table) means
+    /// a dialog is caught however the program reached it — a static import, a
     /// <c>GetProcAddress</c>, a delay-load, or a call routed through a third-party DLL.
-    /// The resolved entries are the same kind the inline Windows-API path already
+    /// Most of the resolved entries are the same kind the inline Windows-API path already
     /// splices (<see cref="ApiImportScanner"/> → <see cref="CaptureSession.Start"/>),
     /// so hooking them carries no new risk.
     ///
-    /// If neither DLL is mapped (a console app that never loads the GUI surface),
-    /// <see cref="Result.Functions"/> is empty and the caller reports that plainly.
+    /// Two entries are <b>not</b> plain openers and are special-cased by the caller
+    /// (MainWindow), because the modern GUI surface reaches past flat exports:
+    ///   * <c>combase!CoCreateInstance</c> is the choke point for the modern
+    ///     <c>IFileDialog</c> COM picker (Open/Save). The host matches the requested
+    ///     CLSID, then reads the created object's vtable to inline-hook
+    ///     <c>IFileDialog::Show</c> — so the picker is caught however it was wrapped
+    ///     (native, MFC, WPF/.NET).
+    ///   * <c>user32!CreateWindowEx</c> is the only lever for a <b>hand-rolled modal
+    ///     window</b> (a custom-class window with its own message loop — no dialog API
+    ///     at all). The host filters it down to dialog-like windows.
+    /// Both are hotter than the openers; the caller protects them from the runaway
+    /// auto-unhook (except CreateWindowEx, which it may drop if it floods) and does not
+    /// emit a row per raw call.
+    ///
+    /// Several of these hosts (<c>comdlg32</c>, <c>credui</c>) load <b>lazily</b> — on
+    /// first use, not at startup — so the launch loop re-scans on their LOAD_DLL event
+    /// (see <see cref="IsDialogHostModule"/>). If no dialog host is mapped (a console
+    /// app that never loads the GUI surface), <see cref="Result.Functions"/> is empty
+    /// and the caller reports that plainly.
     /// </summary>
     public static class DialogApiScanner
     {
-        // Same read cap as the sibling scanners; user32/comctl32 are well under it.
+        // Same read cap as the sibling scanners; the dialog-host DLLs are well under it.
         private const long MaxModuleImageBytes = 96L * 1024 * 1024;
 
-        // The OS modules the dialog surface lives in.
+        // The OS modules the dialog surface lives in. ole32/combase are here only for
+        // the CoCreateInstance choke point (see below); ole32's CoCreateInstance is a
+        // forwarder to combase, so combase is where the real entry is hooked.
         private static readonly HashSet<string> DialogModules = new(StringComparer.OrdinalIgnoreCase)
         {
-            "user32.dll", "comctl32.dll",
+            "user32.dll", "comctl32.dll", "comdlg32.dll", "credui.dll",
+            "ole32.dll", "combase.dll",
         };
 
         // Dialog-creating exports, by BASE name (A/W folded away — the export table
-        // carries the suffixed forms, e.g. MessageBoxW). The *Param* forms are the real
-        // exports; DialogBox/CreateDialog are SDK macros over them. EndDialog is the
-        // closer, not an opener, so it is intentionally absent.
+        // carries the suffixed forms, e.g. MessageBoxW). EndDialog is the closer, not an
+        // opener, so it is intentionally absent, as are the cmd-line credential prompts.
         private static readonly HashSet<string> DialogApis = new(StringComparer.OrdinalIgnoreCase)
         {
+            // user32 — message boxes and resource-template dialogs. The *Param* forms
+            // are the real exports; DialogBox/CreateDialog are SDK macros over them.
             "MessageBox", "MessageBoxEx", "MessageBoxIndirect", "MessageBoxTimeout",
             "DialogBoxParam", "DialogBoxIndirectParam",
             "CreateDialogParam", "CreateDialogIndirectParam",
-            "TaskDialog", "TaskDialogIndirect",
+            // comctl32 — task dialogs and the tabbed property sheet.
+            "TaskDialog", "TaskDialogIndirect", "PropertySheet",
+            // comdlg32 — the common dialogs. Each takes a single struct pointer, so the
+            // dialog is named but its caption is left blank unless the host can decode it.
+            "GetOpenFileName", "GetSaveFileName", "ChooseColor", "ChooseFont",
+            "PrintDlg", "PrintDlgEx", "PageSetupDlg", "FindText", "ReplaceText",
+            // credui — the interactive credential prompts (not the CmdLine forms).
+            "CredUIPromptForCredentials", "CredUIPromptForWindowsCredentials",
+            // Special-cased by the caller — these are NOT plain openers and are hotter
+            // than the rest, so MainWindow treats them specially rather than reporting a
+            // row per call. CoCreateInstance is the choke point for the modern IFileDialog
+            // COM picker (the host matches the CLSID, then reads the created object's
+            // vtable to hook IFileDialog::Show). CreateWindowEx is the only lever for a
+            // hand-rolled modal window (the host filters it down to dialog-like windows,
+            // and it is the one dialog-mode hook the runaway guard may drop if it floods).
+            // See MainWindow.HandleComCreate / IsDialogLikeWindow.
+            "CoCreateInstance", "CreateWindowEx",
         };
 
         public sealed class Result
@@ -63,6 +103,16 @@ namespace Cda.Core.Engine
             /// <summary>Dialog exports dropped because they forward to another DLL.</summary>
             public int SkippedForwarders;
         }
+
+        /// <summary>
+        /// Is <paramref name="fileName"/> (a bare module file name, e.g.
+        /// <c>"comdlg32.dll"</c>) one of the OS modules the dialog surface lives in? The
+        /// launch loop uses this to recognize a dialog host as it maps — several
+        /// (comdlg32, credui) load lazily on first use rather than at startup, so they
+        /// must be armed on their LOAD_DLL event, not just at the loader breakpoint.
+        /// </summary>
+        public static bool IsDialogHostModule(string? fileName) =>
+            !string.IsNullOrEmpty(fileName) && DialogModules.Contains(fileName!);
 
         /// <summary>
         /// Walk the export tables of the target's dialog-surface modules and return
@@ -124,7 +174,7 @@ namespace Cda.Core.Engine
             return result;
         }
 
-        // Is this the OS user32/comctl32, matched by file name (not path, so a
+        // Is this one of the OS dialog-host DLLs, matched by file name (not path, so a
         // relocated system32 still matches; a same-named app DLL is vanishingly rare
         // and would only add a few harmless extra hook candidates).
         private static bool IsDialogModule(ModuleInfo m)

@@ -188,9 +188,29 @@ namespace Cda.App
 
         // Dialog-caller capture active: the poll loop (CheckDialogCalls) surfaces each
         // dialog the target raises — and the app function that raised it — into the
-        // Dialogs tab. _dialogApiAddrs is the set of hooked dialog-API entry addresses.
+        // Dialogs tab. _dialogApiAddrs is the set of hooked dialog-API entry addresses
+        // that PRODUCE a Dialogs-tab row (message boxes, common dialogs, TaskDialog,
+        // property sheets, credential prompts, filtered CreateWindowEx, and each resolved
+        // IFileDialog::Show).
         private bool _dialogMode;
         private readonly HashSet<ulong> _dialogApiAddrs = new();
+        // The modern IFileDialog COM picker and hand-rolled windows need special handling
+        // (see DialogApiScanner's remarks). _comProbeAddrs are the hooked CoCreateInstance
+        // entries — they resolve the file-dialog ::Show slot rather than reporting a row.
+        // _createWindowAddrs are the hooked CreateWindowEx entries — row-producing but
+        // filtered to dialog-like windows. _comShowResolved holds the file-dialog CLSIDs
+        // whose ::Show vtable slot has already been hooked, so it is done once per kind.
+        // _dialogDroppable are the dialog-mode hooks the runaway guard MAY auto-drop if
+        // they flood: CreateWindowEx always (deliberately hot), and CoCreateInstance once
+        // its ::Show is resolved (it is then no longer strictly needed, so it may be shed
+        // to protect the ring on a COM-heavy target).
+        private readonly HashSet<ulong> _comProbeAddrs = new();
+        private readonly HashSet<ulong> _createWindowAddrs = new();
+        private readonly HashSet<Guid> _comShowResolved = new();
+        private readonly HashSet<ulong> _dialogDroppable = new();
+        // The two modern file-dialog coclasses whose CoCreateInstance we watch for.
+        private static readonly Guid ClsidFileOpenDialog = new Guid("DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7");
+        private static readonly Guid ClsidFileSaveDialog = new Guid("C0B4E2F3-BA21-4773-8DBA-335EC946EB8B");
         private string? _winDir; // cached Windows directory, for app/system classification
         private readonly Dictionary<ulong, bool> _appModuleCache = new(); // module base -> is app code
         private readonly Dictionary<ulong, bool> _retAddrCache = new();   // code addr -> looks like a return address
@@ -2640,9 +2660,10 @@ namespace Cda.App
         // Hook ONLY the OS dialog-box functions on the attached process, so a dialog
         // the target raises is attributed to the app function that created it (surfaced
         // in the Dialogs tab). Mirrors OnCaptureApi, but discovers the dialog surface by
-        // address from user32/comctl32 (DialogApiScanner) instead of the whole imported
-        // API set — so it catches a dialog however the program reached the call (static
-        // import, GetProcAddress, delay-load, or a third-party DLL).
+        // address from the dialog-host DLLs — user32, comctl32, comdlg32 (common
+        // dialogs), credui (credential prompts) — via DialogApiScanner, instead of the
+        // whole imported API set, so it catches a dialog however the program reached the
+        // call (static import, GetProcAddress, delay-load, or a third-party DLL).
         private async void OnDetectDialogCaller(object sender, RoutedEventArgs e)
         {
             if (_session == null)
@@ -2664,12 +2685,12 @@ namespace Cda.App
             _offlineTrace = false;
             _childView = false;
             var session = _session;
-            Diag("Dialogs: resolving the OS dialog-box functions (user32/comctl32)…");
+            Diag("Dialogs: resolving the OS dialog-box functions (user32/comctl32/comdlg32/credui)…");
 
             DialogApiScanner.Result dlg;
             try
             {
-                // Reads target memory + parses the user32/comctl32 export tables off the UI thread.
+                // Reads target memory + parses the dialog-host export tables off the UI thread.
                 dlg = await Task.Run(() => DialogApiScanner.Discover(session.Process, session.Modules));
             }
             catch (Exception ex)
@@ -2682,16 +2703,17 @@ namespace Cda.App
 
             if (dlg.Functions.Count == 0)
             {
-                Diag("No dialog-box APIs found to hook — user32/comctl32 aren't loaded in the target " +
-                     "(a console app with no GUI, or the GUI DLLs aren't mapped yet). Attach after the app " +
-                     "has shown a window, or use Launch & detect dialogs… to catch dialogs raised at startup.");
+                Diag("No dialog-box APIs found to hook — no dialog host (user32/comctl32/comdlg32/credui) is " +
+                     "loaded in the target yet (a console app with no GUI, or the dialog DLLs aren't mapped " +
+                     "yet — comdlg32/credui load only on first use). Attach after the app has shown the " +
+                     "dialog, or use Launch & detect dialogs… to catch dialogs raised at startup.");
                 return;
             }
 
             var addresses = new List<ulong>(dlg.Functions.Count);
             foreach (var f in dlg.Functions) addresses.Add(f.Address);
 
-            // Dialog-only view: nodes are the dialog functions, under user32/comctl32.
+            // Dialog-only view: nodes are the dialog functions, under their host DLLs.
             var ds = new TraceDataset { TimeStart = 0, TimeEnd = 1 };
             ds.Modules.AddRange(dlg.Modules);
             ds.Functions.AddRange(dlg.Functions);
@@ -2722,8 +2744,8 @@ namespace Cda.App
             {
                 _apiCaptureMode = true; // a click inspects callers, doesn't refocus onto one dialog API
                 _dialogMode = true;
-                _dialogApiAddrs.Clear(); // StartCaptureOn cleared it; repopulate with the hooked set
-                foreach (var f in dlg.Functions) _dialogApiAddrs.Add(f.Address);
+                ClearDialogState(); // StartCaptureOn cleared it; repopulate with the hooked set
+                RegisterDialogFunctions(dlg.Functions);
                 Diag($"✓ Watching for dialogs · {_capture.HookedCount} dialog hook(s) armed — trigger a dialog " +
                      "in the target and the Dialogs tab will name the function that raised it.");
             }
@@ -2964,11 +2986,11 @@ namespace Cda.App
             _moduleMap = h.ModuleMap;   // full map: resolves both callers (app) and callees (OS)
 
             // Dialog-caller launch: arm the Dialogs-tab reporting for the hooked set.
-            _dialogApiAddrs.Clear();
+            ClearDialogState();
             DialogList.Clear();
             _dialogMode = h.Mode == LaunchApiCapture.HookMode.Dialogs;
             if (_dialogMode)
-                foreach (var f in h.Dataset.Functions) _dialogApiAddrs.Add(f.Address);
+                RegisterDialogFunctions(h.Dataset.Functions);
             _captured.Clear();
             _autoUnhooked.Clear();
             _maxCursorSeen = 0;
@@ -3022,7 +3044,7 @@ namespace Cda.App
             var addrs = new List<ulong>(funcs.Count);
             foreach (var f in funcs) addrs.Add(f.Address);
             int added = _capture.HookMore(addrs, out _, out string? firstError);
-            foreach (var f in funcs) _dialogApiAddrs.Add(f.Address);
+            RegisterDialogFunctions(funcs);
             if (_liveDataset != null)
             {
                 _liveDataset.Functions.AddRange(funcs);
@@ -3065,7 +3087,7 @@ namespace Cda.App
                 CallList.Clear();
                 ClearCallerGraph();
                 _autoUnhooked.Clear();
-                _dialogApiAddrs.Clear();
+                ClearDialogState();
                 DialogList.Clear();
                 _diag.Add($"IAT capture.Start({imports.Count} slot(s)): instrumented={instrumented} skipped={skipped} firstError={firstError ?? "(none)"}");
 
@@ -3313,6 +3335,12 @@ namespace Cda.App
         // the only mutation and it's idempotent per address via _autoUnhooked.
         private void TryAutoUnhook(CaptureSession cap, ulong fn, long total)
         {
+            // Dialog mode hooks a small curated set. The precise openers (message boxes,
+            // common dialogs, TaskDialog, credential prompts, resolved ::Show) must never
+            // be auto-dropped. Only the deliberately-hot probes in _dialogDroppable may be
+            // shed if they flood — CreateWindowEx always, and CoCreateInstance once its
+            // ::Show is resolved — so they can't starve the precise catches on a busy target.
+            if (_dialogMode && !_dialogDroppable.Contains(fn)) return;
             if (!cap.UnhookFunction(fn)) return;
             _autoUnhooked.Add(fn);
             string nm = _fnNames.TryGetValue(fn, out var n) ? n : DescribeAddr(fn);
@@ -3632,69 +3660,288 @@ namespace Cda.App
         // the caller is in view while the (modal) dialog is still on screen.
         private void CheckDialogCalls(List<CallRecord> recs, List<List<(ulong Addr, string Name)>>? chains)
         {
-            if (_dialogApiAddrs.Count == 0 || recs.Count == 0) return;
+            if ((_dialogApiAddrs.Count == 0 && _comProbeAddrs.Count == 0) || recs.Count == 0) return;
 
             bool focusedOne = false;
             for (int i = 0; i < recs.Count; i++)
             {
                 var rec = recs[i];
+
+                // A hooked CoCreateInstance: resolve/hook the modern IFileDialog picker's
+                // ::Show from the created object (no row for CoCreateInstance itself,
+                // except the unavoidable first-instance fallback — see HandleComCreate).
+                if (_comProbeAddrs.Contains(rec.Destination))
+                {
+                    HandleComCreate(rec, chains, i, ref focusedOne);
+                    continue;
+                }
                 if (!_dialogApiAddrs.Contains(rec.Destination)) continue;
 
-                // Skip user32/comctl32's INTERNAL dispatch chain. Hooking the whole
-                // dialog family by address also catches its inner cross-calls (e.g.
-                // MessageBoxW → MessageBoxTimeoutW), which would emit a duplicate row
-                // for one logical dialog. Those inner calls come FROM the dialog API's
-                // own module, whereas a dialog the app (or another module like
-                // comdlg32) raised is a cross-module call — so reporting only
-                // cross-module calls collapses one dialog to one row without losing
-                // dialogs raised on the app's behalf by a different system DLL.
+                // Skip a dialog API's INTERNAL dispatch chain. Hooking the whole dialog
+                // family by address also catches inner cross-calls within one module (e.g.
+                // MessageBoxW → MessageBoxTimeoutW), which would double-report one logical
+                // dialog. Those come FROM the dialog API's own module, whereas a dialog the
+                // app (or another system DLL like comdlg32) raised is a cross-module call —
+                // so reporting only cross-module calls collapses one dialog to one row
+                // without losing dialogs raised on the app's behalf by a different DLL.
                 var destMod = _moduleMap?.Resolve(rec.Destination);
                 var srcMod = _moduleMap?.Resolve(rec.Source);
                 if (destMod != null && srcMod != null && destMod.BaseAddress == srcMod.BaseAddress)
                     continue;
 
-                // The app function that raised it: prefer the worker-resolved chain,
-                // fall back to an on-demand extraction.
-                var chain = (chains != null && i < chains.Count) ? chains[i] : ExtractLocalChain(rec);
-                ulong callerAddr = chain.Count > 0 ? chain[0].Addr : 0;
-                string callerName = chain.Count > 0 ? chain[0].Name : "(unknown — no local frame captured)";
-                string callerModule = callerAddr != 0 ? (_moduleMap?.Resolve(callerAddr)?.Name ?? "") : "";
-                string callerDesc = callerAddr != 0 ? DescribeAddr(callerAddr) : "unknown";
+                // CreateWindowEx fires for every control AND is called internally by the OS
+                // dialog machinery — TaskDialog, the comdlg32 dialogs, and IFileDialog::Show
+                // all create their window via user32!CreateWindowEx, a CROSS-module call the
+                // same-module check above can't catch, which would double-report the dialog
+                // that its own opener hook already surfaced. So require the immediate caller
+                // to be APP code (a hand-rolled modal window is one the app creates by
+                // calling CreateWindowEx directly) and keep only dialog-like windows — not
+                // child controls (buttons/edits) or the plain overlapped main window.
+                if (_createWindowAddrs.Contains(rec.Destination) &&
+                    (!IsAppCode(rec.Source) || !IsDialogLikeWindow(rec)))
+                    continue;
 
+                var chain = ChainAt(chains, i, rec);
                 string api = ResolveCalleeName(rec.Destination) ?? DescribeAddr(rec.Destination);
-                string caption = DialogCaption(rec, api);
+                EmitDialogRow(rec, chain, api, DialogCaption(rec, api), ref focusedOne);
+            }
+        }
 
-                DialogList.Add(new DialogListView.Row
+        // The pre-resolved caller chain for record i (from the poll worker) or an
+        // on-demand extraction when no resolver was available. Computed lazily, past the
+        // cheap dedup/filter checks, so a CreateWindowEx/CoCreateInstance flood doesn't
+        // pay for stack unwinding on records that are skipped.
+        private List<(ulong Addr, string Name)> ChainAt(
+            List<List<(ulong Addr, string Name)>>? chains, int i, CallRecord rec)
+            => (chains != null && i < chains.Count) ? chains[i] : ExtractLocalChain(rec);
+
+        // Add one Dialogs-tab row naming the dialog, its caption/text, and the app
+        // function that raised it (chain[0], the nearest local frame). On the first
+        // dialog of the batch it also lights up the Called-by tree + Call-stack panels
+        // and brings the Dialogs tab forward, so the caller is in view while the (modal)
+        // dialog is still on screen. Shared by the plain-opener path and the COM
+        // first-instance fallback.
+        private void EmitDialogRow(CallRecord rec, List<(ulong Addr, string Name)> chain,
+            string api, string caption, ref bool focusedOne)
+        {
+            ulong callerAddr = chain.Count > 0 ? chain[0].Addr : 0;
+            string callerName = chain.Count > 0 ? chain[0].Name : "(unknown — no local frame captured)";
+            string callerModule = callerAddr != 0 ? (_moduleMap?.Resolve(callerAddr)?.Name ?? "") : "";
+            string callerDesc = callerAddr != 0 ? DescribeAddr(callerAddr) : "unknown";
+
+            DialogList.Add(new DialogListView.Row
+            {
+                Time = $"{rec.Time:0.000}s",
+                Api = api,
+                Caption = caption,
+                Caller = callerName,
+                Module = callerModule,
+                Address = callerAddr,
+                Record = rec,
+            });
+
+            Diag(caption.Length > 0
+                ? $"Dialog \"{caption}\" created by {callerName} ({callerDesc}) — {api}"
+                : $"Dialog created by {callerName} ({callerDesc}) — {api}");
+
+            if (!focusedOne)
+            {
+                focusedOne = true;
+                SetCallersTarget(rec.Destination); // Called-by tree of the dialog API
+                ShowCallStack(rec);                // this call's chain back into the app
+                if (DialogsTab != null) Tabs.SelectedItem = DialogsTab;
+            }
+        }
+
+        // A hooked CoCreateInstance fired. If it created a modern file-dialog COM object
+        // (CLSID_FileOpenDialog / CLSID_FileSaveDialog), resolve that live instance's
+        // IFileDialog::Show — vtable slot 3 (IModalWindow::Show, the first method after
+        // IUnknown's QueryInterface/AddRef/Release, the layout IFileDialog inherits) —
+        // and inline-hook it, so every SUBSEQUENT show of that dialog kind is caught
+        // precisely at Show, attributed to the app function that called Show.
+        //
+        // The FIRST instance's Show is already executing by the time we drain this record
+        // (Show is a blocking modal call the app entered right after CoCreateInstance
+        // returned), so its entry can't be hooked in time. Until ::Show is successfully
+        // hooked, surface each creation here at creation-time instead, attributed to the
+        // CoCreateInstance caller — so no file dialog is ever missed; once ::Show is
+        // hooked, later ones report through it (one row each, no duplicates).
+        private void HandleComCreate(CallRecord rec, List<List<(ulong Addr, string Name)>>? chains,
+            int i, ref bool focusedOne)
+        {
+            if (_capture == null && _session == null) return; // no target-memory reader yet
+
+            ulong clsidPtr = ArgRaw(rec, 0);
+            if (!TryReadGuid(clsidPtr, out Guid clsid)) return;
+            string? kind = clsid == ClsidFileOpenDialog ? "IFileOpenDialog"
+                         : clsid == ClsidFileSaveDialog ? "IFileSaveDialog"
+                         : null;
+            if (kind == null) return; // some other COM object — not a file dialog
+
+            if (_comShowResolved.Contains(clsid)) return; // ::Show is hooked; it will report the row
+
+            // Try to resolve and hook ::Show from the live instance for next time.
+            ulong showAddr = ResolveShowSlot(ArgRaw(rec, 4)); // arg4 = ppv out-pointer
+            if (showAddr != 0 && _capture != null && _capture.HookMore(new[] { showAddr }, out _, out _) > 0)
+            {
+                _comShowResolved.Add(clsid);
+                _dialogApiAddrs.Add(showAddr);
+                // ::Show now catches this kind precisely; the CoCreateInstance probe is no
+                // longer strictly needed, so let the runaway guard shed it if it floods.
+                foreach (var a in _comProbeAddrs) _dialogDroppable.Add(a);
+                ulong ownerBase = _moduleMap?.Resolve(showAddr)?.BaseAddress ?? 0;
+                _liveDataset?.Functions.Add(new TracedFunction(showAddr, ownerBase, kind + "::Show"));
+                _nameIndexFor = null; // re-index so ResolveCalleeName names the new Show entry
+                Diag($"resolved {kind}::Show @ 0x{showAddr:X} from a live instance — later " +
+                     $"{kind} shows are caught precisely at Show.");
+            }
+
+            // Surface THIS instance now (its own Show can't be hooked in time).
+            EmitDialogRow(rec, ChainAt(chains, i, rec), kind + " (shown)", "", ref focusedOne);
+        }
+
+        // Reset all dialog-report state (address sets + resolved-Show memory) for a new
+        // capture. Paired with RegisterDialogFunctions, which repopulates it.
+        private void ClearDialogState()
+        {
+            _dialogApiAddrs.Clear();
+            _comProbeAddrs.Clear();
+            _createWindowAddrs.Clear();
+            _comShowResolved.Clear();
+            _dialogDroppable.Clear();
+        }
+
+        // Route a freshly hooked set of dialog functions into the reporting sets: the
+        // CoCreateInstance probe(s) drive COM file-dialog resolution (no row of their
+        // own), CreateWindowEx is a row producer but filtered and runaway-droppable, and
+        // every other opener reports a row directly.
+        private void RegisterDialogFunctions(IEnumerable<TracedFunction> funcs)
+        {
+            foreach (var f in funcs)
+            {
+                string baseName = DialogBaseName(f.Name);
+                if (baseName == "CoCreateInstance" || baseName == "CoCreateInstanceEx")
+                    _comProbeAddrs.Add(f.Address);
+                else
                 {
-                    Time = $"{rec.Time:0.000}s",
-                    Api = api,
-                    Caption = caption,
-                    Caller = callerName,
-                    Module = callerModule,
-                    Address = callerAddr,
-                    Record = rec,
-                });
-
-                Diag(caption.Length > 0
-                    ? $"Dialog \"{caption}\" created by {callerName} ({callerDesc}) — {api}"
-                    : $"Dialog created by {callerName} ({callerDesc}) — {api}");
-
-                if (!focusedOne)
-                {
-                    focusedOne = true;
-                    SetCallersTarget(rec.Destination); // Called-by tree of the dialog API
-                    ShowCallStack(rec);                // this call's chain back into the app
-                    if (DialogsTab != null) Tabs.SelectedItem = DialogsTab;
+                    _dialogApiAddrs.Add(f.Address);
+                    if (baseName == "CreateWindowEx")
+                    {
+                        _createWindowAddrs.Add(f.Address);
+                        _dialogDroppable.Add(f.Address); // hot: droppable if it floods
+                    }
                 }
             }
+        }
+
+        // The bare API name behind a "module!Name" label, A/W folded away.
+        private static string DialogBaseName(string? name)
+        {
+            if (string.IsNullOrEmpty(name)) return "";
+            string s = name!;
+            int bang = s.IndexOf('!');
+            if (bang >= 0) s = s.Substring(bang + 1);
+            return StripAwSuffix(s);
+        }
+
+        // The raw integer value of positional argument i (0-based). The stub captures the
+        // first few integer args directly; the rest come from the stack snapshot, where
+        // snapshot[0] is the return address and argument i sits at snapshot[i+1] (true on
+        // both x86 — every arg on the stack — and x64 — the 5th arg on sits past the
+        // 32-byte shadow space). 0 when the snapshot doesn't reach that far.
+        private static ulong ArgRaw(CallRecord rec, int i)
+        {
+            if (rec.IntegerArgs != null && i < rec.IntegerArgs.Length) return rec.IntegerArgs[i];
+            var snap = rec.StackSnapshot;
+            int idx = i + 1;
+            return (snap != null && idx < snap.Length) ? snap[idx] : 0UL;
+        }
+
+        // Read target memory for the dialog-COM path. Prefers the CAPTURE's own handle,
+        // which is always present during a poll and is read-capable (forWrite attaches
+        // include VmRead), so COM file-dialog detection works even in the brief launch-mode
+        // window before the read-only LiveSession has finished attaching; falls back to
+        // that session if for some reason there is no capture. 0 (no bytes) if neither.
+        private int DialogRead(ulong addr, byte[] buf)
+        {
+            if (_capture != null) return _capture.ReadTarget(addr, buf);
+            if (_session != null) return _session.Process.ReadMemory(addr, buf);
+            return 0;
+        }
+
+        // Read a 16-byte COM GUID from the target at addr. new Guid(byte[16]) uses the
+        // in-memory layout (Data1 LE, Data2 LE, Data3 LE, Data4[8]) exactly. Host-side
+        // read, so a bad pointer just returns false.
+        private bool TryReadGuid(ulong addr, out Guid guid)
+        {
+            guid = Guid.Empty;
+            if (addr < 0x10000) return false;
+            byte[] b = new byte[16];
+            if (DialogRead(addr, b) < 16) return false;
+            guid = new Guid(b);
+            return true;
+        }
+
+        // From a CoCreateInstance out-pointer (ppv), follow ppv → interface pointer →
+        // vtable → vtable slot 3 (IModalWindow::Show) and return the Show function's
+        // address. 0 on any bad/short read — every read is host-side (ReadProcessMemory),
+        // so a stale or freed pointer simply yields 0 rather than touching the target.
+        private ulong ResolveShowSlot(ulong ppv)
+        {
+            if (ppv < 0x10000) return 0;
+            int ptr = _is64 ? 8 : 4;
+            ulong pInterface = ReadPtr(ppv, ptr);
+            if (pInterface < 0x10000) return 0;
+            ulong pVtable = ReadPtr(pInterface, ptr);
+            if (pVtable < 0x10000) return 0;
+            ulong show = ReadPtr(pVtable + (ulong)(3 * ptr), ptr);
+            return show >= 0x10000 ? show : 0;
+        }
+
+        // Read one pointer-sized word from the target. 0 on a short read.
+        private ulong ReadPtr(ulong addr, int ptrSize)
+        {
+            byte[] b = new byte[ptrSize];
+            if (DialogRead(addr, b) < ptrSize) return 0;
+            return ptrSize == 8 ? BitConverter.ToUInt64(b, 0) : BitConverter.ToUInt32(b, 0);
+        }
+
+        private const uint WS_CHILD = 0x40000000;
+        private const uint WS_POPUP = 0x80000000;
+        private const uint WS_EX_DLGMODALFRAME = 0x00000001;
+        private const ulong AtomDialogClass = 0x8002; // MAKEINTATOM(WC_DIALOG) — the #32770 class
+
+        // CreateWindowEx heuristic: is this a dialog/box rather than a child control or
+        // the app's main window? True for the standard dialog class (#32770, passed as
+        // the atom 0x8002 or the "#32770" string), any window with the modal-frame
+        // ex-style, or a titled top-level popup. This filters out the flood of child
+        // controls (buttons/edits/statics) and the plain overlapped main window.
+        // Args: dwExStyle=0, lpClassName=1, lpWindowName=2, dwStyle=3.
+        private bool IsDialogLikeWindow(CallRecord rec)
+        {
+            ulong classArg = ArgRaw(rec, 1);
+            if (classArg == AtomDialogClass) return true;
+            string? cls = StringArg(rec, 1);
+            if (cls == "#32770") return true;
+
+            uint exStyle = (uint)ArgRaw(rec, 0);
+            if ((exStyle & WS_EX_DLGMODALFRAME) != 0) return true;
+
+            uint style = (uint)ArgRaw(rec, 3);
+            if ((style & WS_POPUP) != 0 && (style & WS_CHILD) == 0 && !string.IsNullOrEmpty(StringArg(rec, 2)))
+                return true;
+
+            return false;
         }
 
         // Best-effort caption/text for a dialog call, from the same decoded string
         // arguments the Calls log shows. MessageBox-family: caption (arg2), else text
         // (arg1). TaskDialog: window title (arg2), then instruction/content. Template
         // dialogs (DialogBoxParam/CreateDialogParam): the template name if named, else
-        // its resource ordinal. Indirect / TaskDialogIndirect: params live behind a
-        // struct pointer, so there's nothing to decode directly — left blank.
+        // its resource ordinal. CredUI prompt: the target name (arg1). The comdlg32
+        // common dialogs, PropertySheet, and the *Indirect / TaskDialogIndirect forms
+        // pass their strings behind a single struct pointer, so there's nothing to
+        // decode directly — left blank (the row still names the API and its caller).
         private static string DialogCaption(CallRecord rec, string api)
         {
             string baseName = api;
@@ -3707,7 +3954,9 @@ namespace Cda.App
                 "MessageBox" or "MessageBoxEx" or "MessageBoxTimeout" => new[] { 2, 1 }, // caption, then text
                 "TaskDialog" => new[] { 2, 3 },                                          // title, then instruction
                 "DialogBoxParam" or "CreateDialogParam" => new[] { 1 },                  // template name (if named)
-                _ => Array.Empty<int>(),                                                  // *Indirect* / TaskDialogIndirect
+                "CredUIPromptForCredentials" => new[] { 1 },                             // pszTargetName (resource prompted for)
+                "CreateWindowEx" => new[] { 2 },                                          // lpWindowName (the window title)
+                _ => Array.Empty<int>(),                                                  // comdlg32 / PropertySheet / *Indirect / IFileDialog::Show
             };
             foreach (int idx in argOrder)
             {
@@ -4019,7 +4268,7 @@ namespace Cda.App
                     CallList.Clear();
                     ClearCallerGraph();
                     _autoUnhooked.Clear();
-                    _dialogApiAddrs.Clear();
+                    ClearDialogState();
                     DialogList.Clear();
                 }
                 _diag.Add($"capture.Start({candidates.Count} candidate(s)): instrumented={instrumented} skipped={skipped} firstError={firstError ?? "(none)"}");
