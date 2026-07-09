@@ -12,7 +12,23 @@
         TextOptions.TextRenderingMode="ClearType"
         UseLayoutRounding="True">
 
+    <Window.CommandBindings>
+        <!-- F1 (ApplicationCommands.Help) and the Help ▸ Help Contents item both
+             route here; the gesture text on the menu item is supplied by the command. -->
+        <CommandBinding Command="Help" Executed="OnHelpContents" />
+    </Window.CommandBindings>
+
     <DockPanel>
+        <!-- Menu bar (Help) -->
+        <Menu DockPanel.Dock="Top" Padding="4,2">
+            <MenuItem Header="_Help">
+                <MenuItem Header="Help Contents" Command="Help" />
+                <MenuItem Header="Keyboard &amp; Mouse Shortcuts" Click="OnHelpShortcuts" />
+                <Separator />
+                <MenuItem Header="About CDA…" Click="OnAbout" />
+            </MenuItem>
+        </Menu>
+
         <!-- Toolbar -->
         <Border DockPanel.Dock="Top" Background="{StaticResource Surface}" Padding="10,8">
             <WrapPanel Orientation="Horizontal">

@@ -195,6 +195,79 @@
             </Setter>
         </Style>
 
+        <!-- ========================= Menu / MenuItem ====================== -->
+        <!-- The app is otherwise all toolbar buttons; the one menu bar (Help) is
+             themed here so it matches the dark chrome instead of the light OS
+             default. One MenuItem template serves both the top-level header and
+             its drop-down leaf items: the Popup only opens for an item that has
+             children, so leaves simply never show it. -->
+        <Style TargetType="Menu">
+            <Setter Property="Background" Value="{StaticResource Surface}" />
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
+            <Setter Property="FontSize" Value="12.5" />
+        </Style>
+        <Style TargetType="MenuItem">
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Padding" Value="10,4" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="MenuItem">
+                        <Border x:Name="bd" Background="{TemplateBinding Background}"
+                                CornerRadius="3" SnapsToDevicePixels="True">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <ContentPresenter Grid.Column="0" ContentSource="Header"
+                                                  RecognizesAccessKey="True"
+                                                  Margin="{TemplateBinding Padding}"
+                                                  VerticalAlignment="Center" />
+                                <TextBlock Grid.Column="1" Text="{TemplateBinding InputGestureText}"
+                                           Foreground="{StaticResource TextMuted}"
+                                           Margin="24,0,10,0" VerticalAlignment="Center" />
+                                <Popup x:Name="PART_Popup" Placement="Bottom" AllowsTransparency="True"
+                                       Focusable="False" PopupAnimation="Fade"
+                                       IsOpen="{TemplateBinding IsSubmenuOpen}">
+                                    <Border Background="{StaticResource Surface}"
+                                            BorderBrush="{StaticResource OutlineStrong}"
+                                            BorderThickness="1" CornerRadius="4" Padding="3" MinWidth="180">
+                                        <StackPanel IsItemsHost="True"
+                                                    KeyboardNavigation.DirectionalNavigation="Cycle" />
+                                    </Border>
+                                </Popup>
+                            </Grid>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsHighlighted" Value="True">
+                                <Setter TargetName="bd" Property="Background" Value="{StaticResource AccentSoft}" />
+                            </Trigger>
+                            <Trigger Property="IsSubmenuOpen" Value="True">
+                                <Setter TargetName="bd" Property="Background" Value="{StaticResource AccentSoft}" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Opacity" Value="0.45" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <!-- Drop-down separators only (keyed to the menu separator style, so plain
+             Separators used elsewhere are untouched). -->
+        <Style x:Key="{x:Static MenuItem.SeparatorStyleKey}" TargetType="Separator">
+            <Setter Property="Margin" Value="6,4" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Separator">
+                        <Border Height="1" Background="{StaticResource Outline}" />
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
         <!-- ====================== DataGrid + parts ======================== -->
         <Style TargetType="DataGrid">
             <Setter Property="Background" Value="{StaticResource Surface}" />

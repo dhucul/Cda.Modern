@@ -2751,6 +2751,29 @@ namespace Cda.App
             }
         }
 
+        // ---- Help menu ---------------------------------------------------------
+        // One reusable, non-modal Help window (the searchable command/panel/shortcut
+        // reference) and a small About dialog. F1 and Help ▸ Help Contents both land
+        // in OnHelpContents via the Help command binding.
+        private UI.HelpWindow? _helpWindow;
+
+        private void OnHelpContents(object sender, System.Windows.Input.ExecutedRoutedEventArgs e) => ShowHelp(null);
+        private void OnHelpShortcuts(object sender, RoutedEventArgs e) => ShowHelp("Keyboard & mouse");
+        private void OnAbout(object sender, RoutedEventArgs e) => UI.HelpWindow.ShowAbout(this);
+
+        private void ShowHelp(string? scrollToSection)
+        {
+            if (_helpWindow == null)
+            {
+                _helpWindow = new UI.HelpWindow { Owner = this };
+                _helpWindow.Closed += (_, _) => _helpWindow = null;
+            }
+            _helpWindow.Show();
+            if (_helpWindow.WindowState == WindowState.Minimized) _helpWindow.WindowState = WindowState.Normal;
+            _helpWindow.Activate();
+            if (scrollToSection != null) _helpWindow.ScrollToSection(scrollToSection);
+        }
+
         // Hook the IAT slots of the imports the attached process makes into the OS
         // — by overwriting import-table pointers (data), NEVER patching .text. This
         // captures the same Windows-API call flow as Capture Windows API, but works
