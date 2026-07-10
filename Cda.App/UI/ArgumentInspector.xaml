@@ -15,7 +15,7 @@
                 <DataGridTextColumn Header="#" Binding="{Binding Index}" Width="40" ElementStyle="{StaticResource GridCellText}" />
                 <DataGridTextColumn Header="Register/Slot" Binding="{Binding Slot}" Width="110" ElementStyle="{StaticResource GridCellText}" />
                 <DataGridTextColumn Header="Value" Binding="{Binding Value}" Width="150" ElementStyle="{StaticResource GridCellText}" />
-                <DataGridTextColumn Header="Dereference" Binding="{Binding Deref}" Width="Auto" MinWidth="200" MaxWidth="600" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Dereference" Binding="{Binding Deref}" Width="360" MinWidth="200" ElementStyle="{StaticResource GridCellText}" />
             </DataGrid.Columns>
         </DataGrid>
     </DockPanel>

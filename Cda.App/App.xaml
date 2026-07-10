@@ -1,6 +1,7 @@
 <Application x:Class="Cda.App.App"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:ui="clr-namespace:Cda.App.UI"
              StartupUri="MainWindow.xaml">
     <Application.Resources>
         <!-- =====================================================================
@@ -268,6 +269,71 @@
             </Setter>
         </Style>
 
+        <!-- ========================= ContextMenu ========================== -->
+        <!-- The right-click Copy menus (Calls/Strings/Functions grids, hex view,
+             disassembly, caller tree) are built in code with no styling, so the popup
+             kept the OS default *light* background while the global MenuItem style
+             paints its text light - i.e. invisible. Theme the popup dark so the menu
+             text is readable. Items render through the global MenuItem template
+             (transparent face, light text, AccentSoft highlight), matching the Help
+             menu's drop-down. -->
+        <Style TargetType="ContextMenu">
+            <Setter Property="Background" Value="{StaticResource Surface}" />
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
+            <Setter Property="BorderBrush" Value="{StaticResource OutlineStrong}" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ContextMenu">
+                        <Border Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="4" Padding="3" SnapsToDevicePixels="True">
+                            <StackPanel IsItemsHost="True"
+                                        KeyboardNavigation.DirectionalNavigation="Cycle" />
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- =========================== ToolTip ============================ -->
+        <!-- Dark, wrapping tooltips app-wide (the OS default is a light box that
+             clashes with the dark chrome and never wraps). The wrapping matters for
+             the grid-cell "read the full value" tooltips (see GridCellText /
+             TrimmedToolTip): a long Strings/Args value wraps to a readable block
+             instead of one clipped line. A string tooltip's implicit TextBlock picks
+             up the wrap style from the presenter's resources; rich content is left
+             untouched. -->
+        <Style TargetType="ToolTip">
+            <Setter Property="Background" Value="{StaticResource Surface2}" />
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
+            <Setter Property="BorderBrush" Value="{StaticResource OutlineStrong}" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Padding" Value="8,6" />
+            <Setter Property="MaxWidth" Value="720" />
+            <Setter Property="HasDropShadow" Value="False" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ToolTip">
+                        <Border Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="4" SnapsToDevicePixels="True"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter TextElement.Foreground="{TemplateBinding Foreground}">
+                                <ContentPresenter.Resources>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="TextWrapping" Value="Wrap" />
+                                    </Style>
+                                </ContentPresenter.Resources>
+                            </ContentPresenter>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
         <!-- ====================== DataGrid + parts ======================== -->
         <Style TargetType="DataGrid">
             <Setter Property="Background" Value="{StaticResource Surface}" />
@@ -299,7 +365,9 @@
             <Style.Triggers>
                 <Trigger Property="IsSelected" Value="True">
                     <Setter Property="Background" Value="{StaticResource Selection}" />
-                    <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
+                    <!-- White (not light-grey) on the blue selection, matching the caller
+                         tree's selected node, so a selected row's text stays high-contrast. -->
+                    <Setter Property="Foreground" Value="#FFFFFF" />
                 </Trigger>
             </Style.Triggers>
         </Style>
@@ -324,6 +392,9 @@
             <Setter Property="VerticalAlignment" Value="Center" />
             <Setter Property="Margin" Value="8,0,12,0" />
             <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+            <!-- Hover a cut-off cell to read its full value (only shows when actually
+                 trimmed; see UI/TrimmedToolTip). Inherited by every style BasedOn this. -->
+            <Setter Property="ui:TrimmedToolTip.Enabled" Value="True" />
         </Style>
 
         <!-- ======================= ListBox + item ========================= -->

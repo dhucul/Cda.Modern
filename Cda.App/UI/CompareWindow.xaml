@@ -132,9 +132,9 @@
                             <DataGrid.Columns>
                                 <DataGridTextColumn Header="Status" Binding="{Binding StatusText}" Width="86"
                                                     ElementStyle="{StaticResource StatusCell}" />
-                                <DataGridTextColumn Header="Function" Binding="{Binding Label}" Width="Auto" MinWidth="220" MaxWidth="520"
+                                <DataGridTextColumn Header="Function" Binding="{Binding Label}" Width="Auto" MinWidth="220"
                                                     ElementStyle="{StaticResource GridCellText}" />
-                                <DataGridTextColumn Header="Module" Binding="{Binding Module}" Width="Auto" MinWidth="120" MaxWidth="240"
+                                <DataGridTextColumn Header="Module" Binding="{Binding Module}" Width="Auto" MinWidth="120"
                                                     ElementStyle="{StaticResource GridCellText}" />
                                 <DataGridTextColumn Header="Calls A" Binding="{Binding CountAText}" Width="74"
                                                     SortMemberPath="CountA" ElementStyle="{StaticResource NumCell}" />
@@ -197,7 +197,7 @@
                             <DataGrid.Columns>
                                 <DataGridTextColumn Header="Status" Binding="{Binding StatusText}" Width="86"
                                                     ElementStyle="{StaticResource StatusCell}" />
-                                <DataGridTextColumn Header="String" Binding="{Binding Value}" Width="Auto" MinWidth="200" MaxWidth="600">
+                                <DataGridTextColumn Header="String" Binding="{Binding Value}" Width="400" MinWidth="200">
                                     <DataGridTextColumn.ElementStyle>
                                         <Style TargetType="TextBlock" BasedOn="{StaticResource GridCellText}">
                                             <Setter Property="FontFamily" Value="Cascadia Mono, Consolas" />
@@ -229,9 +229,9 @@
                                 <DataGrid.Columns>
                                     <DataGridTextColumn Header="Status" Binding="{Binding StatusText}" Width="86"
                                                         ElementStyle="{StaticResource StatusCell}" />
-                                    <DataGridTextColumn Header="Function (received it)" Binding="{Binding Label}" Width="Auto" MinWidth="220" MaxWidth="520"
+                                    <DataGridTextColumn Header="Function (received it)" Binding="{Binding Label}" Width="Auto" MinWidth="220"
                                                         ElementStyle="{StaticResource GridCellText}" />
-                                    <DataGridTextColumn Header="Module" Binding="{Binding Module}" Width="Auto" MinWidth="120" MaxWidth="240"
+                                    <DataGridTextColumn Header="Module" Binding="{Binding Module}" Width="Auto" MinWidth="120"
                                                         ElementStyle="{StaticResource GridCellText}" />
                                     <DataGridTextColumn Header="Seen A" Binding="{Binding CountAText}" Width="74"
                                                         SortMemberPath="CountA" ElementStyle="{StaticResource NumCell}" />
@@ -284,9 +284,9 @@
                             <DataGrid.Columns>
                                 <DataGridTextColumn Header="Status" Binding="{Binding StatusText}" Width="86"
                                                     ElementStyle="{StaticResource StatusCell}" />
-                                <DataGridTextColumn Header="Function" Binding="{Binding Label}" Width="Auto" MinWidth="220" MaxWidth="520"
+                                <DataGridTextColumn Header="Function" Binding="{Binding Label}" Width="Auto" MinWidth="220"
                                                     ElementStyle="{StaticResource GridCellText}" />
-                                <DataGridTextColumn Header="Module" Binding="{Binding Module}" Width="Auto" MinWidth="120" MaxWidth="240"
+                                <DataGridTextColumn Header="Module" Binding="{Binding Module}" Width="Auto" MinWidth="120"
                                                     ElementStyle="{StaticResource GridCellText}" />
                                 <DataGridTextColumn Header="Rank A" Binding="{Binding RankAText}" Width="74"
                                                     SortMemberPath="RankASort" ElementStyle="{StaticResource NumCell}" />
@@ -323,9 +323,9 @@
                                         <DataGrid.Columns>
                                             <DataGridTextColumn Header="#" Binding="{Binding RankText}" Width="44"
                                                                 ElementStyle="{StaticResource CtxNumCell}" />
-                                            <DataGridTextColumn Header="Function" Binding="{Binding Label}" Width="Auto" MinWidth="220" MaxWidth="520"
+                                            <DataGridTextColumn Header="Function" Binding="{Binding Label}" Width="Auto" MinWidth="220"
                                                                 ElementStyle="{StaticResource CtxCenterCell}" />
-                                            <DataGridTextColumn Header="Module" Binding="{Binding Module}" Width="Auto" MinWidth="120" MaxWidth="240"
+                                            <DataGridTextColumn Header="Module" Binding="{Binding Module}" Width="Auto" MinWidth="120"
                                                                 ElementStyle="{StaticResource CtxCenterCell}" />
                                         </DataGrid.Columns>
                                     </DataGrid>
@@ -345,9 +345,9 @@
                                         <DataGrid.Columns>
                                             <DataGridTextColumn Header="#" Binding="{Binding RankText}" Width="44"
                                                                 ElementStyle="{StaticResource CtxNumCell}" />
-                                            <DataGridTextColumn Header="Function" Binding="{Binding Label}" Width="Auto" MinWidth="220" MaxWidth="520"
+                                            <DataGridTextColumn Header="Function" Binding="{Binding Label}" Width="Auto" MinWidth="220"
                                                                 ElementStyle="{StaticResource CtxCenterCell}" />
-                                            <DataGridTextColumn Header="Module" Binding="{Binding Module}" Width="Auto" MinWidth="120" MaxWidth="240"
+                                            <DataGridTextColumn Header="Module" Binding="{Binding Module}" Width="Auto" MinWidth="120"
                                                                 ElementStyle="{StaticResource CtxCenterCell}" />
                                         </DataGrid.Columns>
                                     </DataGrid>

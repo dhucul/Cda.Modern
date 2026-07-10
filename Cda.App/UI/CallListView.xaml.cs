@@ -6,6 +6,7 @@ using System.Text;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Data;
+using System.Windows.Input;
 using Cda.Core.Engine;
 using Cda.Core.Model;
 using Cda.Core.Process;
@@ -28,7 +29,10 @@ namespace Cda.App.UI
             public string Dest { get; set; } = "";
             public string Args { get; set; } = "";
             public string Return { get; set; } = "";
-            public string Strings { get; set; } = "";
+            public string Strings { get; set; } = "";          // single line, for the grid column
+            public string StringsMultiline { get; set; } = ""; // one per line, for the detail panel
+            public bool HasReturn { get; set; }
+            public bool HasStrings { get; set; }
             public bool Bookmarked { get; set; }
             public CallRecord Record { get; set; } = null!;
         }
@@ -185,8 +189,11 @@ namespace Cda.App.UI
             string? name = _nameOf?.Invoke(r.Destination);
 
             // Decoded strings indexed by argument, so a signature can inline them.
+            // Built two ways: single-line (space-separated) for the grid column, and
+            // one-per-line for the detail panel that unfurls under the selected call.
             Dictionary<int, string>? strByArg = null;
             var strs = new StringBuilder();
+            var strsMulti = new StringBuilder();
             if (r.Dereferences != null)
                 foreach (var d in r.Dereferences)
                 {
@@ -195,7 +202,11 @@ namespace Cda.App.UI
                     (strByArg ??= new Dictionary<int, string>())[d.ArgumentIndex] = s;
                     if (strs.Length > 0) strs.Append("   ");
                     strs.Append($"arg{d.ArgumentIndex}=\"{s}\"");
+                    if (strsMulti.Length > 0) strsMulti.Append('\n');
+                    strsMulti.Append($"arg{d.ArgumentIndex} = \"{s}\"");
                 }
+
+            string ret = FormatReturn(r);
 
             return new CallRow
             {
@@ -205,8 +216,11 @@ namespace Cda.App.UI
                 Source = Describe(r.Source),
                 Dest = DescribeCallee(r.Destination, name),
                 Args = FormatArgs(r, name, strByArg),
-                Return = FormatReturn(r),
+                Return = ret,
                 Strings = strs.ToString(),
+                StringsMultiline = strsMulti.ToString(),
+                HasReturn = ret.Length > 0,
+                HasStrings = strs.Length > 0,
                 Record = r,
             };
         }
@@ -280,6 +294,12 @@ namespace Cda.App.UI
 
         private void OnSelectionChanged(object? sender, SelectionChangedEventArgs e)
         {
+            // Unfurl the per-call detail panel only for a lone selection — a multi-row
+            // selection is a copy gesture, so keep those rows compact.
+            Grid.RowDetailsVisibilityMode = Grid.SelectedItems.Count == 1
+                ? DataGridRowDetailsVisibilityMode.VisibleWhenSelected
+                : DataGridRowDetailsVisibilityMode.Collapsed;
+
             if (_selecting) return; // a programmatic jump fires CallSelected itself
             if (Grid.SelectedItems.Count > 1) return; // multi-select is for copy, not navigation
             if (Grid.SelectedItem is CallRow row && row.Record != null)
@@ -338,6 +358,23 @@ namespace Cda.App.UI
         private void OnBookmarkClick(object sender, RoutedEventArgs e)
         {
             if (_bookmarkedOnly) _view?.Refresh();
+        }
+
+        // Scroll the detail's strings box one line per wheel notch (the default is the
+        // system's ~3 lines). Handling PreviewMouseWheel replaces the TextBox's own
+        // wheel scroll; one line per 120-unit notch (more for a fast/coarse wheel).
+        private void OnStringsWheel(object sender, MouseWheelEventArgs e)
+        {
+            if (sender is not TextBox tb) return;
+            if (tb.Template?.FindName("PART_ContentHost", tb) is not ScrollViewer sv) return;
+
+            int lines = Math.Max(1, Math.Abs(e.Delta) / 120);
+            for (int i = 0; i < lines; i++)
+            {
+                if (e.Delta > 0) sv.LineUp();
+                else sv.LineDown();
+            }
+            e.Handled = true;
         }
     }
 }

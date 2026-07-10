@@ -17,8 +17,8 @@
                   FontFamily="Cascadia Mono, Consolas" FontSize="12">
             <DataGrid.Columns>
                 <DataGridTextColumn Header="#" Binding="{Binding Depth}" Width="48" ElementStyle="{StaticResource GridCellText}" />
-                <DataGridTextColumn Header="Frame (caller)" Binding="{Binding Function}" Width="Auto" MinWidth="200" MaxWidth="600" ElementStyle="{StaticResource GridCellText}" />
-                <DataGridTextColumn Header="Module" Binding="{Binding Module}" Width="Auto" MaxWidth="220" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Frame (caller)" Binding="{Binding Function}" Width="Auto" MinWidth="200" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Module" Binding="{Binding Module}" Width="Auto" ElementStyle="{StaticResource GridCellText}" />
             </DataGrid.Columns>
         </DataGrid>
     </DockPanel>

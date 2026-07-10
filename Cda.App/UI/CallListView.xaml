@@ -2,6 +2,33 @@
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              Background="{StaticResource Surface}">
+    <UserControl.Resources>
+        <BooleanToVisibilityConverter x:Key="BoolToVis" />
+
+        <!-- Per-call detail panel (unfurls under the selected row). A muted label and a
+             read-only, wrapping, selectable value - so a long decoded string is fully
+             readable and individually copyable, not squeezed into a grid cell. -->
+        <Style x:Key="DetailLabel" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="{StaticResource TextMuted}" />
+            <Setter Property="FontFamily" Value="Cascadia Mono, Consolas" />
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="MinWidth" Value="52" />
+            <Setter Property="Margin" Value="0,1,10,1" />
+            <Setter Property="VerticalAlignment" Value="Top" />
+        </Style>
+        <Style x:Key="DetailValue" TargetType="TextBox" BasedOn="{StaticResource {x:Type TextBox}}">
+            <Setter Property="IsReadOnly" Value="True" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="Margin" Value="0,1,0,1" />
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
+            <Setter Property="FontFamily" Value="Cascadia Mono, Consolas" />
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="TextWrapping" Value="Wrap" />
+            <Setter Property="IsTabStop" Value="False" />
+        </Style>
+    </UserControl.Resources>
     <DockPanel>
         <DockPanel DockPanel.Dock="Top" LastChildFill="True">
             <CheckBox x:Name="FollowTail" DockPanel.Dock="Right" Content="Follow" IsChecked="True"
@@ -35,6 +62,7 @@
                   Foreground="{StaticResource TextPrimary}" BorderThickness="0"
                   EnableRowVirtualization="True" EnableColumnVirtualization="True"
                   VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+                  RowDetailsVisibilityMode="Collapsed"
                   FontFamily="Cascadia Mono, Consolas" FontSize="12">
             <DataGrid.Columns>
                 <DataGridTemplateColumn Header="★" Width="32" SortMemberPath="Bookmarked">
@@ -48,12 +76,63 @@
                 </DataGridTemplateColumn>
                 <DataGridTextColumn Header="#" Binding="{Binding Seq}" SortMemberPath="SeqNum" Width="60" ElementStyle="{StaticResource GridCellText}" />
                 <DataGridTextColumn Header="Time (s)" Binding="{Binding Time}" SortMemberPath="Record.Time" Width="90" ElementStyle="{StaticResource GridCellText}" />
-                <DataGridTextColumn Header="Caller" Binding="{Binding Source}" Width="170" ElementStyle="{StaticResource GridCellText}" />
-                <DataGridTextColumn Header="Callee" Binding="{Binding Dest}" Width="170" ElementStyle="{StaticResource GridCellText}" />
-                <DataGridTextColumn Header="Args" Binding="{Binding Args}" Width="240" ElementStyle="{StaticResource GridCellText}" />
-                <DataGridTextColumn Header="Return" Binding="{Binding Return}" Width="130" ElementStyle="{StaticResource GridCellText}" />
-                <DataGridTextColumn Header="Strings" Binding="{Binding Strings}" Width="Auto" MinWidth="200" MaxWidth="600" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Caller" Binding="{Binding Source}" Width="220" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Callee" Binding="{Binding Dest}" Width="220" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Args" Binding="{Binding Args}" Width="320" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Return" Binding="{Binding Return}" Width="160" ElementStyle="{StaticResource GridCellText}" />
+                <!-- No MaxWidth: this column can hold very long decoded strings, so let the
+                     user drag it arbitrarily wide (and horizontal-scroll to it) to read all of it. -->
+                <DataGridTextColumn Header="Strings" Binding="{Binding Strings}" Width="420" MinWidth="200" ElementStyle="{StaticResource GridCellText}" />
             </DataGrid.Columns>
+
+            <!-- Click a call to unfurl its full breakdown here: caller, callee, args,
+                 return, and every decoded string on its own line - all wrapping and
+                 selectable, so nothing is cut off and any value can be copied. -->
+            <DataGrid.RowDetailsTemplate>
+                <DataTemplate>
+                    <Border Background="{StaticResource Surface2}" BorderBrush="{StaticResource OutlineStrong}"
+                            BorderThickness="0,1,0,1" Padding="16,10">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+
+                            <TextBlock Grid.Row="0" Grid.Column="0" Text="Caller" Style="{StaticResource DetailLabel}" />
+                            <TextBox   Grid.Row="0" Grid.Column="1" Text="{Binding Source, Mode=OneWay}" Style="{StaticResource DetailValue}" />
+
+                            <TextBlock Grid.Row="1" Grid.Column="0" Text="Callee" Style="{StaticResource DetailLabel}" />
+                            <TextBox   Grid.Row="1" Grid.Column="1" Text="{Binding Dest, Mode=OneWay}" Style="{StaticResource DetailValue}" />
+
+                            <TextBlock Grid.Row="2" Grid.Column="0" Text="Args" Style="{StaticResource DetailLabel}" />
+                            <TextBox   Grid.Row="2" Grid.Column="1" Text="{Binding Args, Mode=OneWay}" Style="{StaticResource DetailValue}" />
+
+                            <TextBlock Grid.Row="3" Grid.Column="0" Text="Return" Style="{StaticResource DetailLabel}"
+                                       Visibility="{Binding HasReturn, Converter={StaticResource BoolToVis}}" />
+                            <TextBox   Grid.Row="3" Grid.Column="1" Text="{Binding Return, Mode=OneWay}" Style="{StaticResource DetailValue}"
+                                       Visibility="{Binding HasReturn, Converter={StaticResource BoolToVis}}" />
+
+                            <TextBlock Grid.Row="4" Grid.Column="0" Text="Strings" Style="{StaticResource DetailLabel}"
+                                       Visibility="{Binding HasStrings, Converter={StaticResource BoolToVis}}" />
+                            <!-- The strings can be many lines, so this box scrolls itself: a
+                                 multi-line, height-capped TextBox scrolls with the mouse wheel
+                                 (and its own scrollbar), while the grid's scrollbar keeps moving
+                                 between calls. -->
+                            <TextBox   Grid.Row="4" Grid.Column="1" Text="{Binding StringsMultiline, Mode=OneWay}" Style="{StaticResource DetailValue}"
+                                       AcceptsReturn="True" MaxHeight="200" VerticalScrollBarVisibility="Auto"
+                                       PreviewMouseWheel="OnStringsWheel"
+                                       Visibility="{Binding HasStrings, Converter={StaticResource BoolToVis}}" />
+                        </Grid>
+                    </Border>
+                </DataTemplate>
+            </DataGrid.RowDetailsTemplate>
         </DataGrid>
     </DockPanel>
 </UserControl>

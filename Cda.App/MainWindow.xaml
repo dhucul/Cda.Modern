@@ -152,13 +152,18 @@
         <!-- Main work area: function list | (graph / hex+args) -->
         <Grid>
             <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="560" MinWidth="340" />
-                <ColumnDefinition Width="4" />
-                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="560" MinWidth="260" />
+                <ColumnDefinition Width="6" />
+                <ColumnDefinition Width="*" MinWidth="200" />
             </Grid.ColumnDefinitions>
 
             <ui:FunctionListView x:Name="FunctionList" Grid.Column="0" />
-            <GridSplitter Grid.Column="1" Width="4" HorizontalAlignment="Stretch" Background="{StaticResource Outline}" />
+            <!-- Drag to move room between the function list and the right pane. Explicit
+                 direction/behaviour so it reliably resizes the two columns (not rows), and a
+                 6px grip so it's easy to grab. -->
+            <GridSplitter Grid.Column="1" Width="6" HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+                          ResizeDirection="Columns" ResizeBehavior="PreviousAndNext"
+                          Background="{StaticResource Outline}" />
 
             <Grid Grid.Column="2">
                 <Grid.RowDefinitions>

@@ -42,8 +42,8 @@
             <DataGrid.Columns>
                 <DataGridTextColumn Header="Order" Binding="{Binding CallOrderText}" SortMemberPath="FirstCallSeq" Width="Auto" MinWidth="44" ElementStyle="{StaticResource GridCellText}" />
                 <DataGridTextColumn Header="Address" Binding="{Binding AddressHex}" Width="Auto" ElementStyle="{StaticResource GridCellText}" />
-                <DataGridTextColumn Header="Module" Binding="{Binding Module}" Width="Auto" MaxWidth="220" ElementStyle="{StaticResource GridCellText}" />
-                <DataGridTextColumn Header="Function" Binding="{Binding Name}" Width="Auto" MinWidth="180" MaxWidth="420" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Module" Binding="{Binding Module}" Width="Auto" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Function" Binding="{Binding Name}" Width="Auto" MinWidth="180" ElementStyle="{StaticResource GridCellText}" />
                 <DataGridTextColumn Header="Calls" Binding="{Binding CallCount}" Width="84" ElementStyle="{StaticResource GridCellText}" />
             </DataGrid.Columns>
         </DataGrid>
