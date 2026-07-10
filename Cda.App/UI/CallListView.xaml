@@ -46,13 +46,13 @@
                         </DataTemplate>
                     </DataGridTemplateColumn.CellTemplate>
                 </DataGridTemplateColumn>
-                <DataGridTextColumn Header="#" Binding="{Binding Seq}" SortMemberPath="SeqNum" Width="60" />
-                <DataGridTextColumn Header="Time (s)" Binding="{Binding Time}" SortMemberPath="Record.Time" Width="90" />
-                <DataGridTextColumn Header="Caller" Binding="{Binding Source}" Width="170" />
-                <DataGridTextColumn Header="Callee" Binding="{Binding Dest}" Width="170" />
-                <DataGridTextColumn Header="Args" Binding="{Binding Args}" Width="240" />
-                <DataGridTextColumn Header="Return" Binding="{Binding Return}" Width="130" />
-                <DataGridTextColumn Header="Strings" Binding="{Binding Strings}" Width="*" />
+                <DataGridTextColumn Header="#" Binding="{Binding Seq}" SortMemberPath="SeqNum" Width="60" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Time (s)" Binding="{Binding Time}" SortMemberPath="Record.Time" Width="90" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Caller" Binding="{Binding Source}" Width="170" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Callee" Binding="{Binding Dest}" Width="170" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Args" Binding="{Binding Args}" Width="240" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Return" Binding="{Binding Return}" Width="130" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Strings" Binding="{Binding Strings}" Width="Auto" MinWidth="200" MaxWidth="600" ElementStyle="{StaticResource GridCellText}" />
             </DataGrid.Columns>
         </DataGrid>
     </DockPanel>

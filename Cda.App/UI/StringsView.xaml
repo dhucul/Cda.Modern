@@ -49,7 +49,7 @@
                 <DataGrid.Columns>
                     <DataGridTextColumn Header="Address" Binding="{Binding AddressHex}" Width="Auto" ElementStyle="{StaticResource GridCellText}" />
                     <DataGridTextColumn Header="T" Binding="{Binding KindGlyph}" Width="28" ElementStyle="{StaticResource GridCellText}" />
-                    <DataGridTextColumn Header="String" Binding="{Binding Display}" Width="2*" MinWidth="200" ElementStyle="{StaticResource StringCellStyle}" />
+                    <DataGridTextColumn Header="String" Binding="{Binding Display}" Width="Auto" MinWidth="200" MaxWidth="600" ElementStyle="{StaticResource StringCellStyle}" />
                     <DataGridTextColumn Header="Refs" Binding="{Binding RefCount}" Width="56" ElementStyle="{StaticResource GridCellText}" />
                     <DataGridTextColumn Header="Function" Binding="{Binding PrimaryFunction}" Width="Auto" MaxWidth="260" ElementStyle="{StaticResource GridCellText}" />
                 </DataGrid.Columns>
@@ -81,7 +81,7 @@
                     <DataGrid.Columns>
                         <DataGridTextColumn Header="Address" Binding="{Binding AddressHex}" Width="Auto" ElementStyle="{StaticResource GridCellText}" />
                         <DataGridTextColumn Header="Module" Binding="{Binding Module}" Width="Auto" MaxWidth="200" ElementStyle="{StaticResource GridCellText}" />
-                        <DataGridTextColumn Header="Function" Binding="{Binding Name}" Width="*" MinWidth="160" ElementStyle="{StaticResource GridCellText}" />
+                        <DataGridTextColumn Header="Function" Binding="{Binding Name}" Width="Auto" MinWidth="160" MaxWidth="420" ElementStyle="{StaticResource GridCellText}" />
                     </DataGrid.Columns>
                 </DataGrid>
             </DockPanel>

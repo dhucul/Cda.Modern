@@ -16,11 +16,11 @@
                   SelectionMode="Single"
                   FontFamily="Cascadia Mono, Consolas" FontSize="12">
             <DataGrid.Columns>
-                <DataGridTextColumn Header="Time" Binding="{Binding Time}" Width="Auto" MinWidth="72" />
-                <DataGridTextColumn Header="Dialog API" Binding="{Binding Api}" Width="Auto" MinWidth="150" />
-                <DataGridTextColumn Header="Caption / text" Binding="{Binding Caption}" Width="*" MinWidth="140" />
-                <DataGridTextColumn Header="Created by (caller)" Binding="{Binding Caller}" Width="*" MinWidth="180" />
-                <DataGridTextColumn Header="Module" Binding="{Binding Module}" Width="Auto" MaxWidth="200" />
+                <DataGridTextColumn Header="Time" Binding="{Binding Time}" Width="Auto" MinWidth="72" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Dialog API" Binding="{Binding Api}" Width="Auto" MinWidth="150" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Caption / text" Binding="{Binding Caption}" Width="Auto" MinWidth="140" MaxWidth="360" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Created by (caller)" Binding="{Binding Caller}" Width="Auto" MinWidth="180" MaxWidth="420" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Module" Binding="{Binding Module}" Width="Auto" MaxWidth="200" ElementStyle="{StaticResource GridCellText}" />
             </DataGrid.Columns>
         </DataGrid>
     </DockPanel>

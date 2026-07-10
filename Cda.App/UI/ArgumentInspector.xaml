@@ -12,10 +12,10 @@
                   Foreground="{StaticResource TextPrimary}" BorderThickness="0"
                   FontFamily="Cascadia Mono, Consolas" FontSize="12">
             <DataGrid.Columns>
-                <DataGridTextColumn Header="#" Binding="{Binding Index}" Width="40" />
-                <DataGridTextColumn Header="Register/Slot" Binding="{Binding Slot}" Width="110" />
-                <DataGridTextColumn Header="Value" Binding="{Binding Value}" Width="150" />
-                <DataGridTextColumn Header="Dereference" Binding="{Binding Deref}" Width="*" />
+                <DataGridTextColumn Header="#" Binding="{Binding Index}" Width="40" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Register/Slot" Binding="{Binding Slot}" Width="110" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Value" Binding="{Binding Value}" Width="150" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Dereference" Binding="{Binding Deref}" Width="Auto" MinWidth="200" MaxWidth="600" ElementStyle="{StaticResource GridCellText}" />
             </DataGrid.Columns>
         </DataGrid>
     </DockPanel>

@@ -29,6 +29,8 @@ namespace Cda.App.UI
     {
         private readonly Surface _surface;
         private readonly ScrollBar _scroll;
+        private readonly ScrollBar _hScroll;
+        private double _xOffset; // horizontal scroll offset, in pixels
 
         private IMemorySource? _source;
         private readonly List<Line> _lines = new();
@@ -69,15 +71,25 @@ namespace Cda.App.UI
         {
             ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
             _surface = new Surface(this);
             SetColumn(_surface, 0);
+            SetRow(_surface, 0);
             Children.Add(_surface);
 
             _scroll = new ScrollBar { Orientation = Orientation.Vertical, SmallChange = 1 };
             _scroll.Scroll += OnScroll;
             SetColumn(_scroll, 1);
+            SetRow(_scroll, 0);
             Children.Add(_scroll);
+
+            _hScroll = new ScrollBar { Orientation = Orientation.Horizontal, Visibility = Visibility.Collapsed };
+            _hScroll.Scroll += OnHScroll;
+            SetColumn(_hScroll, 0);
+            SetRow(_hScroll, 1);
+            Children.Add(_hScroll);
 
             var copy = new MenuItem { Header = "Copy", InputGestureText = "Ctrl+C" };
             copy.Click += (_, _) => CopyAll();
@@ -170,6 +182,50 @@ namespace Cda.App.UI
             _scroll.ViewportSize = VisibleRows;
             if (_top > (int)_scroll.Maximum) _top = (int)_scroll.Maximum;
             _scroll.Value = _top;
+
+            ConfigureHScroll();
+        }
+
+        // The widest rendered line drives the horizontal bar; it appears only when a
+        // line (e.g. a long decompiled-C# statement) runs past the pane's right edge.
+        private void ConfigureHScroll()
+        {
+            int addrDigits = _source != null && _source.Is64Bit ? 16 : 8;
+            double bytesX = 6 + (addrDigits + 2) * _charWidth;
+            double textX = bytesX + (MaxShownBytes * 3 + 2) * _charWidth;
+            double content = 0;
+            foreach (var l in _lines)
+            {
+                double right = (l.Plain ? 6 : textX) + l.Text.Length * _charWidth;
+                if (right > content) content = right;
+            }
+            if (_lines.Count > 0) content += 8;
+
+            double viewport = _surface.ActualWidth;
+            double max = Math.Max(0, content - viewport);
+            _hScroll.Minimum = 0;
+            _hScroll.Maximum = max;
+            _hScroll.ViewportSize = viewport;
+            _hScroll.LargeChange = Math.Max(_charWidth, viewport - _charWidth);
+            _hScroll.SmallChange = _charWidth;
+            if (_xOffset > max) _xOffset = max;
+            _hScroll.Value = _xOffset;
+            _hScroll.Visibility = viewport > 0.5 && max > 0.5 ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        private void OnHScroll(object sender, ScrollEventArgs e)
+        {
+            _xOffset = Math.Max(0, Math.Min(e.NewValue, _hScroll.Maximum));
+            _surface.InvalidateVisual();
+        }
+
+        private void ScrollHoriz(double dx)
+        {
+            double v = Math.Max(0, Math.Min(_xOffset + dx, _hScroll.Maximum));
+            if (v == _xOffset) return;
+            _xOffset = v;
+            _hScroll.Value = v;
+            _surface.InvalidateVisual();
         }
 
         private void OnScroll(object sender, ScrollEventArgs e)
@@ -205,6 +261,8 @@ namespace Cda.App.UI
             dc.DrawRectangle(BgBrush, null, new Rect(0, 0, width, height));
             if (_lines.Count == 0) return;
 
+            dc.PushTransform(new TranslateTransform(-_xOffset, 0));
+
             double dpi = VisualTreeHelper.GetDpi(this).PixelsPerDip;
             int addrDigits = _source != null && _source.Is64Bit ? 16 : 8;
             double bytesX = 6 + (addrDigits + 2) * _charWidth;
@@ -227,6 +285,8 @@ namespace Cda.App.UI
                 Draw(dc, line.Bytes, bytesX, y, BytesBrush, dpi);
                 Draw(dc, line.Text, textX, y, TextBrush, dpi);
             }
+
+            dc.Pop();
         }
 
         private void Draw(DrawingContext dc, string text, double x, double y, Brush brush, double dpi)
@@ -254,7 +314,10 @@ namespace Cda.App.UI
 
             protected override void OnMouseWheel(MouseWheelEventArgs e)
             {
-                _owner.ScrollByRows(-Math.Sign(e.Delta) * 3);
+                if ((Keyboard.Modifiers & ModifierKeys.Shift) != 0)
+                    _owner.ScrollHoriz(-Math.Sign(e.Delta) * 3 * _owner._charWidth);
+                else
+                    _owner.ScrollByRows(-Math.Sign(e.Delta) * 3);
                 e.Handled = true;
             }
 
@@ -272,6 +335,8 @@ namespace Cda.App.UI
                     case Key.Down: _owner.ScrollByRows(1); e.Handled = true; break;
                     case Key.PageUp: _owner.ScrollByRows(-_owner.VisibleRows); e.Handled = true; break;
                     case Key.PageDown: _owner.ScrollByRows(_owner.VisibleRows); e.Handled = true; break;
+                    case Key.Left: _owner.ScrollHoriz(-4 * _owner._charWidth); e.Handled = true; break;
+                    case Key.Right: _owner.ScrollHoriz(4 * _owner._charWidth); e.Handled = true; break;
                     case Key.C when (Keyboard.Modifiers & ModifierKeys.Control) != 0:
                         _owner.CopyAll(); e.Handled = true; break;
                 }

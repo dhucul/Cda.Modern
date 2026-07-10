@@ -25,6 +25,8 @@ namespace Cda.App.UI
     {
         private readonly Surface _surface;
         private readonly ScrollBar _scroll;
+        private readonly ScrollBar _hScroll;
+        private double _xOffset; // horizontal scroll offset, in pixels
 
         private IMemorySource? _source;
         private ulong _topAddress;
@@ -52,15 +54,25 @@ namespace Cda.App.UI
         {
             ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
             ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
             _surface = new Surface(this);
             SetColumn(_surface, 0);
+            SetRow(_surface, 0);
             Children.Add(_surface);
 
             _scroll = new ScrollBar { Orientation = Orientation.Vertical, SmallChange = 1 };
             _scroll.Scroll += OnScroll;
             SetColumn(_scroll, 1);
+            SetRow(_scroll, 0);
             Children.Add(_scroll);
+
+            _hScroll = new ScrollBar { Orientation = Orientation.Horizontal, Visibility = Visibility.Collapsed };
+            _hScroll.Scroll += OnHScroll;
+            SetColumn(_hScroll, 0);
+            SetRow(_hScroll, 1);
+            Children.Add(_hScroll);
 
             var copyHex = new MenuItem { Header = "Copy (hex)", InputGestureText = "Ctrl+C" };
             copyHex.Click += (_, _) => CopySelection(asText: false);
@@ -112,6 +124,7 @@ namespace Cda.App.UI
 
         private void ConfigureScroll()
         {
+            ConfigureHScroll();
             if (_source == null) { _scroll.Maximum = 0; return; }
             double totalRows = (_source.MaxAddress - _source.MinAddress) / (double)BytesPerRow;
             _scroll.Minimum = 0;
@@ -119,6 +132,38 @@ namespace Cda.App.UI
             _scroll.LargeChange = VisibleRows;
             _scroll.ViewportSize = VisibleRows;
             SyncScrollValue();
+        }
+
+        // The horizontal bar appears only when a row is wider than the pane (a narrow
+        // Memory tab) and scrolls across to reach the ASCII column; hidden otherwise.
+        private void ConfigureHScroll()
+        {
+            double viewport = _surface.ActualWidth;
+            double content = _source == null ? 0 : ContentWidth;
+            double max = Math.Max(0, content - viewport);
+            _hScroll.Minimum = 0;
+            _hScroll.Maximum = max;
+            _hScroll.ViewportSize = viewport;
+            _hScroll.LargeChange = Math.Max(_charWidth, viewport - _charWidth);
+            _hScroll.SmallChange = _charWidth;
+            if (_xOffset > max) _xOffset = max;
+            _hScroll.Value = _xOffset;
+            _hScroll.Visibility = viewport > 0.5 && max > 0.5 ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        private void OnHScroll(object sender, ScrollEventArgs e)
+        {
+            _xOffset = Math.Max(0, Math.Min(e.NewValue, _hScroll.Maximum));
+            _surface.InvalidateVisual();
+        }
+
+        private void ScrollHoriz(double dx)
+        {
+            double v = Math.Max(0, Math.Min(_xOffset + dx, _hScroll.Maximum));
+            if (v == _xOffset) return;
+            _xOffset = v;
+            _hScroll.Value = v;
+            _surface.InvalidateVisual();
         }
 
         private void SyncScrollValue()
@@ -153,6 +198,8 @@ namespace Cda.App.UI
         // The hex run is 16*3 + 1 (mid gap) = 49 chars; ASCII starts one char past it.
         private double AsciiX => HexX + 50 * _charWidth;
         private static int HexCharOffset(int c) => c * 3 + (c >= 8 ? 1 : 0);
+        // Full pixel width of a drawn row (address gutter + hex + ASCII) + a little padding.
+        private double ContentWidth => AsciiX + BytesPerRow * _charWidth + 8;
 
         // The byte address under a point, or false if there's no source.
         private bool HitTestByte(Point p, out ulong addr)
@@ -162,11 +209,14 @@ namespace Cda.App.UI
             int r = Math.Max(0, (int)(p.Y / _rowHeight));
             ulong rowAddr = _topAddress + (ulong)(r * BytesPerRow);
 
+            // Map the surface point into content space (undo the horizontal scroll offset).
+            double px = p.X + _xOffset;
+
             int col;
-            if (p.X >= AsciiX) col = (int)((p.X - AsciiX) / _charWidth);
-            else if (p.X >= HexX)
+            if (px >= AsciiX) col = (int)((px - AsciiX) / _charWidth);
+            else if (px >= HexX)
             {
-                double cx = (p.X - HexX) / _charWidth;
+                double cx = (px - HexX) / _charWidth;
                 col = cx < 24 ? (int)(cx / 3) : 8 + (int)((cx - 25) / 3);
             }
             else col = 0; // in the address gutter — treat as the row's first byte
@@ -234,6 +284,8 @@ namespace Cda.App.UI
             dc.DrawRectangle(BgBrush, null, new Rect(0, 0, width, height));
             if (_source == null) return;
 
+            dc.PushTransform(new TranslateTransform(-_xOffset, 0));
+
             int addrDigits = AddrDigits;
             double hexX = HexX, asciiX = AsciiX;
             int rows = (int)(height / _rowHeight) + 1;
@@ -282,6 +334,8 @@ namespace Cda.App.UI
                 Draw(dc, hex.ToString(), hexX, y, read > 0 ? HexBrush : DimBrush, dpi);
                 Draw(dc, ascii.ToString(), asciiX, y, AsciiBrush, dpi);
             }
+
+            dc.Pop();
         }
 
         // Highlight the selected byte cells [cStart, cEnd] in this row — the ASCII run
@@ -327,7 +381,10 @@ namespace Cda.App.UI
 
             protected override void OnMouseWheel(MouseWheelEventArgs e)
             {
-                _owner.ScrollByRows(-Math.Sign(e.Delta) * 3);
+                if ((Keyboard.Modifiers & ModifierKeys.Shift) != 0)
+                    _owner.ScrollHoriz(-Math.Sign(e.Delta) * 3 * _owner._charWidth);
+                else
+                    _owner.ScrollByRows(-Math.Sign(e.Delta) * 3);
                 e.Handled = true;
             }
 
