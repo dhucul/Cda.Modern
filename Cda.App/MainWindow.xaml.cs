@@ -3752,11 +3752,61 @@ namespace Cda.App
             string callerModule = callerAddr != 0 ? (_moduleMap?.Resolve(callerAddr)?.Name ?? "") : "";
             string callerDesc = callerAddr != 0 ? DescribeAddr(callerAddr) : "unknown";
 
+            // Resolve the conditional branch that gates this dialog call — the
+            // instruction that "jumps or not jumps to the message box". Scans the
+            // immediate call site first, then walks the caller chain upward through
+            // the raw return addresses from the captured stack snapshot (filtered
+            // to app-code frames with validated CALL instructions) so a branch
+            // one level removed — e.g. the `je` in the caller of a ShowError() /
+            // OpenMyDialog() wrapper — is still found. Uses raw return addresses
+            // (not floored function entries) so the analyzer can locate the exact
+            // call instruction at each frame. Reads from the target's live code
+            // via the capture's read handle. Dialogs are infrequent, so the cost
+            // is negligible.
+            ulong branchAddr = 0;
+            string branchText = "";
+            if (rec.Source != 0)
+            {
+                try
+                {
+                    // Build the upward caller chain from raw stack-snapshot words.
+                    // Each word is a return address — the instruction AFTER a call.
+                    // The analyzer uses these to find the `call` at (word - 5) and
+                    // scan backwards from there. We filter for app-code addresses
+                    // that are preceded by a real CALL instruction, same validation
+                    // ExtractLocalChain uses, so we never pass stale data.
+                    var parentAddrs = new List<ulong>();
+                    if (rec.StackSnapshot != null)
+                    {
+                        foreach (var w in rec.StackSnapshot)
+                        {
+                            if (w == rec.Source) continue;
+                            if (!IsAppCode(w)) continue;
+                            if (!LooksLikeReturnAddress(w)) continue;
+                            parentAddrs.Add(w);
+                        }
+                    }
+
+                    var bi = DialogBranchAnalyzer.Analyze(rec.Source, parentAddrs, _is64,
+                        (addr, buf) => DialogRead(addr, buf));
+                    if (bi != null)
+                    {
+                        branchAddr = bi.Address;
+                        string taken = bi.WouldSkip ? " (not taken)" : "";
+                        string frame = bi.FrameIndex > 0 ? $" (+{bi.FrameIndex})" : "";
+                        branchText = $"{bi.Disassembly}{taken}{frame}";
+                    }
+                }
+                catch { /* best effort — branch info is non-critical */ }
+            }
+
             DialogList.Add(new DialogListView.Row
             {
                 Time = $"{rec.Time:0.000}s",
                 Api = api,
                 Caption = caption,
+                Branch = branchText,
+                BranchAddress = branchAddr,
                 Caller = callerName,
                 Module = callerModule,
                 Address = callerAddr,
@@ -3931,27 +3981,110 @@ namespace Cda.App
 
         private const uint WS_CHILD = 0x40000000;
         private const uint WS_POPUP = 0x80000000;
+        private const uint WS_CAPTION = 0x00C00000;
+        private const uint WS_SYSMENU = 0x00080000;
+        private const uint WS_THICKFRAME = 0x00040000;
+        private const uint WS_MINIMIZEBOX = 0x00020000;
+        private const uint WS_MAXIMIZEBOX = 0x00010000;
         private const uint WS_EX_DLGMODALFRAME = 0x00000001;
+        private const uint WS_EX_TOOLWINDOW = 0x00000080;
+        private const uint WS_EX_CONTROLPARENT = 0x00010000;
         private const ulong AtomDialogClass = 0x8002; // MAKEINTATOM(WC_DIALOG) — the #32770 class
 
         // CreateWindowEx heuristic: is this a dialog/box rather than a child control or
-        // the app's main window? True for the standard dialog class (#32770, passed as
-        // the atom 0x8002 or the "#32770" string), any window with the modal-frame
-        // ex-style, or a titled top-level popup. This filters out the flood of child
-        // controls (buttons/edits/statics) and the plain overlapped main window.
+        // the app's main window? Recognizes several patterns (in priority order):
+        //
+        //   1. The standard dialog class (#32770 / MAKEINTATOM 0x8002) — unambiguous.
+        //   2. WS_EX_DLGMODALFRAME (the OS modal-frame border) — unambiguous.
+        //   3. WS_EX_TOOLWINDOW (thin title bar) — custom message boxes + property sheets.
+        //   4. WS_EX_CONTROLPARENT (dialog keyboard navigation: TAB / arrows) — strong signal.
+        //   5. Titled top-level popup with a system menu (close button).
+        //   6. Custom overlapped window: no thick resizable frame, no min+max together,
+        //      has a title + system menu — the classic hand-rolled modal dialog pattern.
+        //   7. A window with a custom-registered ATOM class (MAKEINTATOM, not a system
+        //      class name), top-level, titled, with a system menu — very likely an app
+        //      dialog registered via RegisterClassEx + CreateWindowEx.
+        //
+        // All patterns require the window is NOT a child (WS_CHILD) — child windows are
+        // controls embedded in another window (buttons, edits, statics), never a dialog.
+        // The goal is to catch every dialog the app creates by hand, while never flagging
+        // its own main window or the flood of child controls the OS creates as a dialog
+        // (e.g. TaskDialog) is being assembled.
+        //
         // Args: dwExStyle=0, lpClassName=1, lpWindowName=2, dwStyle=3.
         private bool IsDialogLikeWindow(CallRecord rec)
         {
             ulong classArg = ArgRaw(rec, 1);
-            if (classArg == AtomDialogClass) return true;
+            uint exStyle = (uint)ArgRaw(rec, 0);
+            uint style = (uint)ArgRaw(rec, 3);
+
+            // Reject child windows immediately — a dialog is always top-level.
+            if ((style & WS_CHILD) != 0) return false;
+
+            bool hasTitle = (style & WS_CAPTION) != 0;
+            bool hasSysMenu = (style & WS_SYSMENU) != 0;
+            string? title = StringArg(rec, 2);
             string? cls = StringArg(rec, 1);
+            bool isCustomAtom = classArg != 0 && classArg <= 0xFFFF;
+
+            // (1) The standard dialog class (atom 0x8002 or string "#32770").
+            if (classArg == AtomDialogClass) return true;
             if (cls == "#32770") return true;
 
-            uint exStyle = (uint)ArgRaw(rec, 0);
+            // (2) WS_EX_DLGMODALFRAME — the classic OS modal-frame border. Very strong signal.
             if ((exStyle & WS_EX_DLGMODALFRAME) != 0) return true;
 
-            uint style = (uint)ArgRaw(rec, 3);
-            if ((style & WS_POPUP) != 0 && (style & WS_CHILD) == 0 && !string.IsNullOrEmpty(StringArg(rec, 2)))
+            // (3) WS_EX_TOOLWINDOW — thin title bar; custom message boxes, find/replace
+            //     dialogs, floating tool palettes, property sheets use this.
+            if ((exStyle & WS_EX_TOOLWINDOW) != 0) return true;
+
+            // (4) WS_EX_CONTROLPARENT — dialog keyboard navigation (TAB, arrow keys
+            //     move between child controls). Standard dialogs always have this;
+            //     hand-rolled ones often do too.
+            if ((exStyle & WS_EX_CONTROLPARENT) != 0) return true;
+
+            // (5) Top-level popup + title + system menu (close button). A plain popup
+            //     with no title is a tooltip or popup menu, not a dialog. Even without
+            //     a recognized class, this is a working default for the "owned popup" form.
+            if ((style & WS_POPUP) != 0)
+            {
+                if (hasTitle && hasSysMenu) return true;
+                // A titled popup without a system menu, but with a non-empty caption,
+                // is still a dialog (rare, but some custom message boxes omit the
+                // system menu and manage closing with their own button — e.g. a
+                // skinned / custom-drawn dialog that paints everything itself).
+                if (hasTitle && !string.IsNullOrEmpty(title)) return true;
+            }
+
+            // (6) Overlapped (neither popup nor child): the "custom overlapped window
+            //     as modal dialog" pattern. An app calls RegisterClassEx, creates an
+            //     WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU window with no thick frame
+            //     and no min+max boxes, enters a GetMessage/DispatchMessage loop, and
+            //     destroys on close. A normal app main window has WS_THICKFRAME + both
+            //     min AND max — the absence of those is the signal here.
+            if (hasTitle && hasSysMenu)
+            {
+                bool hasThick = (style & WS_THICKFRAME) != 0;
+                bool hasMin = (style & WS_MINIMIZEBOX) != 0;
+                bool hasMax = (style & WS_MAXIMIZEBOX) != 0;
+
+                // No thick frame AND lacks both min+max (may have one, not both) →
+                // a dialog frame, not an app main window.
+                if (!hasThick && !(hasMin && hasMax)) return true;
+
+                // Even with a thick frame, a custom atom class for a top-level titled
+                // window strongly suggests an app-created dialog box — particularly
+                // when min/max are absent or the class isn't a known system class.
+                if (isCustomAtom && classArg != AtomDialogClass && !(hasMin && hasMax))
+                    return true;
+            }
+
+            // (7) Custom-registered atom class (MAKEINTATOM result, a small ordinal in
+            //     the atom table — not a known system class string). If it's top-level,
+            //     titled, and has a system menu, it's almost certainly an app dialog.
+            //     System control classes ("Button", "Edit", "Static", "ComboBox", etc.)
+            //     are never passed as atoms to CreateWindowEx for a top-level window.
+            if (isCustomAtom && classArg != AtomDialogClass && hasTitle && hasSysMenu)
                 return true;
 
             return false;

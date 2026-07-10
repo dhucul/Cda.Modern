@@ -23,9 +23,12 @@ namespace Cda.App.UI
             public string Caption { get; init; } = "";
             public string Caller { get; init; } = "";
             public string Module { get; init; } = "";
+            public string Branch { get; init; } = "";
 
             /// <summary>Entry address of the app function that raised the dialog (0 if unknown).</summary>
             public ulong Address { get; init; }
+            /// <summary>Address of the conditional branch that gates the dialog call (0 if not resolved).</summary>
+            public ulong BranchAddress { get; init; }
             /// <summary>The dialog call itself, so a click can re-show its exact call stack.</summary>
             public CallRecord? Record { get; init; }
         }

@@ -18,7 +18,8 @@
             <DataGrid.Columns>
                 <DataGridTextColumn Header="Time" Binding="{Binding Time}" Width="Auto" MinWidth="72" ElementStyle="{StaticResource GridCellText}" />
                 <DataGridTextColumn Header="Dialog API" Binding="{Binding Api}" Width="Auto" MinWidth="150" ElementStyle="{StaticResource GridCellText}" />
-                <DataGridTextColumn Header="Caption / text" Binding="{Binding Caption}" Width="360" MinWidth="140" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Caption / text" Binding="{Binding Caption}" Width="280" MinWidth="140" ElementStyle="{StaticResource GridCellText}" />
+                <DataGridTextColumn Header="Branch" Binding="{Binding Branch}" Width="Auto" MinWidth="120" ElementStyle="{StaticResource GridCellText}" />
                 <DataGridTextColumn Header="Created by (caller)" Binding="{Binding Caller}" Width="Auto" MinWidth="180" ElementStyle="{StaticResource GridCellText}" />
                 <DataGridTextColumn Header="Module" Binding="{Binding Module}" Width="Auto" ElementStyle="{StaticResource GridCellText}" />
             </DataGrid.Columns>
