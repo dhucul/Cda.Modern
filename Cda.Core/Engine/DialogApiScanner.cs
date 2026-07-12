@@ -78,6 +78,14 @@ namespace Cda.Core.Engine
             "PrintDlg", "PrintDlgEx", "PageSetupDlg", "FindText", "ReplaceText",
             // credui — the interactive credential prompts (not the CmdLine forms).
             "CredUIPromptForCredentials", "CredUIPromptForWindowsCredentials",
+            // user32 — runtime CONTROL TEXT. NOT dialog openers: these reveal the strings a
+            // custom dialog writes into its child controls AFTER it is created (a message on
+            // a static/label, an edit's initial value, a caption set at runtime), which no
+            // opener argument carries. SetDlgItemText targets a control by dialog handle +
+            // id; SetWindowText sets any window/control's text. MainWindow reports the
+            // decoded text and its caller (deduped, runaway-droppable) rather than a
+            // "dialog raised" row — see MainWindow.HandleControlText.
+            "SetWindowText", "SetDlgItemText",
             // Special-cased by the caller — these are NOT plain openers and are hotter
             // than the rest, so MainWindow treats them specially rather than reporting a
             // row per call. CoCreateInstance is the choke point for the modern IFileDialog

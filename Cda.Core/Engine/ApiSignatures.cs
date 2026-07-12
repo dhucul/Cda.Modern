@@ -111,6 +111,7 @@ namespace Cda.Core.Engine
             ["TaskDialogIndirect"] = new[] { P("pTaskConfig", ApiParamKind.Pointer), P("pnButton", ApiParamKind.Pointer), P("pnRadioButton", ApiParamKind.Pointer), P("pfVerificationFlagChecked", ApiParamKind.Pointer) },
             ["GetWindowText"] = new[] { P("hWnd", ApiParamKind.Handle), P("lpString", ApiParamKind.Pointer), P("nMaxCount", ApiParamKind.Int) },
             ["SetWindowText"] = new[] { P("hWnd", ApiParamKind.Handle), P("lpString", ApiParamKind.String) },
+            ["SetDlgItemText"] = new[] { P("hDlg", ApiParamKind.Handle), P("nIDDlgItem", ApiParamKind.Int), P("lpString", ApiParamKind.String) },
             ["SendMessage"] = new[] { P("hWnd", ApiParamKind.Handle), P("Msg", ApiParamKind.Hex), P("wParam", ApiParamKind.Hex), P("lParam", ApiParamKind.Hex) },
             ["PostMessage"] = new[] { P("hWnd", ApiParamKind.Handle), P("Msg", ApiParamKind.Hex), P("wParam", ApiParamKind.Hex), P("lParam", ApiParamKind.Hex) },
             ["FindWindow"] = new[] { P("lpClassName", ApiParamKind.String), P("lpWindowName", ApiParamKind.String) },

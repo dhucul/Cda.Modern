@@ -107,7 +107,10 @@ namespace Cda.App.UI
                 new Item("Launch & detect dialogs…",
                     "Launch and hook only the OS dialog-box functions, so a dialog raised during startup (a splash, " +
                     "nag, or error box) is caught and attributed to the app function that raised it. Results appear " +
-                    "in the Dialogs tab."),
+                    "in the Dialogs tab, each with its caption — a MessageBox's text and, for a custom app dialog " +
+                    "built from a resource template (DialogBoxParam / CreateDialogParam / MFC), the title read from " +
+                    "the dialog template itself — plus the text the app writes into the dialog's controls at runtime " +
+                    "(SetWindowText / SetDlgItemText), so a message shown on a label or edit is revealed too."),
                 new Item("Capture DLL…",
                     "Launch a host and instrument a chosen DLL the instant it loads — capturing its DllMain and " +
                     "startup. Pick the DLL, then optionally a host EXE (Cancel = use rundll32)."),
@@ -144,7 +147,10 @@ namespace Cda.App.UI
                 new Item("Detect dialog caller",
                     "Hook only the OS dialog-box functions (MessageBox, DialogBoxParam, TaskDialog, …). When the " +
                     "target pops a dialog, the Dialogs tab shows its caption and — the point — the app function that " +
-                    "raised it, lit up in the list, graph, and call stack."),
+                    "raised it, lit up in the list, graph, and call stack. The caption is a MessageBox's text, or for " +
+                    "a resource/template-defined custom dialog the title parsed from its dialog template; the text the " +
+                    "app writes into the dialog's controls at runtime (SetWindowText / SetDlgItemText) is captured " +
+                    "too, so the message on a static/label/edit is revealed, each with the function that set it."),
                 new Item("Capture imports (IAT)",
                     "Like Capture Windows API, but reroutes calls by overwriting import-address-table SLOTS (data) " +
                     "instead of patching code — so it captures anti-tamper targets that checksum their own .text."),

@@ -208,6 +208,13 @@ namespace Cda.App
         private readonly HashSet<ulong> _createWindowAddrs = new();
         private readonly HashSet<Guid> _comShowResolved = new();
         private readonly HashSet<ulong> _dialogDroppable = new();
+        // _dialogTextAddrs are the hooked runtime control-text setters (SetWindowText /
+        // SetDlgItemText). They don't create a dialog — they reveal the text a custom
+        // dialog writes into its child controls after creation; the row shows the decoded
+        // string and its caller. _lastControlText dedups a control re-set to the same text
+        // (keyed by the target window/control) so a label refreshed on a timer can't flood.
+        private readonly HashSet<ulong> _dialogTextAddrs = new();
+        private readonly Dictionary<ulong, string> _lastControlText = new();
         // The two modern file-dialog coclasses whose CoCreateInstance we watch for.
         private static readonly Guid ClsidFileOpenDialog = new Guid("DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7");
         private static readonly Guid ClsidFileSaveDialog = new Guid("C0B4E2F3-BA21-4773-8DBA-335EC946EB8B");
@@ -3683,7 +3690,8 @@ namespace Cda.App
         // the caller is in view while the (modal) dialog is still on screen.
         private void CheckDialogCalls(List<CallRecord> recs, List<List<(ulong Addr, string Name)>>? chains)
         {
-            if ((_dialogApiAddrs.Count == 0 && _comProbeAddrs.Count == 0) || recs.Count == 0) return;
+            if ((_dialogApiAddrs.Count == 0 && _comProbeAddrs.Count == 0 && _dialogTextAddrs.Count == 0) ||
+                recs.Count == 0) return;
 
             bool focusedOne = false;
             for (int i = 0; i < recs.Count; i++)
@@ -3696,6 +3704,15 @@ namespace Cda.App
                 if (_comProbeAddrs.Contains(rec.Destination))
                 {
                     HandleComCreate(rec, chains, i, ref focusedOne);
+                    continue;
+                }
+
+                // A hooked runtime control-text setter (SetWindowText / SetDlgItemText):
+                // reveal the string the app wrote into a dialog control, not a "dialog
+                // raised" row.
+                if (_dialogTextAddrs.Contains(rec.Destination))
+                {
+                    HandleControlText(rec, chains, i, ref focusedOne);
                     continue;
                 }
                 if (!_dialogApiAddrs.Contains(rec.Destination)) continue;
@@ -3726,7 +3743,7 @@ namespace Cda.App
 
                 var chain = ChainAt(chains, i, rec);
                 string api = ResolveCalleeName(rec.Destination) ?? DescribeAddr(rec.Destination);
-                EmitDialogRow(rec, chain, api, DialogCaption(rec, api), ref focusedOne);
+                EmitDialogRow(rec, chain, api, ResolveDialogCaption(rec, api), ref focusedOne);
             }
         }
 
@@ -3749,6 +3766,17 @@ namespace Cda.App
         {
             ulong callerAddr = chain.Count > 0 ? chain[0].Addr : 0;
             string callerName = chain.Count > 0 ? chain[0].Name : "(unknown — no local frame captured)";
+
+            // Stack walk found no app frame, but the immediate caller (the return address)
+            // is app code — fall back to it, so a call whose deeper chain couldn't be
+            // recovered still names who made it (rather than "unknown").
+            if (callerAddr == 0 && rec.Source != 0 && IsAppCode(rec.Source))
+            {
+                ToFunction(rec.Source, out ulong fn, out string nm);
+                callerAddr = fn;
+                callerName = nm;
+            }
+
             string callerModule = callerAddr != 0 ? (_moduleMap?.Resolve(callerAddr)?.Name ?? "") : "";
             string callerDesc = callerAddr != 0 ? DescribeAddr(callerAddr) : "unknown";
 
@@ -3873,6 +3901,53 @@ namespace Cda.App
             EmitDialogRow(rec, ChainAt(chains, i, rec), kind + " (shown)", "", ref focusedOne);
         }
 
+        // A hooked runtime control-text setter fired (SetWindowText / SetDlgItemText). These
+        // carry the strings a custom dialog writes into its child controls AFTER it is
+        // created — a message on a static, an edit's initial value, a caption set at runtime
+        // — which no dialog-opener argument reveals. Emit a Dialogs-tab row with the decoded
+        // text and the function that set it. These are app-facing exports the OS itself
+        // doesn't call internally (it uses lower-level primitives / WM_SETTEXT), so a call
+        // to one is always an app or framework set — no caller-origin gate is applied, or a
+        // real set would be dropped whenever its app frame can't be recovered from the stack
+        // (a deeply wrapped / managed caller). Deduped per control so a label the app re-sets
+        // to the same value can't flood the tab; the caller chain (floored past runtime/MFC
+        // wrapper frames) still names who set it where it can be resolved.
+        private void HandleControlText(CallRecord rec, List<List<(ulong Addr, string Name)>>? chains,
+            int i, ref bool focusedOne)
+        {
+            string api = ResolveCalleeName(rec.Destination) ?? DescribeAddr(rec.Destination);
+            string baseName = DialogBaseName(api);
+
+            // SetWindowText(hWnd, lpString): text = arg1, keyed by the target window.
+            // SetDlgItemText(hDlg, nIDDlgItem, lpString): text = arg2, keyed by dialog+id.
+            string? text;
+            ulong key;
+            string idTag = "";
+            if (baseName == "SetDlgItemText")
+            {
+                text = StringArg(rec, 2);
+                ulong hDlg = ArgRaw(rec, 0);
+                ulong id = ArgRaw(rec, 1);
+                key = hDlg ^ (id << 32);
+                idTag = $"[#{id}] ";
+            }
+            else // SetWindowText
+            {
+                text = StringArg(rec, 1);
+                key = ArgRaw(rec, 0);
+            }
+
+            // Emit the row even when the string can't be decoded — the value here is the
+            // BRANCH (which conditional gated this set) and the caller, exactly as a
+            // CreateWindowEx row shows with an empty caption. Dedup a control re-set to the
+            // SAME value (empty included) so a timer-refreshed label can't flood the tab.
+            string display = text ?? "";
+            if (_lastControlText.TryGetValue(key, out var prev) && prev == display) return;
+            _lastControlText[key] = display;
+
+            EmitDialogRow(rec, ChainAt(chains, i, rec), api, (idTag + display).TrimEnd(), ref focusedOne);
+        }
+
         // Reset all dialog-report state (address sets + resolved-Show memory) for a new
         // capture. Paired with RegisterDialogFunctions, which repopulates it.
         private void ClearDialogState()
@@ -3882,6 +3957,9 @@ namespace Cda.App
             _createWindowAddrs.Clear();
             _comShowResolved.Clear();
             _dialogDroppable.Clear();
+            _dialogModulePe.Clear();
+            _dialogTextAddrs.Clear();
+            _lastControlText.Clear();
         }
 
         // Route a freshly hooked set of dialog functions into the reporting sets: the
@@ -3895,6 +3973,13 @@ namespace Cda.App
                 string baseName = DialogBaseName(f.Name);
                 if (baseName == "CoCreateInstance" || baseName == "CoCreateInstanceEx")
                     _comProbeAddrs.Add(f.Address);
+                else if (baseName == "SetWindowText" || baseName == "SetDlgItemText")
+                {
+                    // Runtime control-text setters: reveal the string, not a "dialog raised"
+                    // row. Hot (called per control), so droppable if the app floods them.
+                    _dialogTextAddrs.Add(f.Address);
+                    _dialogDroppable.Add(f.Address);
+                }
                 else
                 {
                     _dialogApiAddrs.Add(f.Address);
@@ -4090,45 +4175,25 @@ namespace Cda.App
             return false;
         }
 
-        // Best-effort caption/text for a dialog call, from the same decoded string
-        // arguments the Calls log shows. MessageBox-family: caption (arg2), else text
-        // (arg1). TaskDialog: window title (arg2), then instruction/content. Template
-        // dialogs (DialogBoxParam/CreateDialogParam): the template name if named, else
-        // its resource ordinal. CredUI prompt: the target name (arg1). The comdlg32
-        // common dialogs, PropertySheet, and the *Indirect / TaskDialogIndirect forms
-        // pass their strings behind a single struct pointer, so there's nothing to
-        // decode directly — left blank (the row still names the API and its caller).
-        private static string DialogCaption(CallRecord rec, string api)
+        // The argument positions that hold user-visible text for a dialog API, in the
+        // order they should read in the cell. MessageBox-family: caption (arg2) then text
+        // (arg1) — BOTH are shown, so the message body isn't hidden behind the title.
+        // TaskDialog: window title (arg2) then instruction/content (arg3). Template dialogs
+        // (DialogBoxParam/CreateDialogParam): the template name if named (arg1) — the real
+        // caption comes from the template itself, handled in ResolveDialogCaption. CredUI
+        // prompt: the target name (arg1). CreateWindowEx: lpWindowName (arg2). The comdlg32
+        // common dialogs, PropertySheet, and the *Indirect / TaskDialogIndirect forms pass
+        // their strings behind a single struct pointer, so there's nothing to decode from
+        // arguments (the row still names the API and its caller).
+        private static int[] DialogStringArgOrder(string baseName) => baseName switch
         {
-            string baseName = api;
-            int bang = baseName.IndexOf('!');
-            if (bang >= 0) baseName = baseName.Substring(bang + 1);
-            baseName = StripAwSuffix(baseName);
-
-            int[] argOrder = baseName switch
-            {
-                "MessageBox" or "MessageBoxEx" or "MessageBoxTimeout" => new[] { 2, 1 }, // caption, then text
-                "TaskDialog" => new[] { 2, 3 },                                          // title, then instruction
-                "DialogBoxParam" or "CreateDialogParam" => new[] { 1 },                  // template name (if named)
-                "CredUIPromptForCredentials" => new[] { 1 },                             // pszTargetName (resource prompted for)
-                "CreateWindowEx" => new[] { 2 },                                          // lpWindowName (the window title)
-                _ => Array.Empty<int>(),                                                  // comdlg32 / PropertySheet / *Indirect / IFileDialog::Show
-            };
-            foreach (int idx in argOrder)
-            {
-                string? s = StringArg(rec, idx);
-                if (!string.IsNullOrEmpty(s)) return s!;
-            }
-
-            // A template passed by ordinal (MAKEINTRESOURCE) has no string — show the id.
-            if ((baseName == "DialogBoxParam" || baseName == "CreateDialogParam") &&
-                rec.IntegerArgs.Length > 1)
-            {
-                ulong tmpl = rec.IntegerArgs[1];
-                if (tmpl != 0 && tmpl <= 0xFFFF) return $"(template #{tmpl})";
-            }
-            return "";
-        }
+            "MessageBox" or "MessageBoxEx" or "MessageBoxTimeout" => new[] { 2, 1 }, // caption, then text
+            "TaskDialog" => new[] { 2, 3 },                                          // title, then instruction
+            "DialogBoxParam" or "CreateDialogParam" => new[] { 1 },                  // template name (if named)
+            "CredUIPromptForCredentials" => new[] { 1 },                             // pszTargetName
+            "CreateWindowEx" => new[] { 2 },                                          // lpWindowName (window title)
+            _ => Array.Empty<int>(),                                                  // comdlg32 / PropertySheet / *Indirect / IFileDialog::Show
+        };
 
         // The decoded string captured for argument argIndex, or null.
         private static string? StringArg(CallRecord rec, int argIndex)
@@ -4147,6 +4212,170 @@ namespace Cda.App
                 if (last == 'A' || last == 'W') return name.Substring(0, name.Length - 1);
             }
             return name;
+        }
+
+        // Per-module PE cache (keyed by base) for dialog-template resource lookups, so a
+        // resource-defined dialog raised repeatedly reads its module image only once.
+        // Cleared with the rest of the dialog state on a new capture.
+        private readonly Dictionary<ulong, PeImage?> _dialogModulePe = new();
+
+        // The "Caption / text" cell for a dialog row. Reveals EVERY string the dialog
+        // carries — not just the first — so a MessageBox shows its caption AND its body
+        // text (the message), a TaskDialog its title AND instruction, and a custom app
+        // dialog its template caption alongside any string args. This is the fix for
+        // "the message shown in the box isn't revealed": DialogStringArgOrder lists the
+        // arg positions that hold user-visible text for each API, and for a
+        // resource/template-defined dialog the caption lives in the TEMPLATE (not any
+        // argument) so it is read from there first and leads the cell.
+        private string ResolveDialogCaption(CallRecord rec, string api)
+        {
+            string baseName = DialogBaseName(api);
+            var parts = new List<string>();
+            void Add(string? s)
+            {
+                if (string.IsNullOrEmpty(s)) return;
+                if (!parts.Contains(s!)) parts.Add(s!);
+            }
+
+            // A resource/template-defined custom dialog carries its caption inside the
+            // template, not in a call argument — recover it first so it leads the cell.
+            bool isTemplate = baseName is "DialogBoxParam" or "CreateDialogParam"
+                                       or "DialogBoxIndirectParam" or "CreateDialogIndirectParam";
+            if (isTemplate) Add(TryReadDialogTemplateCaption(rec, baseName));
+
+            // Then every user-visible string argument, in the API's natural order — the
+            // caption AND the text/message, not merely the first non-empty one.
+            foreach (int idx in DialogStringArgOrder(baseName))
+                Add(StringArg(rec, idx));
+
+            if (parts.Count > 0) return string.Join("  —  ", parts);
+
+            // Nothing decoded: for a template dialog passed by ordinal, at least name it.
+            if (isTemplate && rec.IntegerArgs.Length > 1)
+            {
+                ulong tmpl = rec.IntegerArgs[1];
+                if (tmpl != 0 && tmpl <= 0xFFFF) return $"(template #{tmpl})";
+            }
+            return "";
+        }
+
+        // Recover a resource-defined dialog's caption from its DLGTEMPLATE(EX). The
+        // *IndirectParam forms pass a direct in-memory template pointer (arg1) — read and
+        // parse it. The *Param forms pass hInstance (arg0) + a template name/ordinal
+        // (arg1) — locate the RT_DIALOG resource in that module's image and parse that.
+        // Every read is host-side (a bad pointer just yields nothing), so this is safe.
+        private string? TryReadDialogTemplateCaption(CallRecord rec, string baseName)
+        {
+            try
+            {
+                ulong templateArg = ArgRaw(rec, 1);
+
+                if (baseName.Contains("Indirect"))
+                {
+                    if (templateArg < 0x10000) return null;
+                    byte[] buf = new byte[512]; // the caption sits early in the header
+                    int n = DialogRead(templateArg, buf);
+                    if (n <= 0) return null;
+                    return DialogTemplate.ReadCaption(buf.AsSpan(0, n));
+                }
+
+                ulong hInstance = ArgRaw(rec, 0);
+                var pe = GetDialogModulePe(hInstance);
+                if (pe == null) return null;
+
+                byte[]? template;
+                if (templateArg != 0 && templateArg <= 0xFFFF)
+                    template = pe.ReadResourceById(PeImage.RT_DIALOG, (uint)templateArg); // MAKEINTRESOURCE ordinal
+                else
+                {
+                    string? name = ReadWideStringFromTarget(templateArg);
+                    if (string.IsNullOrEmpty(name)) return null;
+                    template = pe.ReadResourceByName(PeImage.RT_DIALOG, name!);
+                }
+                if (template == null) return null;
+                return DialogTemplate.ReadCaption(template);
+            }
+            catch { return null; }
+        }
+
+        // The parsed PE for the module whose resources a DialogBoxParam/CreateDialogParam
+        // call names (its hInstance is the module's mapped base). Read once per module from
+        // the target and cached; null if it can't be read or isn't a PE.
+        private PeImage? GetDialogModulePe(ulong hInstance)
+        {
+            if (hInstance < 0x10000) return null;
+
+            ulong baseAddr = _moduleMap?.Resolve(hInstance)?.BaseAddress ?? hInstance;
+            if (_dialogModulePe.TryGetValue(baseAddr, out var cached)) return cached;
+
+            PeImage? pe = null;
+            try
+            {
+                ulong known = _moduleMap?.Resolve(baseAddr)?.Size ?? 0;
+                uint size = known > 0 && known <= uint.MaxValue ? (uint)known : ReadImageSizeFromTarget(baseAddr);
+                if (size > 0 && size <= 128u * 1024 * 1024)
+                {
+                    byte[]? image = ReadModuleImageFromTarget(baseAddr, (int)size);
+                    if (image != null) pe = PeImage.FromMappedImage(image, baseAddr);
+                }
+            }
+            catch { pe = null; }
+
+            _dialogModulePe[baseAddr] = pe;
+            return pe;
+        }
+
+        // Read a module's mapped image out of the target, chunked so an unreadable page
+        // leaves a zero gap rather than failing the whole read (mirrors the engine's
+        // scanners). Null if nothing could be read.
+        private byte[]? ReadModuleImageFromTarget(ulong baseAddr, int size)
+        {
+            byte[] image;
+            try { image = new byte[size]; }
+            catch { return null; }
+
+            const int chunk = 0x10000;
+            byte[] tmp = new byte[chunk];
+            bool any = false;
+            for (int off = 0; off < size; off += chunk)
+            {
+                int len = Math.Min(chunk, size - off);
+                byte[] into = len == chunk ? tmp : new byte[len];
+                int read = DialogRead(baseAddr + (ulong)off, into);
+                if (read > 0) { Array.Copy(into, 0, image, off, read); any = true; }
+            }
+            return any ? image : null;
+        }
+
+        // Read SizeOfImage from a mapped module's PE header in the target (fallback when the
+        // module isn't in the map). 0 on any problem.
+        private uint ReadImageSizeFromTarget(ulong baseAddr)
+        {
+            byte[] hdr = new byte[0x400];
+            if (DialogRead(baseAddr, hdr) < hdr.Length) return 0;
+            if (hdr[0] != (byte)'M' || hdr[1] != (byte)'Z') return 0;
+            int e = BitConverter.ToInt32(hdr, 0x3C);
+            if (e <= 0 || e + 24 + 60 > hdr.Length) return 0;
+            if (hdr[e] != (byte)'P' || hdr[e + 1] != (byte)'E') return 0;
+            return BitConverter.ToUInt32(hdr, e + 24 + 56); // OptionalHeader.SizeOfImage
+        }
+
+        // Read a NUL-terminated wide (UTF-16) string from the target — used for a dialog
+        // template passed by NAME rather than by ordinal. Null on a short/empty read.
+        private string? ReadWideStringFromTarget(ulong ptr, int maxChars = 260)
+        {
+            if (ptr < 0x10000) return null;
+            byte[] buf = new byte[maxChars * 2];
+            int n = DialogRead(ptr, buf);
+            if (n < 2) return null;
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i + 1 < n; i += 2)
+            {
+                char c = (char)(buf[i] | (buf[i + 1] << 8));
+                if (c == 0) break;
+                sb.Append(c);
+            }
+            return sb.Length > 0 ? sb.ToString() : null;
         }
 
         // Drop the whole caller graph + index (new capture / context switch).

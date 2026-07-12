@@ -321,6 +321,113 @@ namespace Cda.Core.Pe
             return result;
         }
 
+        /// <summary>Standard resource type ids (the low ids Windows reserves).</summary>
+        public const uint RT_DIALOG = 5;
+
+        /// <summary>
+        /// Return the raw bytes of a resource identified by <paramref name="type"/> and an
+        /// integer <paramref name="id"/> (e.g. RT_DIALOG=5 and a dialog's resource id), or
+        /// null if the image has no resource directory or no such resource. Walks the
+        /// three-level directory (type → name/id → language) and returns the first
+        /// language's data.
+        /// </summary>
+        public byte[]? ReadResourceById(uint type, uint id) => ReadResource(type, id, null);
+
+        /// <summary>
+        /// Return the raw bytes of a resource identified by <paramref name="type"/> and a
+        /// string <paramref name="name"/> (compared case-insensitively, as the loader
+        /// does), or null if absent.
+        /// </summary>
+        public byte[]? ReadResourceByName(uint type, string name) => ReadResource(type, 0, name);
+
+        private byte[]? ReadResource(uint type, uint id, string? name)
+        {
+            var (resRva, resSize) = _dirs[(int)DataDirectory.Resource];
+            if (resRva == 0 || resSize == 0) return null;
+            int baseOff = RvaToOffset(resRva);
+            if (baseOff < 0) return null;
+
+            // Level 1: type (an integer id, e.g. RT_DIALOG). Level 2: the requested
+            // name/id. Both must be sub-directories.
+            int typeDir = FindResourceDir(baseOff, baseOff, type, null);
+            if (typeDir < 0) return null;
+            int nameDir = FindResourceDir(baseOff, typeDir, id, name);
+            if (nameDir < 0) return null;
+
+            // Level 3: language — take the first entry, whose OffsetToData points at an
+            // IMAGE_RESOURCE_DATA_ENTRY (leaf; high bit clear).
+            int leaf = FirstResourceLeaf(baseOff, nameDir);
+            if (leaf < 0 || leaf + 8 > _data.Length) return null;
+
+            uint dataRva = U32(leaf);        // an RVA, even in a file image
+            uint size = U32(leaf + 4);
+            if (size == 0 || size > 16u * 1024 * 1024) return null;
+            int off = RvaToOffset(dataRva);
+            if (off < 0 || off + (long)size > _data.Length) return null;
+
+            var bytes = new byte[size];
+            Array.Copy(_data, off, bytes, 0, (int)size);
+            return bytes;
+        }
+
+        // Find a sub-directory entry in the resource directory at <dirOff> matching either
+        // an integer <id> (when <name> is null) or a string <name>. Entry offsets are
+        // relative to the resource-directory base <resBase>. Returns the matched
+        // sub-directory's offset, or -1.
+        private int FindResourceDir(int resBase, int dirOff, uint id, string? name)
+        {
+            if (dirOff + 16 > _data.Length) return -1;
+            int numNamed = U16(dirOff + 12);
+            int numId = U16(dirOff + 14);
+            int total = numNamed + numId;
+            int entries = dirOff + 16;
+            for (int i = 0; i < total; i++)
+            {
+                int e = entries + i * 8;
+                if (e + 8 > _data.Length) break;
+                uint nameField = U32(e);
+                uint offField = U32(e + 4);
+                bool isNamed = (nameField & 0x80000000) != 0;
+
+                bool match;
+                if (name != null)
+                    match = isNamed && ResourceNameEquals(resBase + (int)(nameField & 0x7FFFFFFF), name);
+                else
+                    match = !isNamed && nameField == id;
+                if (!match) continue;
+
+                if ((offField & 0x80000000) == 0) return -1; // expected a sub-directory here
+                return resBase + (int)(offField & 0x7FFFFFFF);
+            }
+            return -1;
+        }
+
+        // The first entry of a resource sub-directory as a leaf (data-entry) offset. Used
+        // for the language level, where any language's data serves for a caption.
+        private int FirstResourceLeaf(int resBase, int dirOff)
+        {
+            if (dirOff + 16 > _data.Length) return -1;
+            int total = U16(dirOff + 12) + U16(dirOff + 14);
+            if (total <= 0) return -1;
+            int e = dirOff + 16;
+            if (e + 8 > _data.Length) return -1;
+            uint offField = U32(e + 4);
+            if ((offField & 0x80000000) != 0) return -1; // still a sub-directory, not a leaf
+            return resBase + (int)(offField & 0x7FFFFFFF);
+        }
+
+        // Compare a resource-directory name entry (a WORD length-prefixed, non-terminated
+        // UTF-16 run at <off>, relative to the image) against <name>, case-insensitively.
+        private bool ResourceNameEquals(int off, string name)
+        {
+            if (off + 2 > _data.Length) return false;
+            int len = U16(off);
+            if (len == 0 || off + 2 + len * 2 > _data.Length) return false;
+            var chars = new char[len];
+            for (int i = 0; i < len; i++) chars[i] = (char)U16(off + 2 + i * 2);
+            return string.Equals(new string(chars), name, StringComparison.OrdinalIgnoreCase);
+        }
+
         /// <summary>Parse the import descriptors and their thunks (by name and ordinal).</summary>
         public List<PeImport> ReadImports()
         {

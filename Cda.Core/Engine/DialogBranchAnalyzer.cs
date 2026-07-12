@@ -157,7 +157,13 @@ namespace Cda.Core.Engine
                 {
                     sdecoder.Decode(out Instruction si);
                     if (si.Code == Code.INVALID) break;
-                    if (si.FlowControl == FlowControl.Call && si.NextIP == ra)
+                    // Match BOTH a direct `call rel32` (FlowControl.Call) and an INDIRECT
+                    // call — `call qword ptr [rip+x]` / `call [reg]` / `call reg`
+                    // (FlowControl.IndirectCall). Windows-API calls routed through the IAT
+                    // are the indirect form, so matching only direct calls here missed them
+                    // entirely and left the branch column blank for every IAT-called API.
+                    if ((si.FlowControl == FlowControl.Call || si.FlowControl == FlowControl.IndirectCall)
+                        && si.NextIP == ra)
                     {
                         callSite = si.IP;
                         callLen = si.Length;
@@ -173,8 +179,8 @@ namespace Cda.Core.Engine
                 callLen = 5;
             }
 
-            // --- read code backwards from callSite (up to 512 bytes) ---
-            const int maxScan = 512;
+            // --- read code backwards from callSite (up to maxScan bytes) ---
+            const int maxScan = 1024;
             int back = Math.Min(maxScan, (int)Math.Min(callSite, (ulong)int.MaxValue));
             if (back < 4) return null;
 
@@ -199,13 +205,18 @@ namespace Cda.Core.Engine
                 if (IsConditionalBranch(instr))
                     branches.Add((instr, (int)(callSite - instr.IP)));
 
-                // Stop at a function boundary (ret / int3) unless it's an
-                // unconditional jump whose target lands at the call site
-                // (the fall-through exit of a conditional chain).
-                if (IsFunctionBoundary(instr) && instr.IP < callSite - 1)
+                // A ret / int3 before the call ends a PRIOR block — or is misaligned
+                // garbage that happened to decode as one (this backward scan starts at a
+                // fixed offset, which routinely lands mid-instruction or inside the
+                // previous function). Either way the branch that gates THIS call must lie
+                // AFTER it, so discard what we've gathered and keep scanning toward the
+                // call rather than bailing out (which would drop the real branch and leave
+                // the column blank). An unconditional jmp is left intact — it can be the
+                // fall-through exit of a conditional chain that leads into the call.
+                if (IsFunctionBoundary(instr) && instr.IP < callSite - 1 &&
+                    instr.FlowControl != FlowControl.UnconditionalBranch)
                 {
-                    if (instr.FlowControl != FlowControl.UnconditionalBranch)
-                        break;
+                    branches.Clear();
                 }
             }
 

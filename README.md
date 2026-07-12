@@ -51,6 +51,20 @@ Working and validated on real targets. Implemented and confirmed:
   routed through CRT/runtime wrappers is traced back to the function in *your*
   program that triggered it: a per-call **Call stack** and a recursive **Called
   by** caller tree. On x64 this is sharpened by exact `.pdata` stack unwinding.
+- **Dialog detection (caller + caption)** — hook only the OS dialog-box surface
+  (`MessageBox`, `DialogBoxParam`/`CreateDialogParam`, `TaskDialog`, the `comdlg32`
+  common dialogs, the modern `IFileDialog` COM picker, and hand-rolled modal windows),
+  so every dialog the target raises is attributed to the app function that raised it —
+  on an attached process (**Detect dialog caller**) or from startup (**Launch & detect
+  dialogs…**). Each **Dialogs**-tab row carries the dialog's **caption**: a `MessageBox`'s
+  text comes from its string arguments, while a custom app dialog built from a resource
+  template (`DialogBoxParam`/`CreateDialogParam`, or an in-memory `*IndirectParam`/MFC
+  template) has its title parsed from the **dialog template** itself, since that caption
+  is never passed as a call argument. Beyond the caption, the **text the app writes into
+  the dialog's controls at runtime** — via `SetWindowText`/`SetDlgItemText` — is captured
+  too (deduped per control, attributed to the function that set it), so a message shown on
+  a static/label/edit is revealed even though it's set after the dialog is created and
+  isn't in any opener argument.
 - **Follow children** — launch a program under a debug loop and instrument every
   process it spawns, each from its own first instruction; switch between them in a
   target picker (with an optional skip of OS/system children).
@@ -212,6 +226,26 @@ loader-bound address — and record every call with arguments and decoded string
 Ultra-hot primitives (critical-section / heap / last-error) are skipped to avoid
 flooding. The broad trace keeps running as you click around, so selecting an API
 inspects its callers without collapsing the trace.
+
+**Detect dialogs (caller + caption).** Hook only the OS dialog-box surface —
+`MessageBox`, the resource-template dialogs (`DialogBoxParam` / `CreateDialogParam` and
+their in-memory `*IndirectParam` forms), `TaskDialog`, the `comdlg32` common dialogs,
+the modern `IFileDialog` COM picker, and hand-rolled modal windows — and attribute each
+dialog to the app function that raised it. Works on an attached process (**Detect dialog
+caller**) or on an EXE you launch, hooked before its entry point runs (**Launch & detect
+dialogs…**), with results in the **Dialogs** tab: time, API, caption, the conditional
+branch that gated the call, and the creating caller (click a row to jump to it). The
+**caption** is decoded however the dialog carries it: a `MessageBox`'s text/caption comes
+straight from its string arguments, while a custom app dialog's title is read from its
+**dialog template** — the `RT_DIALOG` resource in the owning module for a `*Param` call,
+or the in-memory template a `*IndirectParam` / MFC call points at — because that caption
+is never a call argument. (Windows' own dialogs whose resources are MUI-split into a
+`.mui` satellite fall back to the template id.) And because a custom dialog usually fills
+its controls *after* it's created, the tool also hooks `SetWindowText` / `SetDlgItemText`
+and reports the **text written into each control at runtime** (with the control id, the
+setting function, and the branch that gated it) — deduped so a label refreshed on a timer
+doesn't flood the tab, and runaway-droppable if an app spams them — so the message a
+custom dialog shows on a static/label/edit is revealed, not just its title.
 
 **Launch & capture API / imports / exports (from startup).** The same hooking, but
 started against an EXE you *launch* rather than one you attach to — because the calls
