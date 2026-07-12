@@ -3822,7 +3822,9 @@ namespace Cda.App
                         branchAddr = bi.Address;
                         string taken = bi.WouldSkip ? " (not taken)" : "";
                         string frame = bi.FrameIndex > 0 ? $" (+{bi.FrameIndex})" : "";
-                        branchText = $"{bi.Disassembly}{taken}{frame}";
+                        // Lead with the branch instruction's own address, so the exact
+                        // location of the gating jump is listed (not just its target).
+                        branchText = $"0x{bi.Address:X}: {bi.Disassembly}{taken}{frame}";
                     }
                 }
                 catch { /* best effort — branch info is non-critical */ }
