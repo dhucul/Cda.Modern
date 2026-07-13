@@ -13,7 +13,7 @@
     <!-- Product version. Kept in lockstep with the installer version in
          tools\installer\Cda.iss. The About/Help window and the crash-log header
          read this assembly version, so bump both together each release. -->
-    <Version>1.17.0</Version>
+    <Version>1.18.0</Version>
 
     <!-- The original tool was x86-only. The modern tool must analyze both
          32-bit and 64-bit targets, so we build for both. The analysis engine

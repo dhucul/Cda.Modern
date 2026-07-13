@@ -199,6 +199,17 @@ namespace Cda.App
         private readonly Dictionary<ulong, (string Text, ulong Addr)> _confirmedBranches = new();
         // Call sites we've already asked the loop to probe, so each is requested once.
         private readonly HashSet<ulong> _probeRequested = new();
+        // Intel PT for the ATTACH-mode "Detect dialog caller" (no debug loop): confirms the real
+        // gating branch of dialogs raised AFTER attach, straight from the trace. The DR fallback
+        // and fresh-read-at-call are launch-only (they need CDA's debug loop). Trace reads are
+        // large, so they run on a background task; _attachPtGate serializes the device IOCTLs.
+        private IntelPt? _attachPt;
+        private readonly object _attachPtGate = new();
+        // Attach-mode retry: a dialog raised in the window between the hooks going live and PT
+        // starting has its gate before the trace, so the first confirm misses. Allow a bounded
+        // number of retries on later occurrences of that call site (now fully covered by PT).
+        private readonly Dictionary<ulong, int> _attachConfirmTries = new();
+        private const int AttachConfirmMaxTries = 3;
         // The modern IFileDialog COM picker and hand-rolled windows need special handling
         // (see DialogApiScanner's remarks). _comProbeAddrs are the hooked CoCreateInstance
         // entries — they resolve the file-dialog ::Show slot rather than reporting a row.
@@ -1342,6 +1353,7 @@ namespace Cda.App
             // sees _capture != cap); closing the handle here would pull it out from
             // under an in-progress ReadProcessMemory.
             if (cap != null && !_polling) { try { cap.Dispose(); } catch { } }
+            DisposeAttachPt();
             UpdateClearCallsState();
         }
 
@@ -1351,6 +1363,14 @@ namespace Cda.App
         {
             var picker = new ProcessPickerWindow { Owner = this };
             if (picker.ShowDialog() != true || picker.SelectedPid < 0) return;
+
+            // Switching targets: stop any capture running on the OLD process first (as every
+            // other mode-switch does) — otherwise its hooks, poll timer and Intel PT trace leak
+            // and its dialog rows/confirmations get misattributed to the new target.
+            StopCaptureQuietly();
+            StopDllCapture();
+            StopApiLaunch();
+            StopChildFollow();
 
             int pid = picker.SelectedPid;
             string label = picker.SelectedEntry?.Name ?? pid.ToString();
@@ -2762,6 +2782,26 @@ namespace Cda.App
                 RegisterDialogFunctions(dlg.Functions);
                 Diag($"✓ Watching for dialogs · {_capture.HookedCount} dialog hook(s) armed — trigger a dialog " +
                      "in the target and the Dialogs tab will name the function that raised it.");
+
+                // Intel PT ground-truth branch confirmation (attach mode): PT is per-process, so
+                // no debug loop is needed. Dialogs raised AFTER this point have their gating
+                // branch confirmed from hardware; the DR fallback / fresh-read-at-call stay
+                // launch-only. Unavailable (AMD / no Ipt.sys) → the static branch guess stands.
+                try
+                {
+                    var pt = IntelPt.TryCreate(out string? ptReason);
+                    if (pt != null && pt.Start(session.Process.Pid))
+                    {
+                        _attachPt = pt;
+                        Diag("Intel PT active — gating branches of dialogs raised after attach are confirmed from hardware.");
+                    }
+                    else
+                    {
+                        pt?.Dispose();
+                        Diag($"Intel PT unavailable ({ptReason ?? "start failed"}) — the Branch column shows the static guess (attach mode has no hardware fallback).");
+                    }
+                }
+                catch (Exception ex) { Diag("Intel PT setup error: " + ex.Message + " — static branch guess only."); }
             }
         }
 
@@ -3105,6 +3145,58 @@ namespace Cda.App
             _confirmedBranches[c.CallSiteKey] = (c.Text, c.BranchAddress);
             DialogList.UpgradeBranch(c.CallSiteKey, c.Text, c.BranchAddress);
             Diag($"branch gate confirmed @ call-site 0x{c.CallSiteKey:X}: {c.Text}");
+        }
+
+        // Stop + dispose the attach-mode PT trace (idempotent). Null it first so no new confirm
+        // uses it, then dispose on a background task under the gate — so we never CloseHandle
+        // during an in-flight trace-read IOCTL and never block the UI thread on a slow read.
+        // Called from BOTH teardown paths (StopCapture and StopCaptureQuietly).
+        private void DisposeAttachPt()
+        {
+            var apt = _attachPt;
+            _attachPt = null;
+            if (apt != null) Task.Run(() => { lock (_attachPtGate) { try { apt.Dispose(); } catch { } } });
+        }
+
+        // (Attach-mode dialog capture) Confirm this call site's gating branch from Intel PT.
+        // The launch path does this on its debug-loop thread; attach mode has no loop, so we
+        // read the (large) process trace and reconstruct on a background task, serialized on
+        // _attachPtGate against disposal, then upgrade the row on the UI thread. Best-effort:
+        // a wrapped ring / unavailable PT simply leaves the static guess (no DR fallback here).
+        private async Task ConfirmDialogGateViaPtAsync(ulong callSiteKey, ulong dialogApiAddr,
+            DialogBranchConfirmer.Candidate[] candidates)
+        {
+            var pt = _attachPt;
+            if (pt == null || dialogApiAddr == 0 || candidates.Length == 0) return;
+            bool is64 = _is64;
+            DialogBranchConfirmer.Confirmation? conf = null;
+            try
+            {
+                conf = await Task.Run(() =>
+                {
+                    byte[]? trace;
+                    lock (_attachPtGate) { trace = pt.ReadTrace(); } // one device read at a time
+                    if (trace == null) return null;
+                    // ReadMemory is safe after dispose (returns 0 → reconstruction just fails).
+                    return PtDecoder.TryConfirm(trace, dialogApiAddr, callSiteKey, candidates, is64,
+                        (a, b) => pt.ReadMemory(a, b), null);
+                });
+            }
+            catch { /* best effort — branch confirmation is non-critical */ }
+
+            // The await resumes on the UI thread (dispatcher sync context), where _attachPt,
+            // _probeRequested, _confirmedBranches and _attachConfirmTries all live.
+            if (_attachPt != pt || !_dialogMode) return; // capture stopped/changed — drop
+            if (conf != null) { OnBranchConfirmed(conf); return; }
+
+            // Missed: gate predates PT (a dialog racing attach) or a transient read. Re-open the
+            // site for a retry on its next occurrence — now fully under PT — up to the cap.
+            int tries = _attachConfirmTries.TryGetValue(callSiteKey, out var t) ? t : 0;
+            if (tries + 1 < AttachConfirmMaxTries)
+            {
+                _attachConfirmTries[callSiteKey] = tries + 1;
+                _probeRequested.Remove(callSiteKey);
+            }
         }
 
         private void StopApiLaunch()
@@ -3863,7 +3955,10 @@ namespace Cda.App
                     callSiteKey = candidates.Count > 0 ? candidates[0].CallSite
                                 : bi?.Address ?? rec.Source;
 
-                    if (_apiLaunch != null && callSiteKey != 0)
+                    // Runtime gate confirmation. Launch mode uses the debug loop (Intel PT first,
+                    // DR fallback, fresh-read-at-call); attach mode uses Intel PT only (no debug
+                    // loop). Either way the branch column upgrades from the static guess.
+                    if ((_apiLaunch != null || _attachPt != null) && callSiteKey != 0)
                     {
                         // A prior dialog at this call site already confirmed the gate — show it now.
                         if (_confirmedBranches.TryGetValue(callSiteKey, out var already))
@@ -3873,9 +3968,9 @@ namespace Cda.App
                         }
                         else
                         {
-                            // Request the probe once per call site (not on every dialog it
-                            // raises) — the confirmer needs only one arm, and re-requesting a
-                            // site that never confirms would grow the loop's request queue.
+                            // Request the confirmation once per call site (not on every dialog it
+                            // raises) — one arm/read suffices, and re-requesting a site that never
+                            // confirms would grow the loop's queue (launch) or re-read PT (attach).
                             var probe = new List<DialogBranchConfirmer.Candidate>();
                             foreach (var c in candidates)
                                 if (c.Address != 0 && IsAppCode(c.Address)) // arm app code only (never a spliced OS entry)
@@ -3884,9 +3979,16 @@ namespace Cda.App
                             {
                                 // rec.Destination is the hooked dialog-API entry — the target of the
                                 // call, which Intel PT matches to locate the gating branches.
-                                _apiLaunch.RequestGateConfirm(callSiteKey, rec.Destination, probe);
-                                if (probe.Count > 4)
-                                    Diag($"branch probe @ 0x{callSiteKey:X}: {probe.Count} candidates — confirming the nearest 4.");
+                                if (_apiLaunch != null)
+                                {
+                                    _apiLaunch.RequestGateConfirm(callSiteKey, rec.Destination, probe);
+                                    if (probe.Count > 4)
+                                        Diag($"branch probe @ 0x{callSiteKey:X}: {probe.Count} candidates — confirming the nearest 4.");
+                                }
+                                else
+                                {
+                                    _ = ConfirmDialogGateViaPtAsync(callSiteKey, rec.Destination, probe.ToArray());
+                                }
                             }
                         }
                     }
@@ -4027,6 +4129,11 @@ namespace Cda.App
             _dialogModulePe.Clear();
             _dialogTextAddrs.Clear();
             _lastControlText.Clear();
+            // Branch-confirmation caches — reset so a re-detect doesn't apply a prior run's
+            // confirmations or suppress fresh probes (attach mode resets only via here).
+            _confirmedBranches.Clear();
+            _probeRequested.Clear();
+            _attachConfirmTries.Clear();
         }
 
         // Route a freshly hooked set of dialog functions into the reporting sets: the
@@ -5024,6 +5131,7 @@ namespace Cda.App
             StopChildFollow();
             StopHwbp();
             StopManagedRescan();
+            DisposeAttachPt(); // stop attach-mode Intel PT (no-op if not tracing)
             _captureFocus = 0;
             _apiCaptureMode = false;
             bool wasDialogMode = _dialogMode;
@@ -5661,6 +5769,7 @@ namespace Cda.App
             _childFollow?.Stop();
             _hwbp?.Stop();
             _hwbp?.WaitForExit(600); // let it clear debug registers + detach before we exit
+            DisposeAttachPt(); // stop attach-mode Intel PT tracing (no-op if inactive)
             if (_pollTimer != null) { _pollTimer.Stop(); _pollTimer = null; }
             if (!_polling) _capture?.Dispose(); // don't close the handle under an in-flight poll at shutdown
             _session?.Dispose();
