@@ -17,7 +17,7 @@ namespace Cda.Core.Engine
     /// Wow64Get/SetThreadContext, so the hardware-breakpoint mode refuses WOW64
     /// targets upstream.
     /// </summary>
-    internal sealed class ThreadContextX64 : IDisposable
+    internal sealed class ThreadContextX64 : IThreadContext
     {
         // x64 CONTEXT field offsets (bytes).
         private const int OFF_ContextFlags = 0x30;
@@ -127,6 +127,12 @@ namespace Cda.Core.Engine
         public ulong R9 => (ulong)Marshal.ReadInt64(_ctx, OFF_R9);
         public ulong Rsp => (ulong)Marshal.ReadInt64(_ctx, OFF_Rsp);
         public ulong Rip => (ulong)Marshal.ReadInt64(_ctx, OFF_Rip);
+
+        // IThreadContext (bitness-neutral view for the hardware branch probe).
+        public bool Is64 => true;
+        public ulong CountRegister => Rcx;
+        public ulong InstructionPointer => Rip;
+        public ulong StackPointer => Rsp;
 
         /// <summary>
         /// Arm DR0..DR(n-1) as 1-byte execute breakpoints at <paramref name="addrs"/>

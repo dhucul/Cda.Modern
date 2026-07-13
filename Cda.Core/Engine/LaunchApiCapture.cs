@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -121,6 +122,72 @@ namespace Cda.Core.Engine
         private readonly HashSet<ulong> _dialogHookedAddrs = new();
         private readonly List<ModuleInfo> _dialogModules = new();
 
+        // --- hardware branch confirmation (dialogs mode) -------------------------------
+        // Confirms which candidate branch a dialog's gate actually took, by arming the
+        // candidates in hardware debug registers and reading the real EFLAGS on each #DB.
+        // All of this runs on THIS loop thread; the UI enqueues requests via
+        // RequestBranchProbe and receives results via BranchConfirmed.
+        private const uint THREAD_ACCESS =
+            NativeMethods.THREAD_GET_CONTEXT | NativeMethods.THREAD_SET_CONTEXT |
+            NativeMethods.THREAD_SUSPEND_RESUME | NativeMethods.THREAD_QUERY_INFORMATION;
+
+        private readonly DialogBranchConfirmer _confirmer = new();
+        private readonly ConcurrentQueue<(ulong Key, ulong DialogApi, DialogBranchConfirmer.Candidate[] Candidates)> _probeRequests = new();
+        private readonly Queue<(ulong Key, DialogBranchConfirmer.Candidate[] Candidates)> _drPending = new(); // PT-missed, awaiting a DR probe (loop thread only)
+        private ulong[] _armedProbeAddrs = Array.Empty<ulong>(); // DR0..DR(n-1) contents (loop thread only)
+        private ulong _armedProbeMask;                           // DR6 bits we own
+        private ulong _armedCallSiteKey;                         // the call site currently probed
+        private bool _targetIsWow64;                             // set once at first attach
+        private IntelPt? _pt;                                    // Intel PT, if available (first-occurrence path)
+        // PtDecoder now does full instruction-level control-flow reconstruction, so a TNT bit
+        // is attributed to the exact branch that produced it (a non-executed candidate gets no
+        // direction and can't be confirmed). Enabled for first-occurrence confirmation.
+        private static readonly bool EnablePtFirstOccurrence = true;
+
+        // Intel PT "read at the call" path (when PT is active). A poll-time trace read can miss
+        // a flood-prone dialog (e.g. CreateWindowExW): by the time the UI drains the record and
+        // reads the trace, window creation has overwritten the pre-call branch history in the
+        // ring. So for a dialog PT couldn't confirm at poll time, we arm a hardware execute
+        // breakpoint on the API entry; when the app next calls it, the whole process is frozen
+        // at the entry with the buffer FRESH (the gate is the most-recent branch), and we read
+        // the trace right there. `_drApiWatch` says the armed DRs are API entries, not branches.
+        private sealed class ApiWatch
+        {
+            public ulong Key; public DialogBranchConfirmer.Candidate[] Cands = Array.Empty<DialogBranchConfirmer.Candidate>();
+            public ulong AppLo, AppHi; public int Hits; public int AppTries;
+            public readonly HashSet<ulong> Confirmed = new(); // reconstructed call sites already reported
+        }
+        private readonly Dictionary<ulong, ApiWatch> _apiWatch = new();  // API entry → pending fresh-read watch
+        private readonly HashSet<ulong> _apiWatchDone = new();           // watches confirmed/given-up, to disarm
+        private bool _drApiWatch;                                        // armed DRs are API entries (else branches)
+        private bool _apiWatchDirty;                                     // watch set changed → re-arm needed
+        // Give up on a watch after this many APP-ORIGINATED calls fail to yield the requested
+        // gate (system-internal calls don't count — they're cheap return-address skips), with a
+        // high total-hit backstop so a genuinely hot API entry can't trap the loop forever.
+        private const int MaxAppWatchTries = 8;
+        private const int MaxApiWatchHits = 2000;
+
+        /// <summary>Raised (on the loop thread) when a dialog's gating branch is confirmed
+        /// at runtime. The subscriber marshals it to the UI to upgrade the dialog row.</summary>
+        public event Action<DialogBranchConfirmer.Confirmation>? BranchConfirmed;
+
+        /// <summary>
+        /// (Dialogs mode, UI/poll thread) Ask the loop to confirm which of <paramref name="candidates"/>
+        /// the gate for <paramref name="callSiteKey"/> actually took. Non-blocking. The loop tries
+        /// <b>Intel PT first</b> (always-on branch history — confirms this very occurrence by
+        /// reading the trace and finding the branches before the call to
+        /// <paramref name="dialogApiAddr"/>); if PT is unavailable or the call wrapped out of the
+        /// ring, it falls back to arming DR0–DR3 (confirms on the caller's next run). Reports via
+        /// <see cref="BranchConfirmed"/>.
+        /// </summary>
+        public void RequestGateConfirm(ulong callSiteKey, ulong dialogApiAddr, IReadOnlyList<DialogBranchConfirmer.Candidate> candidates)
+        {
+            if (candidates == null || candidates.Count == 0) return;
+            var arr = new DialogBranchConfirmer.Candidate[candidates.Count];
+            for (int i = 0; i < candidates.Count; i++) arr[i] = candidates[i];
+            _probeRequests.Enqueue((callSiteKey, dialogApiAddr, arr));
+        }
+
         public LaunchApiCapture(string exePath, string commandLine, HookMode mode,
             int maxFunctions, int bufferRecords, bool disableAslr = false)
         {
@@ -172,6 +239,41 @@ namespace Cda.Core.Engine
                 Log?.Invoke($"launched {Path.GetFileName(_exePath)} under debugger (pid {_pid}{(_disableAslr ? ", ASLR disabled" : "")}); " +
                             "waiting for the loader to bind imports, then hooking before the entry point runs…");
 
+                // Dialog mode: begin Intel PT tracing from startup, so a dialog's gating branch
+                // can be confirmed on its FIRST occurrence (else the DR path confirms on the next).
+                // DISABLED: the current PtDecoder uses a scoped shortcut (the TNT bits right before
+                // the dialog-call TIP = the gating branches) that is only correct when nothing else
+                // branches between the gate and the call. On real/obfuscated targets that assumption
+                // breaks and PT mis-attributes a TNT bit to a non-executed candidate → a FALSE
+                // "[confirmed]". Until PtDecoder does full instruction-level control-flow
+                // reconstruction (call stack + return compression, attributing each TNT bit to the
+                // real branch address), we rely on the DR path, which only ever reports an executed
+                // branch. The PT device/decoder stay for that future work.
+                if (_mode == HookMode.Dialogs && EnablePtFirstOccurrence)
+                {
+                    try
+                    {
+                        var pt = IntelPt.TryCreate(out string? ptReason);
+                        if (pt != null && pt.Start(_pid))
+                        {
+                            _pt = pt;
+                            Log?.Invoke("Intel PT active — dialog gates are confirmed on their first occurrence.");
+                            if (PtDiagVerbose)
+                            {
+                                try { if (PtDiagPath != null) File.WriteAllText(PtDiagPath, $"=== PT session · pid {_pid} ===\r\n"); } catch { }
+                                _ptDiagStarted = true;
+                                Log?.Invoke("Intel PT diagnostics → " + (PtDiagPath ?? "(file unavailable)"));
+                            }
+                        }
+                        else
+                        {
+                            pt?.Dispose();
+                            Log?.Invoke($"Intel PT unavailable ({ptReason ?? "start failed"}) — gates confirmed on the caller's next run (hardware breakpoints).");
+                        }
+                    }
+                    catch (Exception ex) { Log?.Invoke("Intel PT setup error: " + ex.Message + " — using the hardware-breakpoint fallback."); }
+                }
+
                 while (true)
                 {
                     if (!NativeMethods.WaitForDebugEvent(evt, 200))
@@ -180,9 +282,11 @@ namespace Cda.Core.Engine
                         if (err == NativeMethods.ERROR_SEM_TIMEOUT)
                         {
                             if (_stop) { Detach(); break; }
+                            ServiceProbeRequests(); // the target is idle — a good moment to (dis)arm
                             continue;
                         }
                         Log?.Invoke($"WaitForDebugEvent error {err}");
+                        Detach();
                         break;
                     }
 
@@ -195,6 +299,14 @@ namespace Cda.Core.Engine
                     {
                         case NativeMethods.CREATE_PROCESS_DEBUG_EVENT:
                             CloseEventFile(Marshal.ReadIntPtr(evt, U)); // CREATE_PROCESS_DEBUG_INFO.hFile
+                            break;
+
+                        case NativeMethods.CREATE_THREAD_DEBUG_EVENT:
+                            // Arm a newly-created thread so a dialog raised on it is still
+                            // confirmed. CREATE_THREAD_DEBUG_INFO.hThread is the first union
+                            // field; the thread is frozen for this event (no suspend needed).
+                            if (_armedProbeAddrs.Length > 0)
+                                ArmProbeThread(Marshal.ReadIntPtr(evt, U), evtTid);
                             break;
 
                         case NativeMethods.LOAD_DLL_DEBUG_EVENT:
@@ -233,6 +345,17 @@ namespace Cda.Core.Engine
                         case NativeMethods.EXCEPTION_DEBUG_EVENT:
                         {
                             uint exCode = (uint)Marshal.ReadInt32(evt, U); // EXCEPTION_RECORD.ExceptionCode
+
+                            // A single-step #DB with one of OUR debug-register bits set is a
+                            // branch-probe hit — evaluate it and consume the event. Any other
+                            // single-step (or a non-ours DR6) falls through to the crash path.
+                            // A 32-bit (WOW64) thread's #DB surfaces as STATUS_WX86_SINGLE_STEP.
+                            if ((exCode == NativeMethods.EXCEPTION_SINGLE_STEP ||
+                                 exCode == NativeMethods.STATUS_WX86_SINGLE_STEP) && HandleProbeHit(evtTid))
+                            {
+                                cont = NativeMethods.DBG_CONTINUE;
+                                break;
+                            }
 
                             // The FIRST breakpoint is the loader's: the loader has just
                             // finished (imports bound, static DllMains run) and broken in
@@ -290,6 +413,7 @@ namespace Cda.Core.Engine
 
                         case NativeMethods.EXIT_PROCESS_DEBUG_EVENT:
                             NativeMethods.ContinueDebugEvent(evtPid, evtTid, NativeMethods.DBG_CONTINUE);
+                            try { _pt?.Dispose(); _pt = null; } catch { }
                             Log?.Invoke("target exited.");
                             TargetExited?.Invoke();
                             return;
@@ -297,12 +421,17 @@ namespace Cda.Core.Engine
 
                     NativeMethods.ContinueDebugEvent(evtPid, evtTid, cont);
 
+                    ServiceProbeRequests(); // pick up any UI-requested branch probe
                     if (_stop) { Detach(); break; }
                 }
             }
             catch (Exception ex)
             {
                 Log?.Invoke("API launch loop error: " + ex.Message);
+                // Clear any armed debug registers so the target doesn't fault on the next
+                // candidate execution after we're gone (they survive a lost debugger).
+                try { if (_armedProbeAddrs.Length > 0) DisarmProbeAllThreads(); } catch { }
+                try { _pt?.Dispose(); _pt = null; } catch { }
             }
             finally
             {
@@ -312,8 +441,326 @@ namespace Cda.Core.Engine
 
         private void Detach()
         {
+            // The debug registers we set are part of each thread's context and are NOT
+            // cleared by detaching — leave them armed and the next candidate hit raises an
+            // unhandled #DB in the target. Clear them on every thread first.
+            try { if (_armedProbeAddrs.Length > 0) DisarmProbeAllThreads(); } catch { /* best effort */ }
+            try { _pt?.Dispose(); _pt = null; } catch { /* best effort — stops PT tracing */ }
             try { NativeMethods.DebugActiveProcessStop((uint)_pid); } catch { /* best effort */ }
             Log?.Invoke("detached from target (left running).");
+        }
+
+        // --- hardware branch probe (arm / disarm / service / hit) ----------------------
+
+        // Service the UI's branch-probe queue. Called on the loop thread only. Intel PT and
+        // the DR fallback are DECOUPLED: PT is stateless (reads the trace on demand, no
+        // per-site limit) so every request is tried against PT immediately — a pending DR
+        // probe must NOT starve PT confirmations, whose trace data ages quickly. Only the
+        // PT-misses are gated by the DR "one call site (≤4 DRs) at a time" rule.
+        private void ServiceProbeRequests()
+        {
+            // 1. Intel PT first, for EVERY new request. Confirms this occurrence retroactively;
+            //    on a miss, watch the API entry to read the trace FRESH at its next call (PT
+            //    active) or queue a DR branch-probe (no PT — confirms on the caller's next run).
+            while (_probeRequests.TryDequeue(out var req))
+            {
+                if (_pt != null)
+                {
+                    if (!TryPtConfirm(req.Key, req.DialogApi, req.Candidates))
+                        RequestApiWatch(req.DialogApi, req.Key, req.Candidates);
+                    continue;
+                }
+                _drPending.Enqueue((req.Key, req.Candidates));
+            }
+
+            // 2a. PT active: (re)arm the API-entry watches for fresh reads (see ServiceApiWatch).
+            if (_pt != null) { ServiceApiWatch(); return; }
+
+            // 2b. DR fallback: free the current probe once its nearest gate has routed in (or
+            //    give-up) — NOT on any confirmation, or we'd disarm mid-pass on a farther branch.
+            if (_armedProbeAddrs.Length > 0)
+            {
+                if (!_confirmer.IsResolved(_armedCallSiteKey)) return;
+                DisarmProbeAllThreads();
+                _armedProbeAddrs = Array.Empty<ulong>();
+                _armedProbeMask = 0;
+            }
+
+            // 3. Arm the next PT-missed call site (confirms on the caller's next run).
+            while (_drPending.Count > 0)
+            {
+                var d = _drPending.Dequeue();
+                var arm = _confirmer.Register(d.Key, d.Candidates);
+                if (arm.Count == 0) continue; // already confirmed, or nothing armable
+                var addrs = new ulong[arm.Count];
+                for (int i = 0; i < arm.Count; i++) addrs[i] = arm[i];
+                _armedProbeAddrs = addrs;
+                _armedProbeMask = (1UL << addrs.Length) - 1;
+                _armedCallSiteKey = d.Key;
+                ArmProbeAllThreads();
+                break;
+            }
+        }
+
+        // Register a dialog API entry to watch for a FRESH trace read at its next call. Bounded
+        // to 4 (the hardware DR count); the app rarely raises dialogs through more than a couple
+        // of distinct APIs, and the poll-time read still covers the rest.
+        private void RequestApiWatch(ulong apiAddr, ulong key, DialogBranchConfirmer.Candidate[] cands)
+        {
+            if (apiAddr == 0 || _apiWatch.ContainsKey(apiAddr) || _apiWatch.Count >= 4 || cands.Length == 0) return;
+            ulong lo = ulong.MaxValue, hi = 0;
+            foreach (var c in cands) { if (c.Address < lo) lo = c.Address; if (c.Address > hi) hi = c.Address; }
+            _apiWatch[apiAddr] = new ApiWatch
+            {
+                Key = key, Cands = cands,
+                AppLo = lo > 0x10000000 ? lo - 0x10000000 : 0, AppHi = hi + 0x10000000,
+            };
+            _apiWatchDirty = true;
+            PtDiag($"watch armed on API 0x{apiAddr:X} (fresh read at next call); {_apiWatch.Count} watched");
+        }
+
+        // (Re)arm the set of watched API entries in the debug registers, dropping any that have
+        // confirmed or given up. Only touches the threads when the set actually changed.
+        private void ServiceApiWatch()
+        {
+            if (_apiWatchDone.Count > 0)
+            {
+                foreach (var a in _apiWatchDone) _apiWatch.Remove(a);
+                _apiWatchDone.Clear();
+                _apiWatchDirty = true;
+            }
+            if (!_apiWatchDirty) return;
+            _apiWatchDirty = false;
+
+            var addrs = new ulong[Math.Min(4, _apiWatch.Count)];
+            int i = 0; foreach (var a in _apiWatch.Keys) { if (i >= addrs.Length) break; addrs[i++] = a; }
+            _armedProbeAddrs = addrs;
+            _armedProbeMask = addrs.Length == 0 ? 0 : (1UL << addrs.Length) - 1;
+            _drApiWatch = true;
+            if (addrs.Length > 0) ArmProbeAllThreads(); else DisarmProbeAllThreads();
+        }
+
+        // An API-entry watch fired: the whole process is frozen at the dialog API's first
+        // instruction, so the trace ring holds the pre-call branch history intact. Read it
+        // fresh and reconstruct the gate. Only app-originated calls (return address in the
+        // candidates' module neighbourhood) are worth the read; system-internal calls are
+        // stepped over cheaply. Returns having marked confirmed/exhausted watches for disarm.
+        private void HandleApiWatchHit(IThreadContext ctx, ulong hit)
+        {
+            int psize = _targetIsWow64 ? 4 : 8;
+            var word = new byte[8];
+            for (int i = 0; i < _armedProbeAddrs.Length; i++)
+            {
+                if ((hit & (1UL << i)) == 0) continue;
+                ulong apiAddr = _armedProbeAddrs[i];
+                if (!_apiWatch.TryGetValue(apiAddr, out var w)) continue;
+
+                w.Hits++;
+                // Only an app-originated call is worth a (large) trace read + reconstruct: check
+                // the return address at [RSP]. A failed/short read leaves ret=0, which must NOT
+                // count as app code even when AppLo==0 (a 32-bit target's low module base).
+                ulong ret = 0;
+                bool readOk = _pt != null && _pt.ReadMemory(ctx.StackPointer, word) >= psize;
+                if (readOk) ret = psize == 8 ? BitConverter.ToUInt64(word, 0) : BitConverter.ToUInt32(word, 0);
+                bool appCall = readOk && ret != 0 && ret >= w.AppLo && ret <= w.AppHi;
+
+                if (appCall)
+                {
+                    w.AppTries++;
+                    byte[]? trace = null;
+                    try { trace = _pt?.ReadTrace(); } catch { }
+                    if (trace != null)
+                    {
+                        DialogBranchConfirmer.Confirmation? conf = null;
+                        // keyByCallSite: report the branch for the call site that actually fired,
+                        // not necessarily the one whose request armed this watch.
+                        try { conf = PtDecoder.TryConfirm(trace, apiAddr, w.Key, w.Cands, !_targetIsWow64, (a, b) => _pt!.ReadMemory(a, b), PtDiagSink, keyByCallSite: true); }
+                        catch (Exception ex) { PtDiag("fresh-read decode error: " + ex.Message); }
+                        if (conf != null && w.Confirmed.Add(conf.CallSiteKey))
+                        {
+                            PtDiag($"FRESH-READ confirmed (ret=0x{ret:X}): {conf.Text}");
+                            BranchConfirmed?.Invoke(conf);
+                            // Done once the site that requested the watch is confirmed; other
+                            // sites sharing this API entry are upgraded as a bonus meanwhile.
+                            if (conf.CallSiteKey == w.Key) _apiWatchDone.Add(apiAddr);
+                        }
+                    }
+                }
+                if (!_apiWatchDone.Contains(apiAddr) && (w.AppTries >= MaxAppWatchTries || w.Hits >= MaxApiWatchHits))
+                {
+                    PtDiag($"watch on API 0x{apiAddr:X} gave up (appTries={w.AppTries} hits={w.Hits})");
+                    _apiWatchDone.Add(apiAddr);
+                }
+            }
+        }
+
+        // PT diagnostics are OFF by default (the feature is validated). Set CDA_PT_DIAG=1 to
+        // turn on the verbose per-thread/per-reconstruction trace when diagnosing a new target;
+        // it then goes to BOTH the Diag pane AND a file next to the exe (the pane can scroll/
+        // truncate; the file is the reliable copy).
+        public static readonly bool PtDiagVerbose = Environment.GetEnvironmentVariable("CDA_PT_DIAG") == "1";
+        public static readonly string? PtDiagPath = PtDiagVerbose ? ComputePtDiagPath() : null;
+        private static string? ComputePtDiagPath()
+        {
+            foreach (var dir in new[] { AppContext.BaseDirectory,
+                        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Cda.Modern") })
+            {
+                try { Directory.CreateDirectory(dir); var p = Path.Combine(dir, "cda-pt-diag.log"); File.AppendAllText(p, ""); return p; }
+                catch { /* try next */ }
+            }
+            return null;
+        }
+        // Null when quiet, so it's cheap to pass as PtDecoder's optional diagnostic sink.
+        private Action<string>? PtDiagSink => PtDiagVerbose ? PtDiag : null;
+        private static bool _ptDiagStarted;
+        private void PtDiag(string m)
+        {
+            if (!PtDiagVerbose) return;
+            Log?.Invoke("[PT] " + m);
+            try
+            {
+                if (PtDiagPath == null) return;
+                if (!_ptDiagStarted) { try { if (new FileInfo(PtDiagPath).Length > 512 * 1024) File.WriteAllText(PtDiagPath, ""); } catch { } _ptDiagStarted = true; }
+                File.AppendAllText(PtDiagPath, m + Environment.NewLine);
+            }
+            catch { /* diagnostics must never throw */ }
+        }
+
+        // Read the Intel PT trace and decode the gate for this dialog call. Returns true (and
+        // raises BranchConfirmed) on success; false if PT can't confirm (unavailable, the call
+        // wrapped out of the ring, or a decode miss) so the caller uses the DR fallback.
+        private bool TryPtConfirm(ulong key, ulong dialogApiAddr, DialogBranchConfirmer.Candidate[] candidates)
+        {
+            if (_pt == null || dialogApiAddr == 0) { PtDiag($"skip: pt={( _pt != null)} api=0x{dialogApiAddr:X}"); return false; }
+            byte[]? trace;
+            try { trace = _pt.ReadTrace(); } catch (Exception ex) { PtDiag("ReadTrace threw: " + ex.Message); return false; }
+            if (trace == null) { PtDiag("ReadTrace returned null (no trace data)"); return false; }
+            DialogBranchConfirmer.Confirmation? conf;
+            try { conf = PtDecoder.TryConfirm(trace, dialogApiAddr, key, candidates, !_targetIsWow64, (addr, buf) => _pt!.ReadMemory(addr, buf), PtDiagSink); }
+            catch (Exception ex) { PtDiag("decode error: " + ex.Message); return false; }
+            if (conf == null) return false;
+            BranchConfirmed?.Invoke(conf);
+            return true;
+        }
+
+        // A single-step #DB fired on thread tid. If it's one of our branch-probe DRs,
+        // evaluate the branch's real direction from EFLAGS, report any confirmation, step
+        // over the breakpoint (resume flag) so it stays armed, and return true. If DR6 has
+        // none of our bits, return false so the crash path handles it.
+        private bool HandleProbeHit(uint tid)
+        {
+            if (_armedProbeAddrs.Length == 0) return false;
+            IntPtr h = NativeMethods.OpenThread(THREAD_ACCESS, false, tid);
+            if (h == IntPtr.Zero) return false;
+            try
+            {
+                using var ctx = ThreadContext.Capture(h, _targetIsWow64);
+                if (ctx == null) return false;
+
+                ulong hit = ctx.Dr6 & _armedProbeMask;
+                if (hit == 0) return false; // not one of ours
+
+                if (_drApiWatch)
+                {
+                    // Armed DRs are dialog API entries: read the trace fresh at the call.
+                    HandleApiWatchHit(ctx, hit);
+                }
+                else
+                {
+                    // Armed DRs are candidate branches: evaluate each from EFLAGS.
+                    for (int i = 0; i < _armedProbeAddrs.Length; i++)
+                    {
+                        if ((hit & (1UL << i)) == 0) continue;
+                        var conf = _confirmer.OnBreakpointHit(_armedCallSiteKey, i, ctx);
+                        if (conf != null) BranchConfirmed?.Invoke(conf);
+                    }
+                }
+
+                ctx.Dr6 = 0;                              // acknowledge
+                ctx.EFlags |= ThreadContext.ResumeFlag;   // step over the instruction once
+                ctx.Apply(h);
+                return true;
+            }
+            finally { NativeMethods.CloseHandle(h); }
+        }
+
+        // Arm the current probe addresses on every existing thread. The target is live here
+        // (between debug events), so each thread is briefly suspended for the context swap.
+        private void ArmProbeAllThreads()
+        {
+            ForEachThread(h =>
+            {
+                NativeMethods.SuspendThread(h);
+                try
+                {
+                    using var ctx = ThreadContext.Capture(h, _targetIsWow64);
+                    if (ctx == null) return false;
+                    ctx.SetBreakpoints(_armedProbeAddrs);
+                    return ctx.Apply(h);
+                }
+                finally { NativeMethods.ResumeThread(h); }
+            });
+        }
+
+        private void DisarmProbeAllThreads()
+        {
+            ForEachThread(h =>
+            {
+                NativeMethods.SuspendThread(h);
+                try
+                {
+                    using var ctx = ThreadContext.Capture(h, _targetIsWow64);
+                    if (ctx == null) return false;
+                    ctx.ClearBreakpoints();
+                    return ctx.Apply(h);
+                }
+                finally { NativeMethods.ResumeThread(h); }
+            });
+        }
+
+        // Arm a single thread from a CREATE_THREAD event (frozen — no suspend), by the
+        // system-owned handle when present, else by tid.
+        private void ArmProbeThread(IntPtr hThread, uint tid)
+        {
+            if (hThread != IntPtr.Zero && hThread != NativeMethods.INVALID_HANDLE_VALUE)
+            {
+                using var ctx = ThreadContext.Capture(hThread, _targetIsWow64);
+                if (ctx != null) { ctx.SetBreakpoints(_armedProbeAddrs); ctx.Apply(hThread); }
+                return;
+            }
+            IntPtr h = NativeMethods.OpenThread(THREAD_ACCESS, false, tid);
+            if (h == IntPtr.Zero) return;
+            try
+            {
+                using var ctx = ThreadContext.Capture(h, _targetIsWow64);
+                if (ctx != null) { ctx.SetBreakpoints(_armedProbeAddrs); ctx.Apply(h); }
+            }
+            finally { NativeMethods.CloseHandle(h); }
+        }
+
+        // Enumerate the target's threads and run an action on a handle to each.
+        private int ForEachThread(Func<IntPtr, bool> action)
+        {
+            IntPtr snap = NativeMethods.CreateToolhelp32Snapshot(NativeMethods.TH32CS_SNAPTHREAD, 0);
+            if (snap == NativeMethods.INVALID_HANDLE_VALUE) return 0;
+            int count = 0;
+            try
+            {
+                var te = new NativeMethods.THREADENTRY32 { dwSize = (uint)Marshal.SizeOf<NativeMethods.THREADENTRY32>() };
+                if (!NativeMethods.Thread32First(snap, ref te)) return 0;
+                do
+                {
+                    if (te.th32OwnerProcessID != (uint)_pid) continue;
+                    IntPtr h = NativeMethods.OpenThread(THREAD_ACCESS, false, te.th32ThreadID);
+                    if (h == IntPtr.Zero) continue;
+                    try { if (action(h)) count++; }
+                    catch { /* one bad thread shouldn't abort the sweep */ }
+                    finally { NativeMethods.CloseHandle(h); }
+                }
+                while (NativeMethods.Thread32Next(snap, ref te));
+            }
+            finally { NativeMethods.CloseHandle(snap); }
+            return count;
         }
 
         private static void CloseEventFile(IntPtr h)
@@ -349,6 +796,7 @@ namespace Cda.Core.Engine
             using (var probe = TargetProcess.Attach(_pid, forWrite: false))
             {
                 is64 = probe.Is64Bit;
+                _targetIsWow64 = !is64; // a 32-bit target needs the WOW64 context path (phase B)
                 var mods = new List<ModuleInfo>(probe.EnumerateModules());
                 if (ensureBase != 0 && ensureName != null &&
                     !mods.Exists(m => m.BaseAddress == ensureBase))

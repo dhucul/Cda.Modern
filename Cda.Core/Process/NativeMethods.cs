@@ -53,6 +53,48 @@ namespace Cda.Core.Process
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool CloseHandle(IntPtr handle);
 
+        // --- Intel PT (ipt.sys) device + inbox IPT service (see Engine/IntelPt) -----------
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern IntPtr CreateFileW(string name, uint access, uint share,
+            IntPtr securityAttributes, uint creationDisposition, uint flags, IntPtr template);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool DeviceIoControl(IntPtr device, uint ioControlCode,
+            byte[] inBuffer, uint inSize, byte[]? outBuffer, uint outSize, out uint bytesReturned, IntPtr overlapped);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern IntPtr OpenSCManagerW(string? machine, string? database, uint access);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern IntPtr OpenServiceW(IntPtr scManager, string serviceName, uint access);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool StartServiceW(IntPtr service, uint numArgs, IntPtr args);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool QueryServiceStatus(IntPtr service, out SERVICE_STATUS status);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool CloseServiceHandle(IntPtr handle);
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SERVICE_STATUS
+        {
+            public uint dwServiceType, dwCurrentState, dwControlsAccepted, dwWin32ExitCode,
+                dwServiceSpecificExitCode, dwCheckPoint, dwWaitHint;
+        }
+
+        public const uint GENERIC_READ = 0x80000000, GENERIC_WRITE = 0x40000000;
+        public const uint FILE_SHARE_READ = 1, FILE_SHARE_WRITE = 2, OPEN_EXISTING = 3;
+        public const uint SC_MANAGER_CONNECT = 0x0001;
+        public const uint SERVICE_START = 0x0010, SERVICE_QUERY_STATUS = 0x0004;
+        public const uint SERVICE_RUNNING = 0x4, SERVICE_START_PENDING = 0x2;
+        public const int ERROR_SERVICE_ALREADY_RUNNING = 1056;
+
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool ReadProcessMemory(
@@ -224,6 +266,17 @@ namespace Cda.Core.Process
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         public static extern bool SetThreadContext(IntPtr thread, IntPtr context);
+
+        // A 32-bit (WOW64) thread's real 32-bit register state (EIP/EFLAGS/DR0–DR7 in a
+        // WOW64_CONTEXT) must be read/written with these from the x64 host — plain
+        // Get/SetThreadContext on a WOW64 thread returns the x64 transition context.
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool Wow64GetThreadContext(IntPtr thread, IntPtr context);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool Wow64SetThreadContext(IntPtr thread, IntPtr context);
 
         // --- suspended launch (capture from the first instruction) -----------
 
@@ -475,6 +528,7 @@ namespace Cda.Core.Process
         public const uint EXCEPTION_BREAKPOINT = 0x80000003;
         public const uint STATUS_WX86_BREAKPOINT = 0x4000001F;
         public const uint EXCEPTION_SINGLE_STEP = 0x80000004; // also a hardware-bp #DB
+        public const uint STATUS_WX86_SINGLE_STEP = 0x4000001E; // WOW64 #DB (32-bit thread)
 
         public const int ERROR_SEM_TIMEOUT = 121;
     }

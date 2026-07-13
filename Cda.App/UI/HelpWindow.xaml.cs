@@ -110,7 +110,11 @@ namespace Cda.App.UI
                     "in the Dialogs tab, each with its caption — a MessageBox's text and, for a custom app dialog " +
                     "built from a resource template (DialogBoxParam / CreateDialogParam / MFC), the title read from " +
                     "the dialog template itself — plus the text the app writes into the dialog's controls at runtime " +
-                    "(SetWindowText / SetDlgItemText), so a message shown on a label or edit is revealed too."),
+                    "(SetWindowText / SetDlgItemText), so a message shown on a label or edit is revealed too. The " +
+                    "Dialogs tab also names the conditional jump that gated each dialog, and on this launched path " +
+                    "CONFIRMS it from the CPU's real flags using hardware breakpoints: trigger the same box a second " +
+                    "time (in the target) and the row upgrades in place to '[confirmed]' with the jump's true " +
+                    "taken/not-taken. x64 and 32-bit targets; nothing is patched (hardware breakpoints only)."),
                 new Item("Capture DLL…",
                     "Launch a host and instrument a chosen DLL the instant it loads — capturing its DllMain and " +
                     "startup. Pick the DLL, then optionally a host EXE (Cancel = use rundll32)."),
@@ -228,8 +232,11 @@ namespace Cda.App.UI
                 new Item("Call stack",
                     "The captured stack snapshot for the selected call."),
                 new Item("Dialogs",
-                    "One row per dialog the target raised, with its caption and the app function that created it " +
-                    "(from Detect dialog caller / Launch & detect dialogs…). Click a row to jump to that caller."),
+                    "One row per dialog the target raised, with its caption, the app function that created it, and " +
+                    "the conditional jump (Branch) that gated it. Launched (Launch & detect dialogs…), that branch is " +
+                    "hardware-confirmed on the dialog's NEXT appearance — the row upgrades in place to '[confirmed]' " +
+                    "with the jump's real taken/not-taken; attached (Detect dialog caller) it is a static best-guess. " +
+                    "Click a row to jump to that caller."),
                 new Item("Memory",
                     "A hex view of the selected function's or module's bytes."),
                 new Item("Disassembly",

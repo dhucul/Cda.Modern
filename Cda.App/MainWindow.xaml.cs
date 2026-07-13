@@ -194,6 +194,11 @@ namespace Cda.App
         // IFileDialog::Show).
         private bool _dialogMode;
         private readonly HashSet<ulong> _dialogApiAddrs = new();
+        // Hardware-confirmed gating branches, keyed by call site — so a later dialog raised
+        // from the same code path shows the confirmed gate immediately (UI thread only).
+        private readonly Dictionary<ulong, (string Text, ulong Addr)> _confirmedBranches = new();
+        // Call sites we've already asked the loop to probe, so each is requested once.
+        private readonly HashSet<ulong> _probeRequested = new();
         // The modern IFileDialog COM picker and hand-rolled windows need special handling
         // (see DialogApiScanner's remarks). _comProbeAddrs are the hooked CoCreateInstance
         // entries — they resolve the file-dialog ::Show slot rather than reporting a row.
@@ -350,7 +355,9 @@ namespace Cda.App
             string capture = CaptureStubSelfTest.Run();
             string returns = CaptureReturnSelfTest.Run();
             string veh = CaptureVehSelfTest.Run();
-            StatusText.Text = $"Self-test · hook: {hook} · capture: {capture} · returns: {returns} · veh: {veh}";
+            string branch = DialogBranchConfirmerSelfTest.Run();
+            string pt = PtDecoderSelfTest.Run();
+            StatusText.Text = $"Self-test · hook: {hook} · capture: {capture} · returns: {returns} · veh: {veh} · branch: {branch} · pt: {pt}";
         }
 
         private void LoadDemo()
@@ -2968,6 +2975,8 @@ namespace Cda.App
             _offlineTrace = false;
             _childView = false;
             ClearStringsTab(); // this mode traces the OS surface, not the image's strings
+            _confirmedBranches.Clear();
+            _probeRequested.Clear();
             Diag($"launch & capture {modeLabel}: {name}" + (disableAslr ? " (ASLR disabled)" : "") + " — waiting for the loader…");
 
             _apiLaunch = new LaunchApiCapture(launchPath, commandLine, mode,
@@ -2980,6 +2989,7 @@ namespace Cda.App
             }));
             _apiLaunch.Hooked += h => Dispatcher.BeginInvoke(new Action(() => OnApiLaunchHooked(h)));
             _apiLaunch.MoreDialogsHooked += funcs => Dispatcher.BeginInvoke(new Action(() => OnMoreDialogsHooked(funcs)));
+            _apiLaunch.BranchConfirmed += c => Dispatcher.BeginInvoke(new Action(() => OnBranchConfirmed(c)));
             _apiLaunch.Aborted += m => Dispatcher.BeginInvoke(new Action(() =>
             {
                 // Loader breakpoint reached but nothing was hooked: the loop is now a
@@ -3083,6 +3093,18 @@ namespace Cda.App
             Diag(added > 0
                 ? $"hooked {added} more dialog function(s) from a later-loaded module (e.g. comctl32)."
                 : $"later dialog module added no new hooks ({firstError ?? "already hooked"}).");
+        }
+
+        // (UI thread) A dialog's gating branch was confirmed at runtime from hardware — the
+        // debug loop observed which candidate the CPU actually took. Cache it (so a later
+        // dialog from the same call site shows it at once) and upgrade the existing row(s)
+        // from the static guess to the confirmed gate + real direction.
+        private void OnBranchConfirmed(DialogBranchConfirmer.Confirmation c)
+        {
+            if (!_dialogMode) return;
+            _confirmedBranches[c.CallSiteKey] = (c.Text, c.BranchAddress);
+            DialogList.UpgradeBranch(c.CallSiteKey, c.Text, c.BranchAddress);
+            Diag($"branch gate confirmed @ call-site 0x{c.CallSiteKey:X}: {c.Text}");
         }
 
         private void StopApiLaunch()
@@ -3793,6 +3815,7 @@ namespace Cda.App
             // is negligible.
             ulong branchAddr = 0;
             string branchText = "";
+            ulong callSiteKey = 0;
             if (rec.Source != 0)
             {
                 try
@@ -3820,11 +3843,52 @@ namespace Cda.App
                     if (bi != null)
                     {
                         branchAddr = bi.Address;
-                        string taken = bi.WouldSkip ? " (not taken)" : "";
+                        // A skip-over guard that fell through (the dialog fired) is
+                        // "(not taken)". A short-circuit entry gate is the branch that,
+                        // when taken, jumps INTO the dialog path — label it "→ dialog".
+                        string taken = bi.WouldSkip ? " (not taken)"
+                                     : bi.EntryGate ? " (→ dialog)" : "";
                         string frame = bi.FrameIndex > 0 ? $" (+{bi.FrameIndex})" : "";
                         // Lead with the branch instruction's own address, so the exact
                         // location of the gating jump is listed (not just its target).
                         branchText = $"0x{bi.Address:X}: {bi.Disassembly}{taken}{frame}";
+                    }
+
+                    // Hardware branch confirmation (launch dialog mode only): the static pick
+                    // above is a GUESS when several jumps route into the box. Collect the
+                    // nearest candidate branches and ask the debug loop to observe which one
+                    // the CPU actually takes — confirmed on the caller's next run.
+                    var candidates = DialogBranchAnalyzer.CollectCandidates(rec.Source, parentAddrs, _is64,
+                        (addr, buf) => DialogRead(addr, buf), maxCandidates: 6);
+                    callSiteKey = candidates.Count > 0 ? candidates[0].CallSite
+                                : bi?.Address ?? rec.Source;
+
+                    if (_apiLaunch != null && callSiteKey != 0)
+                    {
+                        // A prior dialog at this call site already confirmed the gate — show it now.
+                        if (_confirmedBranches.TryGetValue(callSiteKey, out var already))
+                        {
+                            branchText = already.Text;
+                            branchAddr = already.Addr;
+                        }
+                        else
+                        {
+                            // Request the probe once per call site (not on every dialog it
+                            // raises) — the confirmer needs only one arm, and re-requesting a
+                            // site that never confirms would grow the loop's request queue.
+                            var probe = new List<DialogBranchConfirmer.Candidate>();
+                            foreach (var c in candidates)
+                                if (c.Address != 0 && IsAppCode(c.Address)) // arm app code only (never a spliced OS entry)
+                                    probe.Add(new DialogBranchConfirmer.Candidate(c.Address, c.OpCode, c.Role, c.Disassembly));
+                            if (probe.Count > 0 && _probeRequested.Add(callSiteKey))
+                            {
+                                // rec.Destination is the hooked dialog-API entry — the target of the
+                                // call, which Intel PT matches to locate the gating branches.
+                                _apiLaunch.RequestGateConfirm(callSiteKey, rec.Destination, probe);
+                                if (probe.Count > 4)
+                                    Diag($"branch probe @ 0x{callSiteKey:X}: {probe.Count} candidates — confirming the nearest 4.");
+                            }
+                        }
                     }
                 }
                 catch { /* best effort — branch info is non-critical */ }
@@ -3836,6 +3900,7 @@ namespace Cda.App
                 Api = api,
                 Caption = caption,
                 Branch = branchText,
+                CallSiteKey = callSiteKey,
                 BranchAddress = branchAddr,
                 Caller = callerName,
                 Module = callerModule,

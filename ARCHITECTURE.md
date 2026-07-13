@@ -418,6 +418,75 @@ same arrangement the DLL-at-load capture uses. The hooked set is bounded
 last-error) are skipped, exactly as in the attach-time form, since both share
 `ApiImportScanner`.
 
+## Hardware-confirmed dialog gating branch
+
+The Dialogs tab names the conditional jump that gated a dialog call. `Engine/DialogBranchAnalyzer`
+picks it *statically* from code geometry, but that is a **guess** when several jumps route into the
+box path (e.g. an `je` entry-gate above a nearer `jbe`/`ja`): geometry cannot know which one the CPU
+actually took. `Engine/DialogBranchConfirmer` replaces the guess with **runtime ground truth**, on
+the launch dialog path (which owns a live debugger), with no kernel driver and no Intel PT.
+
+`DialogBranchAnalyzer.CollectCandidates` returns the nearest few conditional branches above the call
+(each tagged `SkipOver` / `EntryGate` / `IntoPath` — the same geometry the single-pick selector uses).
+`LaunchApiCapture` arms up to four of them in the CPU's **hardware execute breakpoints (DR0–DR3)** on
+every thread — reusing the `ThreadContextX64` DR machinery the hardware-breakpoint capture already
+proves. A DR execute breakpoint faults **before** the instruction runs, so the thread's EFLAGS at the
+fault are exactly the flags that `Jcc` will consume, and it fires **only** on instructions actually
+executed — so a branch skipped by an earlier taken jump is never even seen, and cannot be mis-scored.
+On each `#DB` the loop evaluates the branch's real taken/not-taken from EFLAGS
+(`DialogBranchConfirmer.Taken`, a complete per-mnemonic table incl. `jcxz`/`loop`), decides whether
+that direction **routes into the dialog** (a `SkipOver` routes in when *not* taken, an `EntryGate`/
+`IntoPath` when taken), and steps over the breakpoint with the resume flag so it stays armed. The
+decisive branch — nearest routing-in — is reported through `BranchConfirmed`; the UI upgrades the
+dialog row in place from the static guess to `… (→ dialog | not taken) [confirmed]`.
+
+The branch has already executed by the time the dialog hook fires, so confirmation lands the **next**
+time the caller runs (the first dialog shows the static guess, then upgrades). Correlation is by
+**call site** — the candidates are unique to one code path, so no thread id is needed. DRs are cleared
+on every thread before detach (they survive a lost debugger, else the target faults). Both x64 and
+**WOW64 (32-bit) targets** are supported: `ThreadContextWow64` (over `WOW64_CONTEXT` via
+`Wow64Get/SetThreadContext`, with the 32-bit `#DB` arriving as `STATUS_WX86_SINGLE_STEP`) sits behind
+the same `IThreadContext` seam, so the probe logic is bitness-neutral. Validated by
+`Engine/DialogBranchConfirmerSelfTest` (the condition table + the decision state machine, incl. the
+`je`-guess→`ja`-confirmed case) and cross-process launch runs against both an x64 and a 32-bit target.
+
+## Intel PT first-occurrence confirmation
+
+The DR path above confirms the gating branch on the caller's *next* run (a DR breakpoint
+can't see a branch that already executed). **Intel Processor Trace** is always-on branch
+recording, so the gate can be confirmed on the **first** occurrence, retroactively.
+`Engine/IntelPt` drives the Windows inbox PT driver (`ipt.sys`, device `\\.\Ipt`): it starts
+the inbox `Ipt` service (elevated) to expose the device, then per-process traces the launched
+target from startup (`IptStartProcessTrace`, user-mode, timing disabled). The IOCTL interface
+is undocumented (reverse-engineered by WinIPT, verified byte-for-byte): `IPT_INPUT_BUFFER`
+0x30 with `BufferMajorVersion@0=1`, `InputType@8`, union at `0x10`; the read returns
+`IPT_TRACE_DATA` + packed per-thread `IPT_TRACE_HEADER{ThreadId, RingBufferOffset, TraceSize}`
++ each thread's circular PT-packet buffer.
+
+`Engine/PtDecoder` turns a trace into a confirmation. It parses the per-thread framing,
+unwraps each circular buffer to chronological order, and decodes the PT packet stream (PSB
+sync, short/long **TNT** taken/not-taken bits, **TIP** with the last-IP compression). The
+insight that makes this tractable — no full multi-module reconstruction or IP-filtering — is
+that a dialog's argument setup has **no branches**, so the conditional branches executed
+immediately before the `call dialog-API` transfer *are* the gating branches: find the most
+recent **TIP whose target is the dialog API entry**, read the TNT bits right before it
+(nearest-to-the-call first), map them onto the static candidate list, and let
+`DialogBranchConfirmer.Resolve` pick the nearest routing-in gate — the same rule the DR path
+uses. The result is raised on the same `BranchConfirmed` event, so the UI upgrade is identical.
+
+`LaunchApiCapture` would try **PT first** and fall back to the DR path on a miss. **The PT
+confirmation is currently DISABLED** (`EnablePtFirstOccurrence = false`): the scoped shortcut
+above is only sound when *nothing else branches* between the gate and the call. On real /
+obfuscated targets other branches execute in that window, so the "N TNT bits before the call =
+the N candidates" mapping pins a bit to the wrong branch and can emit a **false** `[confirmed]`
+for a branch that never executed — strictly worse than the DR path, which only ever reports an
+*executed* branch. Making PT correct requires **full instruction-level control-flow
+reconstruction** (decode every instruction from a PSB with a call stack for return compression,
+attributing each TNT bit to its real branch address); until then confirmation is DR-only. The
+device/decoder (`IntelPt`, `PtDecoder`) and the proven interface remain for that work. Validated
+by `Engine/PtDecoderSelfTest` (synthetic buffer → `ja` not-taken) and a real-trace run — both of
+which use the clean single-gate shape where the shortcut holds.
+
 ## Child-process follow (instrument a tree)
 
 `Engine/ChildFollowCapture` launches an executable under a `DEBUG_PROCESS` debug loop

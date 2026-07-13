@@ -234,8 +234,16 @@ the modern `IFileDialog` COM picker, and hand-rolled modal windows — and attri
 dialog to the app function that raised it. Works on an attached process (**Detect dialog
 caller**) or on an EXE you launch, hooked before its entry point runs (**Launch & detect
 dialogs…**), with results in the **Dialogs** tab: time, API, caption, the conditional
-branch that gated the call, and the creating caller (click a row to jump to it). The
-**caption** is decoded however the dialog carries it: a `MessageBox`'s text/caption comes
+branch that gated the call, and the creating caller (click a row to jump to it). On the
+**launch** path (which runs under a debugger) that gated branch is more than a
+disassembly guess: CDA arms the candidate jumps in the CPU's hardware debug registers and
+reads the **real EFLAGS** the next time the caller runs, upgrading the row in place to the
+branch the CPU **actually** took — marked `[confirmed]` with its true direction
+(`(→ dialog)` / `(not taken)`). Because the jump already ran by the time the box appears,
+confirmation lands on the dialog's *next* appearance, so **re-trigger the box** (in the
+target) to see it resolve; a one-shot startup dialog keeps the guess. It works on x64 and
+32-bit (WOW64) targets and patches nothing — hardware breakpoints only, cleared on stop.
+The **caption** is decoded however the dialog carries it: a `MessageBox`'s text/caption comes
 straight from its string arguments, while a custom app dialog's title is read from its
 **dialog template** — the `RT_DIALOG` resource in the owning module for a `*Param` call,
 or the in-memory template a `*IndirectParam` / MFC call points at — because that caption
