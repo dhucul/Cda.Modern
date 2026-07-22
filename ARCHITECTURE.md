@@ -260,12 +260,21 @@ marks recursion.
 ## Polling off the UI thread
 
 The capture poll runs on a 100 ms WPF `DispatcherTimer`, but the heavy work does not
-run on the UI thread. Each tick hands the whole expensive part — draining + decoding
-the ring, host-side dereference enrichment, *and* each record's caller-chain
-extraction (stack unwinding + return-address probes) — to a worker via `Task.Run`,
-and a `_polling` guard makes ticks non-reentrant (a tick is skipped if the previous
-poll is still draining). The UI thread is left with only cheap dictionary folds and
-the WPF row adds.
+run on the UI thread. Each tick drains + decodes the ring on a worker, briefly returns
+to the UI thread to remove any detected runaway hook, then sends host-side dereference
+enrichment and caller-chain extraction (stack unwinding + return-address probes) back
+to workers. Removing the runaway before those stages prevents it from continuing to
+lap the ring throughout thousands of cross-process reads or a large `ResolveAll` pass. A
+`_polling` guard makes ticks non-reentrant (a tick is skipped if the previous poll is
+still draining).
+
+The UI folds the resulting dictionaries. The Calls grid uses ordinary collection
+notifications for small batches (preserving selection, scrolling, filtering, and
+sorting), but collapses a genuinely large update into one collection reset and
+restores any retained selection afterward. Its visible row cache keeps the newest
+5,000 calls by default (user-configurable); timeline navigation finds its record in
+the full trace first and only synchronizes a grid row when that row is still retained.
+The full trace also backs export/copy, caller totals, and per-function counts.
 
 The worker touches only read-only or concurrently-safe state: the capture's own ring
 handle, `ReadProcessMemory`, and the immutable `ModuleMap`. The caller-chain resolver
@@ -300,15 +309,22 @@ and child-follow paths.
 
 **Runtime — `MainWindow.CheckRunaway`.** Static signals can't perfectly predict
 runtime hotness, so a flooder that slips into the hooked set is dropped adaptively.
-Each poll, two triggers can unhook a single callee (via
+Immediately after each ring drain—and before dereference enrichment or caller-chain
+resolution—two triggers can unhook a callee (via
 `CaptureSession.UnhookFunction`, which freezes the target with a `ThreadSuspender`
 and restores the original entry bytes): a **cumulative ceiling** — any hooked callee
 whose total recorded calls cross a hard limit, which runs every tick and catches a
 *diffuse* runaway that never dominates one batch — and a **per-batch dominance**
 check — a callee both dominating a heavy batch and past a lower call floor, which
-catches a *bursty* runaway earlier. An unhooked function stays in the views with the
-count it reached; the rest of the trace keeps recording. A user-focused
-single-function capture is never auto-unhooked.
+catches a *bursty* runaway earlier. Safety totals are accumulated from raw records,
+independently of the display-only `Capture only` filter. A batch invalidated by
+**Clear calls** is not allowed to remove a hook. An unhooked function stays in the
+views with the count it reached; the rest of the trace keeps recording. A focused
+single-function capture does not use dominance (one hook would always be 100%), but
+its hook is removed at a 20,000-decoded-call threshold and sooner if its smaller ring
+laps. Batch draining/finalization can retain a small in-flight tail beyond the threshold.
+When an auto-unhook removes the final hook, the session finishes automatically rather
+than leaving a zero-hook poll timer running.
 
 ---
 

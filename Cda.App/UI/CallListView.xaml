@@ -38,8 +38,9 @@
                 <TextBlock Text="Keep last:" Foreground="{StaticResource TextSecondary}"
                            VerticalAlignment="Center" Margin="0,0,4,0" FontSize="12" />
                 <TextBox x:Name="CapBox" Width="90" VerticalAlignment="Center" FontSize="12"
-                         ToolTip="Maximum calls to keep in this list. Blank or 0 = unlimited (keep all). When exceeded, the oldest rows drop off; the full trace is still kept for the timeline and Copy results."
-                         TextChanged="OnCapChanged" />
+                          Text="5000"
+                          ToolTip="Maximum calls to keep in this list (default 5000). Blank or 0 = unlimited. When exceeded, the oldest visible rows drop off; the full trace is still kept for the timeline and Copy results."
+                          TextChanged="OnCapChanged" />
             </StackPanel>
             <CheckBox x:Name="BookmarkOnly" DockPanel.Dock="Right" Content="★ only"
                       Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" Margin="8,6"

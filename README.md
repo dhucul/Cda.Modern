@@ -163,9 +163,21 @@ This powers the **Call stack** (one call's chain) and **Called by** (a caller tr
 composed across calls) views. As with arguments, the stub only copies raw words;
 all interpretation is host-side.
 
-The poll that drains the ring runs its heavy work — decode, dereference enrichment,
-and caller-chain extraction — on a worker thread, so a heavy startup flood doesn't
-freeze the window; the UI thread is left with cheap dictionary folds and row adds.
+The poll that drains the ring runs decode, dereference enrichment, and caller-chain
+extraction on worker threads. A runaway hook is removed immediately after decode,
+before enrichment and chain resolution, so it cannot keep flooding throughout those
+expensive passes. The Calls grid keeps normal incremental notifications for ordinary
+polls and collapses only a large update into one UI refresh, preserving any retained
+selection. It keeps the newest 5,000 visible rows by default; timeline navigation and
+analysis still use the full trace. Change **Keep last** to another limit, or to 0 for
+unlimited.
+
+A focused one-function capture removes its hook once the decoded sample reaches the
+20,000-call threshold (or after one surviving ring batch if the target already outran
+the poll), then finishes automatically. Because draining and finalization are batched,
+the retained trace can include a small in-flight tail beyond that threshold. This
+prevents a hot loop from growing the trace indefinitely while
+still leaving a substantial sample for caller and argument analysis.
 
 ### Bitness rule
 
@@ -420,7 +432,8 @@ the current build's architecture.
   structure; it updates live during capture.
 - **Calls / Called by / Call stack / Memory tabs (right)**
   - **Calls** — the live call log with arguments and decoded strings, a
-    **"Keep last" cap** (blank = unlimited), and a **Follow** toggle for tailing.
+**"Keep last" cap** (defaults to 5,000; blank or 0 = unlimited), and a **Follow**
+toggle for tailing.
   - **Called by** — a recursive caller tree for the selected function; expand a
     caller to see its callers, tracing back toward the entry point.
   - **Call stack** — the local call chain for the call selected in the Calls log,

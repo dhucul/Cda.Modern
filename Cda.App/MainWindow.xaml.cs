@@ -40,6 +40,7 @@ namespace Cda.App
         private LiveSession? _chainResolverSession;    // session the resolver was built for (rebuild on change)
         private ModuleMap? _chainResolverMap;          // module map the resolver was built for
         private readonly HashSet<ulong> _autoUnhooked = new(); // callees auto-removed mid-capture as runaways
+        private readonly Dictionary<ulong, long> _runawayTotals = new(); // raw/unfiltered calls per callee for safety decisions
         private readonly List<string> _diag = new(); // step-by-step log, included in Copy results
         private DebugLoadCapture? _dllCapture; // active DLL-at-load capture, if any
         private LaunchApiCapture? _apiLaunch; // active launch-and-hook-imports-from-startup capture, if any
@@ -283,6 +284,12 @@ namespace Cda.App
         // batch, so the per-batch dominance path above never trips). Set above
         // RunawayMinCalls so a bursty runaway is still caught earlier by dominance.
         private const int RunawayCeilingCalls = 50000;
+        // A user-focused capture deliberately has only one hook, so batch dominance
+        // is meaningless (it is always 100%). Still bound the retained sample: a hot
+        // focused function otherwise records forever and grows the full trace without
+        // limit. If it actually laps its smaller ring, one surviving batch is already
+        // enough evidence and the hook is removed immediately.
+        private const int FocusedCaptureCallLimit = 20000;
 
         // Upper bound on Windows API entry points hooked by "Capture Windows API".
         // Most programs import far fewer; if a target exceeds this we hook the
@@ -311,15 +318,7 @@ namespace Cda.App
             FunctionList.FunctionSelected += OnFunctionSelected;
             FunctionList.CountFilterChanged += OnFunctionFilterChanged;
             GraphView.NeighborSelected += OnGraphNeighborSelected;
-            CallList.CallSelected += (_, rec) =>
-            {
-                // Mirror the hex view's VA-vs-file-offset branch (as NavigateDisasm does),
-                // so both agree even in a mapped-image mode.
-                if (_currentPe != null && _currentPe.TryVaToFileOffset(rec.Destination, out uint off)) Hex.GoTo(off);
-                else Hex.GoTo(rec.Destination);
-                NavigateDisasm(rec.Destination);
-                ShowCallStack(rec);
-            };
+            CallList.CallSelected += (_, rec) => NavigateToCapturedCall(rec);
             // Reverse of the function-click → call sync: when the user clicks a row in
             // the Calls log, follow that call's callee in the function list and the graph.
             // Scoped to CallClicked (a deliberate row pick) rather than the broader
@@ -347,6 +346,18 @@ namespace Cda.App
                 UpdateDpiText();
                 LoadDemo();
             };
+        }
+
+        private void NavigateToCapturedCall(CallRecord rec)
+        {
+            // Mirror the hex view's VA-vs-file-offset branch (as NavigateDisasm does),
+            // so both agree even in a mapped-image mode. Timeline navigation also
+            // calls this directly when the nearest full-trace record has aged out of
+            // the Calls grid's visible-row cap.
+            if (_currentPe != null && _currentPe.TryVaToFileOffset(rec.Destination, out uint off)) Hex.GoTo(off);
+            else Hex.GoTo(rec.Destination);
+            NavigateDisasm(rec.Destination);
+            ShowCallStack(rec);
         }
 
         // --- demo trace ------------------------------------------------------
@@ -1137,7 +1148,7 @@ namespace Cda.App
                 _captured.Clear();
                 CallList.Clear();
                 ClearCallerGraph();
-                _autoUnhooked.Clear();
+                ResetRunawayTracking();
                 DisposeFileMap();
                 ulong hexAt = app.Count > 0 ? app[0].NativeCode : _session.Process.MinAddress;
                 Hex.SetSource(_session.Process, hexAt);
@@ -1261,8 +1272,8 @@ namespace Cda.App
                 Hex.GoTo(address);
             NavigateDisasm(address);
 
-            // Jump to this function's latest call in the Calls list. The full trace
-            // is kept, so if it was ever called the row is present.
+            // Jump to this function's latest call if that row is still retained by
+            // the Calls list's "Keep last" cap.
             bool listJumped = CallList.SelectLastFor(address);
 
             // Child-follow: viewing one followed process. No live session, so its
@@ -1470,7 +1481,7 @@ namespace Cda.App
             StopApiLaunch();
             StopChildFollow();
             _captured.Clear();
-            _autoUnhooked.Clear();
+            ResetRunawayTracking();
             ClearStringsTab(); // armed once the target is running (deferred until the tab is opened)
             _maxCursorSeen = 0;
             _captureFocus = 0;
@@ -1534,6 +1545,7 @@ namespace Cda.App
             int pid = proc.Pid;
             _selectedFunctionAddr = 0;
             bool armed = false;
+            CaptureSession? startupCapture = null;
 
             // The discovery scan and the graph/list build below run partly on this
             // (UI) thread, so the window is briefly unresponsive. Show a busy cursor
@@ -1648,7 +1660,8 @@ namespace Cda.App
                             // the image base so the culprit becomes a stable RVA.
                             _startupActive = true;
                             _startupImageBase = imageBase;
-                            _startupHookedSet = new HashSet<ulong>(_capture!.HookedTargets);
+                            startupCapture = _capture!;
+                            _startupHookedSet = new HashSet<ulong>(startupCapture.HookedTargets);
                             var entryAddrs = discovered.Functions.ConvertAll(f => f.Address);
                             entryAddrs.Sort();
                             _startupSortedEntries = entryAddrs.ToArray();
@@ -1720,7 +1733,7 @@ namespace Cda.App
             }
 
             if (armed)
-                Diag($"startup trace: {_capture!.HookedCount} hook(s) armed before launch — capturing startup…");
+                Diag($"startup trace: {startupCapture!.HookedCount} hook(s) armed before launch — capturing startup…");
 
             // Establish a full live session for the UI (hex source, click-to-focus),
             // and — if we couldn't arm startup hooks — fall back to the post-start
@@ -1749,7 +1762,18 @@ namespace Cda.App
                 if (armed)
                 {
                     _diag.Add($"post-start attach ok: {session.Dataset.Functions.Count} functions (UI/focus session)");
-                    Diag($"✓ Ready · startup trace running · {_capture!.HookedCount} hook(s) — use the program; click a function to focus on just it.");
+                    if (ReferenceEquals(_capture, startupCapture))
+                    {
+                        Diag($"✓ Ready · startup trace running · {startupCapture!.HookedCount} hook(s) — use the program; click a function to focus on just it.");
+                    }
+                    else
+                    {
+                        // The hot-call guard can legitimately finish the startup
+                        // capture during the delay above. The UI session is still
+                        // useful; don't turn that successful completion into a false
+                        // attach failure or skip the deferred post-attach setup below.
+                        _diag.Add("post-start attach completed after the startup capture had already finished");
+                    }
                 }
                 else
                 {
@@ -2102,7 +2126,7 @@ namespace Cda.App
             _apiCaptureMode = false;
             _moduleMap = new ModuleMap(h.Dataset.Modules);
             _captured.Clear();
-            _autoUnhooked.Clear();
+            ResetRunawayTracking();
             _maxCursorSeen = 0;
 
             _model.Load(h.Dataset);
@@ -3006,7 +3030,7 @@ namespace Cda.App
             StopApiLaunch();
             StopChildFollow();
             _captured.Clear();
-            _autoUnhooked.Clear();
+            ResetRunawayTracking();
             _maxCursorSeen = 0;
             _captureFocus = 0;
             _diag.Clear();
@@ -3072,7 +3096,7 @@ namespace Cda.App
             if (_dialogMode)
                 RegisterDialogFunctions(h.Dataset.Functions);
             _captured.Clear();
-            _autoUnhooked.Clear();
+            ResetRunawayTracking();
             _maxCursorSeen = 0;
 
             _model.Load(h.Dataset);
@@ -3230,7 +3254,7 @@ namespace Cda.App
                 _captured.Clear();
                 CallList.Clear();
                 ClearCallerGraph();
-                _autoUnhooked.Clear();
+                ResetRunawayTracking();
                 ClearDialogState();
                 DialogList.Clear();
                 _diag.Add($"IAT capture.Start({imports.Count} slot(s)): instrumented={instrumented} skipped={skipped} firstError={firstError ?? "(none)"}");
@@ -3312,7 +3336,7 @@ namespace Cda.App
             CallList.Configure(_moduleMap);
             CallList.Clear();
             ClearCallerGraph();
-            _autoUnhooked.Clear();
+            ResetRunawayTracking();
             _model.Load(_liveDataset);
             GraphView.SetModel(_model);
             GraphView.SetSelected(_selectedFunctionAddr);
@@ -3436,43 +3460,89 @@ namespace Cda.App
         //   (2) per-batch dominance — a single callee both dominating a heavy batch
         //       and past the lower RunawayMinCalls floor; catches a BURSTY runaway
         //       early, before it reaches the ceiling.
-        // Never touches a user-focused single-function capture, and runs on the UI
-        // thread only after a poll completes (no Poll is in flight), so the brief
-        // thread-freeze for the byte-restore can't race the worker's reads.
+        // A user-focused single-function capture skips the broad-trace dominance test,
+        // but still has its own bounded sample threshold. Runs on the UI thread immediately
+        // after the ring drain, before caller-chain resolution.
+        // No Poll is in flight then, so the brief thread-freeze for the byte-restore
+        // can't race the worker's reads. Running here also stops a hot target before
+        // the expensive part of an oversized batch gives it time to lap the ring again.
         private void CheckRunaway(List<CallRecord> recs, CaptureSession cap)
         {
-            if (_captureFocus != 0) return; // user asked for exactly this function
             if (recs.Count == 0) return;
+
+            // A bisection attempt must run with exactly the subset chosen by the
+            // search. Removing a hot hook would invalidate the crash/survive verdict;
+            // removing the final hook would also stop the timer that owns the survive
+            // deadline and leave the hidden target running forever. Its ring is
+            // bounded, so tolerate loss for the short hidden test instead.
+            if (_bisecting) return;
+
+            bool focused = _captureFocus != 0;
 
             // Per-callee counts in this batch (and the single most frequent).
             ulong top = 0;
             int topCount = 0;
+            int callCount = 0;
             var counts = new Dictionary<ulong, int>();
             foreach (var r in recs)
             {
+                // DrainDecoded also returns internal return records. They are paired
+                // and hidden by CompleteDecodedPoll, so don't double-count them here.
+                if (r.IsReturn) continue;
+                callCount++;
                 int c = counts.TryGetValue(r.Destination, out int v) ? v + 1 : 1;
                 counts[r.Destination] = c;
                 if (c > topCount) { topCount = c; top = r.Destination; }
             }
+            if (callCount == 0) return;
 
             // (1) Cumulative-ceiling trigger: unhook every distinct callee in this
             // batch whose cumulative total has crossed the hard ceiling.
             foreach (var kv in counts)
             {
                 ulong fn = kv.Key;
+                long total = (_runawayTotals.TryGetValue(fn, out long priorTotal) ? priorTotal : 0) + kv.Value;
+                _runawayTotals[fn] = total;
                 if (_autoUnhooked.Contains(fn)) continue;
-                if (_calleeTotals.TryGetValue(fn, out long t) && t >= RunawayCeilingCalls)
-                    TryAutoUnhook(cap, fn, t);
+                long ceiling = focused && fn == _captureFocus
+                    ? FocusedCaptureCallLimit
+                    : RunawayCeilingCalls;
+                if (total >= ceiling)
+                    TryAutoUnhook(cap, fn, total);
+            }
+
+            // A focused session uses a much smaller ring. Once it has lapped, keeping
+            // the hook armed only produces more copies of the same hot call and more
+            // loss; retain the surviving sample and finish this hook immediately.
+            if (focused)
+            {
+                if (cap.RecordsLost > 0 && top == _captureFocus && !_autoUnhooked.Contains(top))
+                {
+                    long focusedTotal = _runawayTotals.TryGetValue(top, out long ft) ? ft : topCount;
+                    TryAutoUnhook(cap, top, focusedTotal);
+                }
+                return;
             }
 
             // (2) Per-batch dominance trigger (heavy batches only). If the top callee
             // crossed the ceiling above it's already in _autoUnhooked and skipped.
-            if (recs.Count >= RunawayBatchMin && top != 0 && !_autoUnhooked.Contains(top)
-                && topCount >= recs.Count * RunawayBatchShare
-                && _calleeTotals.TryGetValue(top, out long total) && total >= RunawayMinCalls)
+            long topTotal = _runawayTotals.TryGetValue(top, out long totalForTop) ? totalForTop : topCount;
+            if (callCount >= RunawayBatchMin && top != 0 && !_autoUnhooked.Contains(top)
+                && topCount >= callCount * RunawayBatchShare
+                && topTotal >= RunawayMinCalls)
             {
-                TryAutoUnhook(cap, top, total);
+                TryAutoUnhook(cap, top, topTotal);
             }
+        }
+
+        // A newly-created capture session has a new hook set and therefore a new
+        // runaway accounting domain. Keep this independent of caller-graph totals:
+        // those totals are display-filtered, while safety decisions must see every
+        // raw call regardless of the active "Capture only" expression.
+        private void ResetRunawayTracking()
+        {
+            _autoUnhooked.Clear();
+            _runawayTotals.Clear();
         }
 
         // Remove one hooked callee and note it. Returns nothing; UnhookFunction is
@@ -4817,6 +4887,7 @@ namespace Cda.App
                     maxFunctions: maxFunctions, bufferRecords: bufferRecords,
                     out int instrumented, out int skipped, out string? firstError,
                     knownModules: null, captureReturns: CaptureReturns?.IsChecked == true);
+                ResetRunawayTracking();
                 CallList.Configure(_moduleMap);
                 // A refocus / single-function start within the same session keeps the
                 // accumulated call log (and the arguments it backs); only loading a
@@ -4826,7 +4897,6 @@ namespace Cda.App
                     _captured.Clear();
                     CallList.Clear();
                     ClearCallerGraph();
-                    _autoUnhooked.Clear();
                     ClearDialogState();
                     DialogList.Clear();
                 }
@@ -4844,7 +4914,12 @@ namespace Cda.App
                 _pollTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
                 _pollTimer.Tick += OnPollTick;
                 _pollTimer.Start();
-                _captureFocus = candidates.Count == 1 ? candidates[0] : 0;
+                // Focus is an explicit one-hook request, not merely a broad discovery
+                // that happened to yield one candidate. Misclassifying the latter used
+                // to exempt its only (possibly very hot) hook from runaway protection.
+                _captureFocus = maxFunctions == 1 && _capture.HookedTargets.Count == 1
+                    ? _capture.HookedTargets[0]
+                    : 0;
 
                 Diag($"capturing {label} · {instrumented} hook(s) installed · 0 calls yet");
             }
@@ -4995,11 +5070,35 @@ namespace Cda.App
             PolledBatch batch;
             try
             {
-                batch = await Task.Run(() =>
+                // Drain + decode first, then return briefly to the UI thread to shed a
+                // runaway before dereference enrichment and caller-chain resolution.
+                // Previously the target kept flooding throughout both expensive stages
+                // and could lap the ring many more times before CheckRunaway finally ran.
+                var decoded = await Task.Run(cap.DrainDecoded);
+
+                // Capture was stopped while the drain ran. Do not touch its hooks or
+                // resolver; disposal was deliberately handed off to this continuation.
+                if (!ReferenceEquals(_capture, cap))
                 {
-                    var polled = cap.Poll();
-                    return new PolledBatch { Records = polled, Chains = resolver?.ResolveAll(polled) };
-                });
+                    _polling = false;
+                    try { cap.Dispose(); } catch { }
+                    return;
+                }
+
+                // Evaluate the unfiltered batch: a display-only "Capture only"
+                // condition must not hide the function that is flooding the ring.
+                // "Clear calls" promises to leave the current hooks untouched. If it
+                // ran while this pre-clear batch was draining, the batch will be
+                // discarded below and must not drive an auto-unhook either.
+                if (clearGen == _captureClearGen)
+                    CheckRunaway(decoded, cap);
+
+                var polled = await Task.Run(() => cap.CompleteDecodedPoll(decoded));
+
+                var resolvedChains = resolver == null
+                    ? null
+                    : await Task.Run(() => resolver.ResolveAll(polled));
+                batch = new PolledBatch { Records = polled, Chains = resolvedChains };
             }
             catch (Exception ex)
             {
@@ -5021,7 +5120,11 @@ namespace Cda.App
             // would resurrect the very calls the user just cleared. Drop the batch —
             // Poll() already advanced the ring read cursor, so the same capture keeps
             // recording from where it is; only this stale batch is discarded.
-            if (clearGen != _captureClearGen) return;
+            if (clearGen != _captureClearGen)
+            {
+                FinishAutoUnhookedCapture(cap);
+                return;
+            }
 
             var recs = batch.Records;
             var chains = batch.Chains;
@@ -5052,6 +5155,7 @@ namespace Cda.App
                         (_maxCursorSeen == 0
                             ? "(hooked function not called yet — exercise the program, or click a function you know runs)"
                             : "(stub firing; decoding…)");
+                FinishAutoUnhookedCapture(cap);
                 return;
             }
             // Heavy startup flood vs caught up: a wait cursor + "catching up" status
@@ -5083,11 +5187,6 @@ namespace Cda.App
             // chains are index-aligned to recs (the "Capture only" filter kept them so).
             if (_dialogMode) CheckDialogCalls(recs, chains);
 
-            // No host-side decode can keep up with a function called ~a million times
-            // a second; such a runaway laps the ring and starves everything else.
-            // Drop just that hook so the rest of the trace records cleanly.
-            CheckRunaway(recs, cap);
-
             // Drive the graph timeline from the live list BY REFERENCE: point the
             // model at _captured once, then only refresh the active (tail) window.
             // The old path rebuilt a sorted copy of the ENTIRE capture every poll —
@@ -5109,6 +5208,24 @@ namespace Cda.App
             StatusText.Text = _captureBursting
                 ? $"Capturing startup… catching up · {_captured.Count} calls (window briefly busy){lost}{runaway}"
                 : $"✓ Capturing · {cap.HookedCount} hook(s) · {_captured.Count} calls{lost}{runaway}";
+
+            // Removing the only hook leaves nothing useful for the timer to poll. Fold
+            // this batch first, then close the session so the UI becomes a stable trace
+            // instead of appearing to capture forever with zero hooks.
+            if (cap.HookedCount == 0 && _autoUnhooked.Count > 0)
+                FinishAutoUnhookedCapture(cap);
+        }
+
+        private bool FinishAutoUnhookedCapture(CaptureSession cap)
+        {
+            // Defensive counterpart to CheckRunaway's bisection exclusion: never stop
+            // the poll timer that drives an active hidden-test deadline.
+            if (_bisecting || !ReferenceEquals(_capture, cap) || cap.HookedCount != 0 || _autoUnhooked.Count == 0)
+                return false;
+
+            StopCapture();
+            StatusText.Text = $"Capture stopped automatically · hot call sample complete · {_captured.Count:N0} calls retained.";
+            return true;
         }
 
         private void OnStopCapture(object sender, RoutedEventArgs e)
@@ -5289,6 +5406,10 @@ namespace Cda.App
         {
             _captured.Clear();
             CallList.Clear();
+            // Match the previous cumulative-ceiling semantics: Clear calls starts a
+            // fresh observation window for hooks that are still installed. Keep
+            // _autoUnhooked intact because those hooks cannot be restored mid-session.
+            _runawayTotals.Clear();
             FunctionList.ResetCounts(); // zeroes counts AND first-call ranks (resets to "show all")
             // Optionally show only the calls captured SINCE the clear on the left, too:
             // hide every function with no post-clear calls, and (live) reveal each one as
@@ -5723,12 +5844,10 @@ namespace Cda.App
             if (!e.ByUser) return;
 
             double mid = (e.Start + e.End) * 0.5;
-            CallRecord? rec = CallList.SelectNearestTime(mid);
-            if (rec == null)
-            {
-                var recs = _model.Records;
-                if (recs != null && recs.Count > 0) rec = NearestByTime(recs, mid);
-            }
+            var recs = _model.Records;
+            CallRecord? rec = recs != null && recs.Count > 0 ? NearestByTime(recs, mid) : null;
+            if (rec != null && !CallList.SelectRecord(rec))
+                NavigateToCapturedCall(rec);
             // Don't clobber the live "Capturing…" line; the selection/hex still move.
             if (rec != null && _capture == null)
                 StatusText.Text = $"t={rec.Time:0.000000}s  ·  {DescribeAddr(rec.Source)} → {DescribeAddr(rec.Destination)}";

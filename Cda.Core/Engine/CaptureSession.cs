@@ -574,8 +574,15 @@ namespace Cda.Core.Engine
         /// </summary>
         public int ReadTarget(ulong address, byte[] buffer) => _process.ReadMemory(address, buffer);
 
-        /// <summary>Drain and decode records captured since the last poll.</summary>
-        public List<CallRecord> Poll()
+        /// <summary>
+        /// Drain and decode records captured since the last poll, without performing
+        /// target-memory dereference enrichment or return-record pairing yet. This
+        /// split form lets the UI identify and remove a runaway hook immediately after
+        /// the ring copy, before thousands of enrichment reads give it more time to
+        /// flood. Every successful call must be followed by
+        /// <see cref="CompleteDecodedPoll"/> before another drain.
+        /// </summary>
+        public List<CallRecord> DrainDecoded()
         {
             byte[] data = _buffer.DrainSince(_code, ref _readSeq, out int lost);
             if (lost > 0) RecordsLost += lost;
@@ -589,9 +596,23 @@ namespace Cda.Core.Engine
 
             // TSC frequency is unknown/variable; a nominal 1 GHz scale keeps the
             // timeline monotonic and roughly seconds-shaped. Exact timing later.
-            var records = RingBufferReader.Decode(data, _tscBase, 1_000_000_000.0);
+            return RingBufferReader.Decode(data, _tscBase, 1_000_000_000.0);
+        }
+
+        /// <summary>
+        /// Finish a batch returned by <see cref="DrainDecoded"/>: enrich captured
+        /// pointers and fold return records into their corresponding calls.
+        /// </summary>
+        public List<CallRecord> CompleteDecodedPoll(List<CallRecord> records)
+        {
             EnrichDereferences(records);
             return _captureReturns ? PairReturns(records) : records;
+        }
+
+        /// <summary>Drain, decode, enrich, and finalize records captured since the last poll.</summary>
+        public List<CallRecord> Poll()
+        {
+            return CompleteDecodedPoll(DrainDecoded());
         }
 
         /// <summary>

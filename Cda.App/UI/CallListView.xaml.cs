@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Specialized;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Text;
@@ -7,6 +8,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Data;
 using System.Windows.Input;
+using System.Windows.Media;
 using Cda.Core.Engine;
 using Cda.Core.Model;
 using Cda.Core.Process;
@@ -37,12 +39,40 @@ namespace Cda.App.UI
             public CallRecord Record { get; set; } = null!;
         }
 
-        private readonly ObservableCollection<CallRow> _rows = new();
-        private readonly List<CallRecord> _records = new(); // parallel to _rows, for selection
+        // WPF's ObservableCollection raises one CollectionChanged event per Add.
+        // A full startup-ring drain can contain 65K calls, and sending 65K events to
+        // the DataGrid makes the window appear hung even with row virtualization on.
+        // This small derivative mutates a batch silently and raises one Reset event.
+        private sealed class BatchObservableCollection<T> : ObservableCollection<T>
+        {
+            public void ReplaceAll(IReadOnlyList<T> items)
+            {
+                Items.Clear();
+                for (int i = 0; i < items.Count; i++) Items.Add(items[i]);
+                NotifyReset();
+            }
+
+            public void AppendAll(IReadOnlyList<T> items)
+            {
+                for (int i = 0; i < items.Count; i++) Items.Add(items[i]);
+                NotifyReset();
+            }
+
+            private void NotifyReset()
+            {
+                OnPropertyChanged(new PropertyChangedEventArgs(nameof(Count)));
+                OnPropertyChanged(new PropertyChangedEventArgs("Item[]"));
+                OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
+            }
+        }
+
+        private const int DefaultMaxRows = 5000;
+        private const int BatchResetThreshold = 512;
+        private readonly BatchObservableCollection<CallRow> _rows = new();
         private ModuleMap? _map;
         private Func<ulong, string?>? _nameOf; // callee address -> real (API/export) name, if any
         private long _seq;
-        private int _maxRows; // 0 = unlimited (keep every call)
+        private int _maxRows = DefaultMaxRows; // 0 = unlimited (keep every call)
         private ICollectionView? _view; // filtered view over _rows (search + bookmarks)
         private string _filterText = "";
         private bool _bookmarkedOnly;
@@ -84,7 +114,6 @@ namespace Cda.App.UI
         public void Clear()
         {
             _rows.Clear();
-            _records.Clear();
             _seq = 0;
             Header.Text = "No calls captured yet.";
         }
@@ -97,9 +126,9 @@ namespace Cda.App.UI
         /// </summary>
         public bool SelectLastFor(ulong destination)
         {
-            for (int i = _records.Count - 1; i >= 0; i--)
+            for (int i = _rows.Count - 1; i >= 0; i--)
             {
-                if (_records[i].Destination == destination)
+                if (_rows[i].Record.Destination == destination)
                 {
                     // Pause tailing so jumping to an older call (e.g. a startup
                     // call near the top) isn't immediately undone by the next
@@ -113,44 +142,84 @@ namespace Cda.App.UI
         }
 
         /// <summary>
-        /// Select (and scroll to) the logged call closest in time to
-        /// <paramref name="time"/> — used by the timeline slider to navigate the
-        /// call log. Returns the chosen record, or null if the list is empty.
-        /// Selecting the row raises CallSelected (so the hex view follows too).
-        /// Pauses "Follow" so a live capture's next poll won't scroll away from it.
+        /// Select <paramref name="record"/> if its row is still retained by the
+        /// "Keep last" cap. The timeline finds the nearest call from the full trace
+        /// first, then uses this method only to synchronize the visible row. Returns
+        /// false when the full-trace record has already aged out of the grid.
         /// </summary>
-        public CallRecord? SelectNearestTime(double time)
+        public bool SelectRecord(CallRecord record)
         {
-            if (_records.Count == 0) return null;
-
-            // Rows are appended in capture (time) order, so binary-search by time.
-            int lo = 0, hi = _records.Count - 1;
-            while (lo < hi)
-            {
-                int mid = (lo + hi) >> 1;
-                if (_records[mid].Time < time) lo = mid + 1; else hi = mid;
-            }
-            int best = lo;
-            if (lo > 0 && Math.Abs(_records[lo - 1].Time - time) <= Math.Abs(_records[lo].Time - time))
-                best = lo - 1;
-
             FollowTail.IsChecked = false;
-            Select(best);
-            return _records[best];
+            for (int i = 0; i < _rows.Count; i++)
+            {
+                if (!ReferenceEquals(_rows[i].Record, record)) continue;
+                Select(i);
+                return true;
+            }
+            return false;
         }
 
         public void AddRecords(IReadOnlyList<CallRecord> recs)
         {
             if (recs == null || recs.Count == 0) return;
 
-            foreach (var r in recs)
+            long firstSeq = _seq + 1;
+            _seq += recs.Count;
+
+            int incomingStart = _maxRows > 0 ? Math.Max(0, recs.Count - _maxRows) : 0;
+            int incomingKeep = recs.Count - incomingStart;
+            int existingKeep = _maxRows > 0
+                ? Math.Min(_rows.Count, _maxRows - incomingKeep)
+                : _rows.Count;
+            int existingStart = _rows.Count - existingKeep;
+            bool useReset = incomingKeep + existingStart >= BatchResetThreshold;
+            var selected = Grid.SelectedItem as CallRow;
+
+            if (_maxRows > 0)
             {
-                _seq++;
-                _rows.Add(ToRow(r, _seq));
-                _records.Add(r);
+                // Retain only enough existing rows to leave room for the newest part
+                // of this batch. Crucially, records that cannot fit are never formatted
+                // into CallRow objects in the first place.
+                if (useReset)
+                {
+                    var nextRows = new List<CallRow>(existingKeep + incomingKeep);
+                    for (int i = existingStart; i < _rows.Count; i++) nextRows.Add(_rows[i]);
+                    for (int i = incomingStart; i < recs.Count; i++)
+                        nextRows.Add(ToRow(recs[i], firstSeq + i));
+                    ReplaceRows(nextRows, selected);
+                }
+                else
+                {
+                    MutateRows(() =>
+                    {
+                        for (int i = 0; i < existingStart; i++) _rows.RemoveAt(0);
+                        for (int i = incomingStart; i < recs.Count; i++)
+                            _rows.Add(ToRow(recs[i], firstSeq + i));
+                    }, selected, scrollSelection: false);
+                }
+            }
+            else
+            {
+                // Unlimited is an explicit opt-in. Ordinary batches use normal Add
+                // notifications so selection, scroll position, sorting, and filtering
+                // stay stable; only a genuinely large batch uses one Reset.
+                if (useReset)
+                {
+                    var addedRows = new List<CallRow>(recs.Count);
+                    for (int i = 0; i < recs.Count; i++)
+                        addedRows.Add(ToRow(recs[i], firstSeq + i));
+                    MutateRows(() => _rows.AppendAll(addedRows), selected, scrollSelection: true);
+                }
+                else
+                {
+                    MutateRows(() =>
+                    {
+                        for (int i = 0; i < recs.Count; i++)
+                            _rows.Add(ToRow(recs[i], firstSeq + i));
+                    }, selected, scrollSelection: false);
+                }
             }
 
-            TrimToCap();
             UpdateHeader();
 
             // Don't fight an active filter/bookmark view by scrolling to a row
@@ -164,8 +233,72 @@ namespace Cda.App.UI
         // (timeline, Copy results, and the per-function call counts).
         private void TrimToCap()
         {
-            if (_maxRows <= 0) return;
-            while (_rows.Count > _maxRows) { _rows.RemoveAt(0); _records.RemoveAt(0); }
+            if (_maxRows <= 0 || _rows.Count <= _maxRows) return;
+            int remove = _rows.Count - _maxRows;
+            var kept = new List<CallRow>(_maxRows);
+            for (int i = remove; i < _rows.Count; i++) kept.Add(_rows[i]);
+            ReplaceRows(kept, Grid.SelectedItem as CallRow);
+        }
+
+        private void ReplaceRows(IReadOnlyList<CallRow> rows, CallRow? selected) =>
+            MutateRows(() => _rows.ReplaceAll(rows), selected, scrollSelection: true);
+
+        // Collection-change notifications are synchronous. Suppress navigation events
+        // while a batch mutates the grid, then restore a retained selection by object
+        // identity. Small batches never Reset; large batches preserve the call being
+        // inspected and scroll it back into view when Follow is paused.
+        private void MutateRows(Action mutation, CallRow? selected, bool scrollSelection)
+        {
+            CallRow? viewportAnchor = scrollSelection && selected == null && FollowTail.IsChecked != true
+                ? FindTopVisibleRow()
+                : null;
+            _selecting = true;
+            try
+            {
+                mutation();
+                if (selected != null && _rows.Contains(selected))
+                {
+                    Grid.SelectedItem = selected;
+                    if (scrollSelection && FollowTail.IsChecked != true)
+                        Grid.ScrollIntoView(selected);
+                }
+                else if (viewportAnchor != null && _rows.Contains(viewportAnchor))
+                {
+                    // A large Reset invalidates the DataGrid's realized containers.
+                    // Keep the formerly topmost visible call in view when the user
+                    // paused Follow but had not selected a row.
+                    Grid.ScrollIntoView(viewportAnchor);
+                }
+            }
+            finally { _selecting = false; }
+        }
+
+        private CallRow? FindTopVisibleRow()
+        {
+            CallRow? best = null;
+            double bestY = double.MaxValue;
+
+            void Visit(DependencyObject parent)
+            {
+                int count = VisualTreeHelper.GetChildrenCount(parent);
+                for (int i = 0; i < count; i++)
+                {
+                    DependencyObject child = VisualTreeHelper.GetChild(parent, i);
+                    if (child is DataGridRow row && row.Item is CallRow item && row.IsVisible)
+                    {
+                        Point p = row.TranslatePoint(new Point(0, 0), Grid);
+                        if (p.Y + row.ActualHeight >= 0 && p.Y < bestY)
+                        {
+                            bestY = p.Y;
+                            best = item;
+                        }
+                    }
+                    Visit(child);
+                }
+            }
+
+            Visit(Grid);
+            return best;
         }
 
         private void UpdateHeader()
@@ -323,7 +456,7 @@ namespace Cda.App.UI
                 Grid.ScrollIntoView(_rows[i]);
             }
             finally { _selecting = false; }
-            CallSelected?.Invoke(this, _records[i]);
+            CallSelected?.Invoke(this, _rows[i].Record);
         }
 
         // Search + bookmark filter. A row passes when it is bookmarked (if "★ only"
