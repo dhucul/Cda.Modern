@@ -18,6 +18,7 @@ namespace Cda.Core.Engine
     {
         private const uint IMAGE_SCN_MEM_EXECUTE = 0x20000000;
         private const int MaxPdataBytes = 8 * 1024 * 1024;
+        private const int MaxExportFunctions = 1024 * 1024;
 
         public static void ScanModule(
             IMemorySource memory, ModuleInfo module, ICpuArchitecture arch,
@@ -34,7 +35,7 @@ namespace Cda.Core.Engine
 
             var regions = BuildLiveRegions(pe, module);
             var seeds = BuildSeeds(memory, pe, module.BaseAddress, regions,
-                fileBacked: false, fileLength: 0, includeExports: false,
+                fileBacked: false, fileLength: 0,
                 out Amd64FunctionMap? knownFunctions);
             ScanReachable(memory, arch, module.BaseAddress, regions, seeds,
                 knownFunctions, functions, edges, maxEdges,
@@ -54,7 +55,7 @@ namespace Cda.Core.Engine
             var memory = new BufferMemorySource(file, 0, arch.Is64Bit);
             var regions = BuildFileRegions(pe, (ulong)file.LongLength, maxBytesPerSection: 0);
             var seeds = BuildSeeds(memory, pe, pe.PreferredImageBase, regions,
-                fileBacked: true, fileLength: (ulong)file.LongLength, includeExports: true,
+                fileBacked: true, fileLength: (ulong)file.LongLength,
                 out Amd64FunctionMap? knownFunctions);
             ScanReachable(memory, arch, pe.PreferredImageBase, regions, seeds,
                 knownFunctions, functions, edges, maxEdges,
@@ -75,7 +76,7 @@ namespace Cda.Core.Engine
             ulong fileLength = file.MaxAddress;
             var regions = BuildFileRegions(pe, fileLength, maxBytesPerSection: 0);
             var seeds = BuildSeeds(file, pe, pe.PreferredImageBase, regions,
-                fileBacked: true, fileLength: fileLength, includeExports: false,
+                fileBacked: true, fileLength: fileLength,
                 out Amd64FunctionMap? knownFunctions);
             ScanReachable(file, arch, pe.PreferredImageBase, regions, seeds,
                 knownFunctions, functions, edges, maxEdges,
@@ -164,22 +165,13 @@ namespace Cda.Core.Engine
         private static List<ulong> BuildSeeds(
             IMemorySource memory, PeImage pe, ulong imageBase,
             IReadOnlyList<ExecutableRegion> regions,
-            bool fileBacked, ulong fileLength, bool includeExports,
+            bool fileBacked, ulong fileLength,
             out Amd64FunctionMap? knownFunctions)
         {
             var seeds = new List<ulong>();
             if (pe.EntryPointRva != 0) seeds.Add(imageBase + pe.EntryPointRva);
 
-            if (includeExports)
-            {
-                try
-                {
-                    foreach (var export in pe.ReadExports())
-                        if (!export.IsForwarder && export.Rva != 0)
-                            seeds.Add(imageBase + export.Rva);
-                }
-                catch { /* a corrupt/partial export table contributes no seeds */ }
-            }
+            AddExportSeeds(memory, pe, imageBase, fileBacked, fileLength, seeds);
 
             knownFunctions = ReadAmd64FunctionMap(
                 memory, pe, imageBase, fileBacked, fileLength);
@@ -191,6 +183,56 @@ namespace Cda.Core.Engine
             // not the old whole-section linear sweep.
             foreach (var region in regions) seeds.Add(region.VirtualAddress);
             return seeds;
+        }
+
+        // The PeImage instance used for a live or streaming scan contains only
+        // headers, so PeImage.ReadExports() cannot walk its body. Read the export
+        // address table from the supplied source instead. Names are unnecessary
+        // for reachability; only non-forwarded function RVAs become roots.
+        private static void AddExportSeeds(
+            IMemorySource memory, PeImage pe, ulong imageBase,
+            bool fileBacked, ulong fileLength, ICollection<ulong> seeds)
+        {
+            const int ExportDirectoryBytes = 40;
+
+            var (directoryRva, directorySize) = pe.GetDirectory(PeImage.DataDirectory.Export);
+            if (directoryRva == 0 || directorySize < ExportDirectoryBytes) return;
+            if (!TryRvaReadBounds(pe, directoryRva, imageBase, fileBacked, fileLength,
+                    out ulong directoryAddress, out ulong directoryAvailable)
+                || directoryAvailable < ExportDirectoryBytes)
+                return;
+
+            byte[] directory = new byte[ExportDirectoryBytes];
+            if (memory.ReadMemory(directoryAddress, directory) != directory.Length) return;
+
+            uint functionCount = BinaryPrimitives.ReadUInt32LittleEndian(directory.AsSpan(20));
+            uint functionsRva = BinaryPrimitives.ReadUInt32LittleEndian(directory.AsSpan(28));
+            if (functionCount == 0 || functionCount > MaxExportFunctions || functionsRva == 0)
+                return;
+
+            ulong tableBytes = (ulong)functionCount * sizeof(uint);
+            if (!TryRvaReadBounds(pe, functionsRva, imageBase, fileBacked, fileLength,
+                    out ulong functionsAddress, out ulong functionsAvailable)
+                || tableBytes > functionsAvailable)
+                return;
+
+            byte[] functions = new byte[(int)tableBytes];
+            if (memory.ReadMemory(functionsAddress, functions) != functions.Length) return;
+
+            for (int i = 0; i < (int)functionCount; i++)
+            {
+                uint functionRva = BinaryPrimitives.ReadUInt32LittleEndian(
+                    functions.AsSpan(i * sizeof(uint)));
+                if (functionRva == 0 || functionRva >= pe.SizeOfImage) continue;
+
+                // Forwarder entries point to strings within the export directory
+                // rather than executable code in this image.
+                if (functionRva >= directoryRva
+                    && (ulong)functionRva - directoryRva < directorySize)
+                    continue;
+
+                seeds.Add(imageBase + functionRva);
+            }
         }
 
         // AMD64's exception directory identifies non-leaf function bodies. It is
@@ -207,17 +249,9 @@ namespace Cda.Core.Engine
 
             ulong readAddress;
             ulong available;
-            if (fileBacked)
-            {
-                if (!TryFileOffset(pe, rva, fileLength, out readAddress)) return null;
-                available = fileLength - readAddress;
-            }
-            else
-            {
-                if (rva >= pe.SizeOfImage) return null;
-                readAddress = imageBase + rva;
-                available = pe.SizeOfImage - rva;
-            }
+            if (!TryRvaReadBounds(pe, rva, imageBase, fileBacked, fileLength,
+                    out readAddress, out available))
+                return null;
 
             int size = (int)Math.Min(
                 Math.Min((ulong)declaredSize, available), (ulong)MaxPdataBytes);
@@ -260,28 +294,61 @@ namespace Cda.Core.Engine
             return new Amd64FunctionMap(entries, merged);
         }
 
-        private static bool TryFileOffset(
-            PeImage pe, uint rva, ulong fileLength, out ulong offset)
+        // Resolve an RVA to its source address and report only the bytes remaining
+        // in the containing section. This prevents a corrupt directory size from
+        // consuming a later section or file overlay as metadata.
+        private static bool TryRvaReadBounds(
+            PeImage pe, uint rva, ulong imageBase, bool fileBacked, ulong fileLength,
+            out ulong address, out ulong available)
         {
             foreach (var sec in pe.Sections)
             {
                 if (rva < sec.VirtualAddress) continue;
                 ulong delta = (ulong)rva - sec.VirtualAddress;
-                if (delta >= sec.RawSize) continue;
-                offset = (ulong)sec.RawPointer + delta;
-                return offset < fileLength;
+                ulong sectionSize = fileBacked
+                    ? sec.RawSize
+                    : (sec.VirtualSize != 0 ? sec.VirtualSize : sec.RawSize);
+                if (delta >= sectionSize) continue;
+
+                if (fileBacked)
+                {
+                    address = (ulong)sec.RawPointer + delta;
+                    if (address >= fileLength) break;
+                    available = Math.Min(sectionSize - delta, fileLength - address);
+                }
+                else
+                {
+                    if (rva >= pe.SizeOfImage || imageBase + rva < imageBase) break;
+                    address = imageBase + rva;
+                    available = Math.Min(sectionSize - delta, (ulong)pe.SizeOfImage - rva);
+                }
+                return available != 0;
             }
 
             uint firstSection = pe.Sections.Count > 0
                 ? pe.Sections[0].VirtualAddress
                 : pe.SizeOfImage;
-            if (rva < firstSection && rva < fileLength)
+            if (rva < firstSection)
             {
-                offset = rva;
-                return true;
+                if (fileBacked)
+                {
+                    address = rva;
+                    if (address >= fileLength) goto Failed;
+                    available = Math.Min((ulong)firstSection - rva, fileLength - address);
+                }
+                else
+                {
+                    if (rva >= pe.SizeOfImage || imageBase + rva < imageBase) goto Failed;
+                    address = imageBase + rva;
+                    available = Math.Min((ulong)firstSection - rva,
+                        (ulong)pe.SizeOfImage - rva);
+                }
+                return available != 0;
             }
 
-            offset = 0;
+        Failed:
+            address = 0;
+            available = 0;
             return false;
         }
 
