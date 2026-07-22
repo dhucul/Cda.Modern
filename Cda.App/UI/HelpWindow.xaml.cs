@@ -123,7 +123,8 @@ namespace Cda.App.UI
                     "its code runs). Per-process call counts stream into the diagnostics."),
                 new Item("Launch .NET & capture…",
                     "Launch a managed (.NET) EXE and capture its managed method calls from startup. Framework " +
-                    "methods (System.*/Microsoft.*) are skipped. Requires a same-bitness CDA build as the target."),
+                    "methods (System.*/Microsoft.*) are skipped. Managed discovery supports 64-bit .NET targets; " +
+                    "use native capture modes for 32-bit .NET targets."),
             }),
 
             new("Launch options", null, new[]
@@ -163,8 +164,8 @@ namespace Cda.App.UI
                     "x64 only, up to 4 addresses; attaches as a debugger (anti-debug targets may notice)."),
                 new Item("Capture .NET (managed)",
                     "On the attached .NET process, discover its JIT-compiled app methods (via ClrMD) and hook their " +
-                    "native entries. A background timer re-scans for methods that JIT later. Same-bitness CDA build " +
-                    "required."),
+                    "native entries. A background timer re-scans for methods that JIT later. This managed-only " +
+                    "mode supports 64-bit .NET targets; native modes still support 32-bit targets."),
                 new Item("Auto-capture on select",
                     "When on, clicking a function in the list immediately starts tracing it — no Start button needed."),
                 new Item("Capture returns",

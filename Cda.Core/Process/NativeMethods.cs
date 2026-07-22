@@ -11,6 +11,20 @@ namespace Cda.Core.Process
     /// </summary>
     internal static class NativeMethods
     {
+        /// <summary>
+        /// Preserve the unsigned bit pattern of a native pointer. IntPtr.ToInt64()
+        /// sign-extends on a 32-bit host, turning valid addresses at or above
+        /// 0x80000000 into bogus 64-bit addresses.
+        /// </summary>
+        public static ulong ToUInt64(IntPtr value) => IntPtr.Size == 4
+            ? unchecked((uint)value.ToInt32())
+            : unchecked((ulong)value.ToInt64());
+
+        /// <summary>Convert an unsigned target address back to a native pointer.</summary>
+        public static IntPtr ToIntPtr(ulong value) => IntPtr.Size == 4
+            ? new IntPtr(unchecked((int)(uint)value))
+            : new IntPtr(unchecked((long)value));
+
         [Flags]
         public enum ProcessAccess : uint
         {
@@ -468,6 +482,15 @@ namespace Cda.Core.Process
         [DllImport("ntdll.dll")]
         public static extern int NtQueryInformationProcess(
             IntPtr process, int infoClass, ref PROCESS_BASIC_INFORMATION info, int size, out int returnLength);
+
+        // ProcessWow64Information (class 26) returns the 32-bit PEB address for a
+        // WOW64 process. A 64-bit debugger must use this PEB, not the process's
+        // parallel native PEB, to find the PE32 main-image base.
+        [DllImport("ntdll.dll", EntryPoint = "NtQueryInformationProcess")]
+        public static extern int NtQueryInformationProcessPointer(
+            IntPtr process, int infoClass, out IntPtr info, int size, out int returnLength);
+
+        public const int ProcessWow64Information = 26;
 
         public const uint CREATE_SUSPENDED = 0x00000004;
         public const uint CREATE_NO_WINDOW = 0x08000000; // suppress a console window (console targets)

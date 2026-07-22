@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using Cda.Core.Memory;
 using Cda.Core.Model;
+using Cda.Core.Pe;
 
 namespace Cda.Core.Process
 {
@@ -29,7 +30,9 @@ namespace Cda.Core.Process
         public PeMachineKind TargetMachine { get; private set; }
 
         public ulong MinAddress => 0x10000;
-        public ulong MaxAddress => Is64Bit ? 0x7FFFFFFFFFFFUL : 0x7FFFFFFFUL;
+        // IMemorySource bounds are half-open: this is one past the highest
+        // user-mode address represented by the selected decoder/address space.
+        public ulong MaxAddress => Is64Bit ? 0x0000800000000000UL : 0x0000000100000000UL;
 
         /// <summary>
         /// Forcibly terminate a process by PID (best effort). Used by the startup
@@ -122,7 +125,7 @@ namespace Cda.Core.Process
             if (_handle == IntPtr.Zero || buffer.Length == 0) return 0;
             byte[] tmp = new byte[buffer.Length];
             bool ok = NativeMethods.ReadProcessMemory(
-                _handle, (IntPtr)unchecked((long)address), tmp, (IntPtr)tmp.Length, out IntPtr read);
+                _handle, NativeMethods.ToIntPtr(address), tmp, (IntPtr)tmp.Length, out IntPtr read);
             int n = ok ? (int)read : 0;
             if (n > 0) tmp.AsSpan(0, n).CopyTo(buffer);
             return n;
@@ -133,7 +136,7 @@ namespace Cda.Core.Process
             if (_handle == IntPtr.Zero || data.Length == 0) return 0;
             byte[] tmp = data.ToArray();
             bool ok = NativeMethods.WriteProcessMemory(
-                _handle, (IntPtr)unchecked((long)address), tmp, (IntPtr)tmp.Length, out IntPtr written);
+                _handle, NativeMethods.ToIntPtr(address), tmp, (IntPtr)tmp.Length, out IntPtr written);
             return ok ? (int)written : 0;
         }
 
@@ -166,7 +169,22 @@ namespace Cda.Core.Process
                         (uint)Marshal.SizeOf<NativeMethods.MODULEINFO>()))
                     size = info.SizeOfImage;
 
-                result.Add(new ModuleInfo(shortName, (ulong)m.ToInt64(), size, path));
+                ulong moduleBase = NativeMethods.ToUInt64(m);
+                ulong preferredBase = 0;
+                try
+                {
+                    // Populate the link-time base at enumeration time so every live
+                    // x86/x64 capture path can present static-disassembler addresses,
+                    // even when that module is not subsequently call-site scanned.
+                    byte[] header = new byte[0x1000];
+                    int read = ReadMemory(moduleBase, header);
+                    if (read >= 0x200)
+                        preferredBase = PeImage.FromMappedImage(header, moduleBase).PreferredImageBase;
+                }
+                catch { /* malformed or unreadable module: live VA remains usable */ }
+
+                result.Add(new ModuleInfo(shortName, moduleBase, size, path,
+                    preferredBaseAddress: preferredBase));
             }
             return result;
         }

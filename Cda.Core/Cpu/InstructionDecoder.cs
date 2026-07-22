@@ -30,7 +30,13 @@ namespace Cda.Core.Cpu
                      instr.Op0Kind == OpKind.NearBranch32 ||
                      instr.Op0Kind == OpKind.NearBranch64))
                 {
-                    yield return (instr.IP, instr.NearBranchTarget);
+                    ulong target = instr.NearBranchTarget;
+                    // `call $+5; pop reg` (or its operand-size variant) obtains
+                    // the current instruction pointer; the following instruction
+                    // is not a subroutine entry. Promoting it produced phantom
+                    // sub_XXXXXXXX rows that no real disassembler recognizes.
+                    if (target != instr.NextIP)
+                        yield return (instr.IP, target);
                 }
             }
         }
@@ -69,7 +75,9 @@ namespace Cda.Core.Cpu
                      instr.Op0Kind == OpKind.NearBranch32 ||
                      instr.Op0Kind == OpKind.NearBranch64))
                 {
-                    yield return (instr.IP, instr.NearBranchTarget);
+                    ulong target = instr.NearBranchTarget;
+                    if (target != instr.NextIP)
+                        yield return (instr.IP, target);
                 }
             }
         }

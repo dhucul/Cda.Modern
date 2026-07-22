@@ -7,14 +7,14 @@
     <LangVersion>latest</LangVersion>
     <AssemblyName>Cda.Core</AssemblyName>
     <RootNamespace>Cda.Core</RootNamespace>
-    <Platforms>x64;x86</Platforms>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 
     <!-- The engine is the only assembly that touches the target process. It has
          no WPF/UI dependency so it can be unit-tested headlessly and reused by a
-         future CLI. The recommended deployment is an x64 host that analyzes both
-         x64 and (via WOW64-aware reads) x86 targets; an x86 build is kept for the
-         edge case of instrumenting a 32-bit target from a 32-bit host. -->
+         future CLI. The x64 host analyzes and instruments both native x64 and
+         WOW64 x86 targets. -->
   </PropertyGroup>
 
   <ItemGroup>

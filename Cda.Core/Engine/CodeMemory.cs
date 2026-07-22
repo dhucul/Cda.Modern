@@ -40,7 +40,7 @@ namespace Cda.Core.Engine
                 NativeMethods.MEM_COMMIT | NativeMethods.MEM_RESERVE, protect);
             if (p == IntPtr.Zero)
                 throw new InvalidOperationException($"VirtualAlloc failed ({Marshal.GetLastWin32Error()}).");
-            return (ulong)p.ToInt64();
+            return NativeMethods.ToUInt64(p);
         }
 
         // The in-process self-test doesn't run the free-region scan; a far
@@ -51,7 +51,7 @@ namespace Cda.Core.Engine
         public int Read(ulong address, Span<byte> buffer)
         {
             byte[] tmp = new byte[buffer.Length];
-            Marshal.Copy((IntPtr)unchecked((long)address), tmp, 0, tmp.Length);
+            Marshal.Copy(NativeMethods.ToIntPtr(address), tmp, 0, tmp.Length);
             tmp.CopyTo(buffer);
             return buffer.Length;
         }
@@ -59,18 +59,18 @@ namespace Cda.Core.Engine
         public void Write(ulong address, ReadOnlySpan<byte> data)
         {
             byte[] tmp = data.ToArray();
-            Marshal.Copy(tmp, 0, (IntPtr)unchecked((long)address), tmp.Length);
+            Marshal.Copy(tmp, 0, NativeMethods.ToIntPtr(address), tmp.Length);
         }
 
         public uint Protect(ulong address, int size, uint protect)
         {
-            NativeMethods.VirtualProtect((IntPtr)unchecked((long)address), (IntPtr)size, protect, out uint old);
+            NativeMethods.VirtualProtect(NativeMethods.ToIntPtr(address), (IntPtr)size, protect, out uint old);
             return old;
         }
 
         public void Flush(ulong address, int size) =>
             NativeMethods.FlushInstructionCache(NativeMethods.GetCurrentProcess(),
-                (IntPtr)unchecked((long)address), (IntPtr)size);
+                NativeMethods.ToIntPtr(address), (IntPtr)size);
     }
 
     /// <summary>Operates on a remote target via <see cref="RemoteMemory"/>.</summary>

@@ -34,9 +34,9 @@ namespace Cda.Core.Engine
     ///
     /// Safety: every per-process hook attempt is fully isolated in try/catch — a
     /// failure to instrument one process never stalls it (it just runs
-    /// uninstrumented) and never disturbs the rest of the tree. Bitness is gated
-    /// (an x86 build won't try to hook a 64-bit child) and the same packed-binary
-    /// heuristic used elsewhere skips processes whose real code isn't visible yet.
+    /// uninstrumented) and never disturbs the rest of the tree. The x64 host handles
+    /// native x64 and WOW64 x86 children, and the same packed-binary heuristic used
+    /// elsewhere skips processes whose real code isn't visible yet.
     /// When the system-skip filter is on (the default), children whose image lives
     /// under the Windows directory (OS helpers like conhost/WerFault) are followed
     /// but not instrumented; the root is always instrumented, even if it lives there.
@@ -194,7 +194,8 @@ namespace Cda.Core.Engine
                             // CREATE_PROCESS_DEBUG_INFO: hFile @U, hProcess @U+ptr,
                             // hThread @U+2*ptr, lpBaseOfImage @U+3*ptr.
                             IntPtr hFile = Marshal.ReadIntPtr(evt, U);
-                            ulong imageBase = (ulong)Marshal.ReadIntPtr(evt, U + 3 * IntPtr.Size).ToInt64();
+                            ulong imageBase = NativeMethods.ToUInt64(
+                                Marshal.ReadIntPtr(evt, U + 3 * IntPtr.Size));
                             string path = Clean(ResolvePath(hFile));
                             CloseEventFile(hFile);
 
@@ -319,8 +320,8 @@ namespace Cda.Core.Engine
                 try { pe = PeImage.FromFile(bytes); }
                 catch (Exception ex) { Log?.Invoke($"pid {pid}: not a PE image ({ex.Message}); not hooking."); return; }
 
-                // A 32-bit host can't write code a 64-bit target will run. (An x64
-                // build instruments both x64 and WOW64 x86 children.)
+                // Defensive if Cda.Core is ever embedded in a 32-bit host; the
+                // shipped CDA application itself is x64-only.
                 if (!Environment.Is64BitProcess && pe.Is64Bit)
                 { Log?.Invoke($"pid {pid}: 64-bit target needs an x64 build of CDA — skipped."); return; }
 
@@ -340,7 +341,8 @@ namespace Cda.Core.Engine
                 ulong delta = unchecked(imageBase - pe.PreferredImageBase);
                 var funcs = new List<TracedFunction>(rawFuncs.Count);
                 foreach (var f in rawFuncs)
-                    funcs.Add(new TracedFunction(unchecked(f.Address + delta), imageBase, f.Name));
+                    funcs.Add(new TracedFunction(unchecked(f.Address + delta), imageBase, f.Name,
+                        displayAddress: f.DisplayAddress));
                 var edges = new List<(ulong Site, ulong Target)>(rawEdges.Count);
                 foreach (var (s, t) in rawEdges)
                     edges.Add((unchecked(s + delta), unchecked(t + delta)));
@@ -354,7 +356,8 @@ namespace Cda.Core.Engine
                 // its .pdata is readable from the already-mapped image now, so the
                 // guard does its authoritative entry check, exactly like the
                 // suspended-launch path. (Reused below for the UI dataset.)
-                var module = new ModuleInfo(Path.GetFileName(imagePath), imageBase, pe.SizeOfImage, imagePath);
+                var module = new ModuleInfo(Path.GetFileName(imagePath), imageBase, pe.SizeOfImage,
+                    imagePath, preferredBaseAddress: pe.PreferredImageBase);
 
                 var session = CaptureSession.Start(pid, candidates, _maxFunctions, _bufferRecords,
                     out int instrumented, out int skipped, out string? firstError,

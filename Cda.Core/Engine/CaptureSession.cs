@@ -155,10 +155,10 @@ namespace Cda.Core.Engine
                 // targets all slip in, and splicing an entry detour into one of
                 // those corrupts the target's code and crashes it (the "some
                 // programs, not all" failure). EntryPointGuard verifies entries
-                // against the x64 .pdata function table (authoritative; its extents
-                // also bound how far the splice may steal), with a PIC-idiom reject
-                // + next-entry clamp where no table is available. Built here, at the
-                // single choke point every capture path funnels through.
+                // against x64 .pdata when available: known starts and extents are
+                // trusted, mid-body targets are rejected, and leaf functions absent
+                // from .pdata use the PIC-idiom reject plus conservative bounds.
+                // Built here, at the single choke point every capture path uses.
                 var funcList = new List<ulong>(functions);
 
                 // The guard's next-entry clamp (its x86 / no-.pdata fallback path)
@@ -220,12 +220,12 @@ namespace Cda.Core.Engine
                 // but in the suspended-launch path Start runs before the first
                 // instruction, when the PEB loader list is still empty, so
                 // EnumerateModules() returns nothing and every candidate would fall
-                // through to the guard's weak heuristic (which doesn't reject
-                // jump-table / mid-function / non-.pdata-entry targets — splicing one
+                // through to the guard's weaker metadata-free checks. Those cannot
+                // disprove jump-table or mid-function targets, and splicing one
                 // of those is exactly what crashes the target with an int3). The
                 // caller passes the already-known main module(s); their .pdata is
                 // readable straight from the mapped image even pre-loader, so merging
-                // them in restores the authoritative entry check.
+                // them in restores the strong unwind-metadata checks.
                 var guardModules = new List<ModuleInfo>(proc.EnumerateModules());
                 if (knownModules != null)
                 {
@@ -449,7 +449,8 @@ namespace Cda.Core.Engine
             {
                 IntPtr k32 = NativeMethods.GetModuleHandleW("kernel32.dll");
                 if (k32 == IntPtr.Zero) return;
-                ulong addVeh = (ulong)NativeMethods.GetProcAddress(k32, "AddVectoredExceptionHandler").ToInt64();
+                ulong addVeh = NativeMethods.ToUInt64(
+                    NativeMethods.GetProcAddress(k32, "AddVectoredExceptionHandler"));
                 if (addVeh == 0) return;
 
                 ulong registry = _code.Allocate(8 + MaxVehContexts * 8, executable: false); // zeroed → count 0
@@ -463,7 +464,7 @@ namespace Cda.Core.Engine
                 _code.Write(boot, bootBytes); _code.Flush(boot, bootBytes.Length);
 
                 IntPtr th = NativeMethods.CreateRemoteThread(_process.Handle, IntPtr.Zero, IntPtr.Zero,
-                    (IntPtr)unchecked((long)boot), IntPtr.Zero, 0, out _);
+                NativeMethods.ToIntPtr(boot), IntPtr.Zero, 0, out _);
                 if (th == IntPtr.Zero) return; // registry stays 0 → InstallHook skips VEH bookkeeping
                 NativeMethods.WaitForSingleObject(th, 5000); // let AddVectoredExceptionHandler complete
                 NativeMethods.CloseHandle(th);

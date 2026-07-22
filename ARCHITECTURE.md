@@ -40,9 +40,12 @@ Two things keep that from forking the whole codebase:
 
 ### Host rule
 
-The **x64 build is the universal host**: it instruments x64 targets and WOW64
-(32-bit) targets. An x86 host cannot write code a 64-bit target will run, so that
-direction is refused with a clear message. Build and run x64.
+The single **x64 build is the universal native host**: it instruments x64 targets
+and WOW64 (32-bit) targets. Suspended PE32 launches query
+`ProcessWow64Information` for PEB32 before reading `ImageBaseAddress`; using the
+parallel native PEB would produce a bogus 64-bit base. Managed method discovery
+is the exception: ClrMD's DAC attach cannot inspect a 32-bit .NET target from the
+x64 CDA process, so use native capture modes for that target.
 
 ### x86 vs x64, concretely
 
@@ -59,9 +62,22 @@ direction is refused with a clear message. Build and run x64.
 ## Discovery
 
 `Pe/PeImage` parses headers, sections, exports, and imports, and converts between
-RVA, VA, and file offset. `Engine/CallSiteScanner` walks code sections with Iced
-(`ICpuArchitecture.FindDirectCalls`) collecting `(callSite, target)` edges and the
-set of call targets, which become candidate functions.
+RVA, VA, and file offset. `Engine/CallSiteScanner` seeds Iced decoding from the PE
+entry point, exports, AMD64 `.pdata` entries, and executable-section starts, then
+recursively follows reachable calls and branches. It does not linearly reinterpret
+embedded data after a return/jump as instructions. Direct-call targets become
+candidate functions; `call $+next; pop` instruction-pointer idioms are rejected.
+For AMD64, `.pdata` supplies known non-leaf entries and body ranges. Exact starts are
+trusted and mid-body call targets are rejected, while targets outside those bodies
+remain eligible because leaf functions need no unwind entry. The hook guard applies
+the same rule. File regions are clipped to both section raw data and the actual EOF,
+so every listed static candidate has bytes the disassembly view can open.
+
+`ModuleInfo` retains both the actual load base and the PE preferred image base. The
+function list therefore presents live VA, static-disassembler VA, and RVA separately;
+unnamed `sub_*` labels use the static-disassembler VA rather than an ASLR-dependent
+live address. Trace archive v2 persists the preferred base while the reader remains
+backward-compatible with v1 traces.
 
 For a **suspended** target (startup trace), the scan runs against the **on-disk
 image**, not the frozen process: at creation most pages aren't faulted in yet, so a

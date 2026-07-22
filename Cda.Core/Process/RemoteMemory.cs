@@ -34,7 +34,7 @@ namespace Cda.Core.Process
                 throw new InvalidOperationException(
                     $"VirtualAllocEx failed (error {System.Runtime.InteropServices.Marshal.GetLastWin32Error()}).");
             _allocs.Add((p, (IntPtr)size));
-            return (ulong)p.ToInt64();
+            return NativeMethods.ToUInt64(p);
         }
 
         // --- near (rel32-reachable) allocation -------------------------------
@@ -90,12 +90,12 @@ namespace Cda.Core.Process
             ulong slot = FindFreeNear(anchor, (ulong)blockBytes);
             if (slot != 0)
             {
-                IntPtr p = NativeMethods.VirtualAllocEx(_process.Handle, (IntPtr)unchecked((long)slot),
+                IntPtr p = NativeMethods.VirtualAllocEx(_process.Handle, NativeMethods.ToIntPtr(slot),
                     (IntPtr)blockBytes, NativeMethods.MEM_COMMIT | NativeMethods.MEM_RESERVE,
                     NativeMethods.PAGE_EXECUTE_READWRITE);
                 if (p != IntPtr.Zero)
                 {
-                    ulong basis = (ulong)p.ToInt64();
+                    ulong basis = NativeMethods.ToUInt64(p);
                     _allocs.Add((p, (IntPtr)blockBytes));
                     _nearBlocks.Add(new NearBlock
                     {
@@ -145,11 +145,11 @@ namespace Cda.Core.Process
             int guard = 0;
             while (addr < limit && guard++ < 200000)
             {
-                if (NativeMethods.VirtualQueryEx(_process.Handle, (IntPtr)unchecked((long)addr),
+                if (NativeMethods.VirtualQueryEx(_process.Handle, NativeMethods.ToIntPtr(addr),
                         out var mbi, (IntPtr)MbiSize) == IntPtr.Zero)
                     break;
-                ulong rBase = (ulong)mbi.BaseAddress.ToInt64();
-                ulong rSize = (ulong)mbi.RegionSize.ToInt64();
+                ulong rBase = NativeMethods.ToUInt64(mbi.BaseAddress);
+                ulong rSize = NativeMethods.ToUInt64(mbi.RegionSize);
                 if (rSize == 0) break;
                 ulong rEnd = rBase + rSize;
 
@@ -188,7 +188,7 @@ namespace Cda.Core.Process
 
         public uint Protect(ulong address, int size, uint protect)
         {
-            if (!NativeMethods.VirtualProtectEx(_process.Handle, (IntPtr)unchecked((long)address),
+            if (!NativeMethods.VirtualProtectEx(_process.Handle, NativeMethods.ToIntPtr(address),
                     (IntPtr)size, protect, out uint old))
                 throw new InvalidOperationException(
                     $"VirtualProtectEx failed at 0x{address:X} " +
@@ -198,7 +198,7 @@ namespace Cda.Core.Process
 
         /// <summary>Flush the CPU instruction cache after writing code (mandatory on patches).</summary>
         public void FlushCode(ulong address, int size) =>
-            NativeMethods.FlushInstructionCache(_process.Handle, (IntPtr)unchecked((long)address), (IntPtr)size);
+            NativeMethods.FlushInstructionCache(_process.Handle, NativeMethods.ToIntPtr(address), (IntPtr)size);
 
         public void Dispose()
         {

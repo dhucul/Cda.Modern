@@ -153,7 +153,7 @@ namespace Cda.Core.Engine
                                     if (loaded.Length > 0 &&
                                         string.Equals(Path.GetFileName(loaded), _dllName, StringComparison.OrdinalIgnoreCase))
                                     {
-                                        HookTargetDll((ulong)baseOfDll.ToInt64());
+                                        HookTargetDll(NativeMethods.ToUInt64(baseOfDll));
                                         _hooked = true;
                                     }
                                 }
@@ -249,7 +249,8 @@ namespace Cda.Core.Engine
             ulong delta = unchecked(dllBase - pe.PreferredImageBase);
             var funcs = new List<TracedFunction>(rawFuncs.Count);
             foreach (var f in rawFuncs)
-                funcs.Add(new TracedFunction(unchecked(f.Address + delta), dllBase, f.Name));
+                funcs.Add(new TracedFunction(unchecked(f.Address + delta), dllBase, f.Name,
+                    displayAddress: f.DisplayAddress));
             var edges = new List<(ulong Site, ulong Target)>(rawEdges.Count);
             foreach (var (s, t) in rawEdges) edges.Add((unchecked(s + delta), unchecked(t + delta)));
 
@@ -260,7 +261,8 @@ namespace Cda.Core.Engine
                 out int instrumented, out int skipped, out string? firstError);
             Log?.Invoke($"DllMain trace: instrumented={instrumented} skipped={skipped} firstError={firstError ?? "(none)"}");
 
-            var module = new ModuleInfo(_dllName, dllBase, pe.SizeOfImage, _dllPath);
+            var module = new ModuleInfo(_dllName, dllBase, pe.SizeOfImage, _dllPath,
+                preferredBaseAddress: pe.PreferredImageBase);
             var ds = new TraceDataset { TimeStart = 0, TimeEnd = 1 };
             ds.Modules.Add(module);
             ds.Functions.AddRange(funcs);

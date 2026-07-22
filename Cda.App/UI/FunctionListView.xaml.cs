@@ -19,6 +19,8 @@ namespace Cda.App.UI
     {
         public ulong Address { get; init; }
         public string AddressHex => "0x" + Address.ToString("X");
+        public string DisassemblerAddress { get; init; } = "";
+        public string Rva { get; init; } = "";
         public string Module { get; init; } = "";
         public string Name { get; init; } = "";
 
@@ -143,14 +145,7 @@ namespace Cda.App.UI
             _byAddress.Clear();
             foreach (var fn in data.Functions)
             {
-                var mod = map.Resolve(fn.Address);
-                var row = new FunctionRow
-                {
-                    Address = fn.Address,
-                    Module = mod?.Name ?? "",
-                    Name = fn.Name ?? fn.DisplayName,
-                    CallCount = fn.CallCount,
-                };
+                var row = MakeRow(fn, map);
                 _rows.Add(row);
                 _byAddress[fn.Address] = row;
             }
@@ -168,13 +163,7 @@ namespace Cda.App.UI
             _byAddress.Clear();
             foreach (var fn in functions)
             {
-                var row = new FunctionRow
-                {
-                    Address = fn.Address,
-                    Module = map?.Resolve(fn.Address)?.Name ?? "",
-                    Name = fn.Name ?? fn.DisplayName,
-                    CallCount = fn.CallCount,
-                };
+                var row = MakeRow(fn, map);
                 _rows.Add(row);
                 _byAddress[fn.Address] = row;
             }
@@ -200,19 +189,36 @@ namespace Cda.App.UI
             foreach (var fn in functions)
             {
                 if (_byAddress.ContainsKey(fn.Address)) continue;
-                var row = new FunctionRow
-                {
-                    Address = fn.Address,
-                    Module = map?.Resolve(fn.Address)?.Name ?? "",
-                    Name = fn.Name ?? fn.DisplayName,
-                    CallCount = fn.CallCount,
-                };
+                var row = MakeRow(fn, map);
                 _rows.Add(row);
                 _byAddress[fn.Address] = row;
                 added++;
             }
             if (added > 0) UpdateMatchInfo();
             return added;
+        }
+
+        private static FunctionRow MakeRow(TracedFunction fn, ModuleMap? map)
+        {
+            var module = map?.Resolve(fn.Address);
+            ulong moduleBase = module?.BaseAddress ?? fn.ModuleBase;
+            bool hasRva = moduleBase != 0 && fn.Address >= moduleBase;
+            ulong rva = hasRva ? fn.Address - moduleBase : 0;
+            ulong disassemblerVa = fn.DisplayAddress != 0 ? fn.DisplayAddress : fn.Address;
+            if (module != null && module.TryToPreferredAddress(fn.Address, out ulong preferred))
+                disassemblerVa = preferred;
+
+            return new FunctionRow
+            {
+                Address = fn.Address,
+                DisassemblerAddress = "0x" + disassemblerVa.ToString("X"),
+                Rva = hasRva ? "+0x" + rva.ToString("X") : "",
+                Module = module?.Name ?? "",
+                // Synthetic names must use the link-time VA used by a static
+                // disassembler, not the ASLR-adjusted live address.
+                Name = fn.Name ?? ("sub_" + disassemblerVa.ToString("X")),
+                CallCount = fn.CallCount,
+            };
         }
 
         /// <summary>
@@ -317,7 +323,9 @@ namespace Cda.App.UI
                 bool textMatch =
                     r.Name.Contains(_filter, StringComparison.OrdinalIgnoreCase)
                     || r.Module.Contains(_filter, StringComparison.OrdinalIgnoreCase)
-                    || r.AddressHex.Contains(_filter, StringComparison.OrdinalIgnoreCase);
+                    || r.AddressHex.Contains(_filter, StringComparison.OrdinalIgnoreCase)
+                    || r.DisassemblerAddress.Contains(_filter, StringComparison.OrdinalIgnoreCase)
+                    || r.Rva.Contains(_filter, StringComparison.OrdinalIgnoreCase);
                 if (!textMatch) return false;
             }
 

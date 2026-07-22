@@ -86,6 +86,10 @@ Working and validated on real targets. Implemented and confirmed:
   on-demand memory source (file image or live process), so it works on an opened PE
   or a running target; decodes a bounded window stopping at the function's first
   `ret`/`jmp`/`int3`.
+- **ASLR-aware function addresses** — the function list separates the current
+  **Live VA**, the link-time **Disasm VA** used by static disassemblers, and the
+  module **RVA**. Synthetic `sub_*` names use Disasm VA, so a live `0x01036B35`
+  relocated from a `0x00400000` image appears as `sub_436B35` / RVA `+0x36B35`.
 - **Return-value capture** — optionally record what each hooked function *returns*
   (integer `RAX`/`EAX`, host-side string-dereferenced like arguments), shown in the
   Calls log's **Return** column. A return trampoline intercepts the callee's `ret`; one
@@ -124,7 +128,7 @@ dependency, not to avoid the GPU.)
 
 ## Stack
 
-- **.NET 8**, **WPF**, built for **x64 and x86**
+- **.NET 8**, **WPF**, one **x64** build for native x64 and WOW64 x86 targets
 - **Per-Monitor v2 DPI** awareness (`Cda.App/app.manifest`) — re-renders crisply
   across monitors of different scale factors; the status bar shows the live DPI
 - **Iced** (`Iced` NuGet) for x86/x64 instruction decoding, call-site discovery,
@@ -181,10 +185,10 @@ still leaving a substantial sample for caller and argument analysis.
 
 ### Bitness rule
 
-The **x64 build is the universal host**: it can instrument x64 targets and
-WOW64 (32-bit) targets. The only unsupported direction is an x86 host trying to
-instrument a 64-bit target, which is guarded against with a clear message. In
-practice, build and run the **x64** configuration.
+The single **x64 build is the universal native host**: it instruments x64 targets
+and WOW64 (32-bit) targets. Managed method discovery is limited to 64-bit .NET
+targets because ClrMD cannot load a 32-bit DAC into the x64 CDA process; native
+capture of those same 32-bit processes still works.
 
 ---
 
@@ -484,10 +488,10 @@ exercisable. From there:
 - **Launch .NET & capture…** to launch a managed (.NET) EXE from disk and trace its
   managed method calls — the managed counterpart of Launch & capture. Or, for an
   already-running .NET app, **Attach to process…** then **Capture .NET (managed)**.
-  Managed capture needs a **same-bitness CDA build** as the target: ClrMD's live attach
-  (used to discover JIT'd method addresses) is bitness-locked, so run the **x64** CDA
-  build for 64-bit apps and the **x86** build for 32-bit apps — CDA says which is needed
-  if they don't match. (Native captures are cross-bitness; only managed discovery isn't.)
+  CDA ships as one **x64** application and supports both native x64 and WOW64 x86
+  targets for static analysis and native capture. Managed method discovery supports
+  64-bit .NET targets only: ClrMD's DAC attach cannot discover a 32-bit .NET target
+  cross-bitness, but CDA's native capture modes remain available for that process.
 - **Capture DLL…** to trace a DLL from the moment it loads.
 - **Follow children…** to trace a program and every process it spawns.
 - **Open / Save trace…** to review a captured `.cdatrace` offline or keep one.
@@ -590,7 +594,7 @@ Cda.Modern/
 │  ├─ Pe/                    PeImage (parse, exports/imports/sections, RVA↔VA↔file-offset)
 │  └─ Process/               TargetProcess, ProcessList, ModuleMap, SuspendedProcess,
 │                            ThreadSuspender, Privileges, RemoteMemory, NativeMethods (P/Invoke)
-└─ Cda.App/                  WPF UI (net8.0-windows, x64;x86, Per-Monitor v2 DPI, requireAdministrator)
+└─ Cda.App/                  WPF UI (net8.0-windows, x64, Per-Monitor v2 DPI, requireAdministrator)
    ├─ App.xaml(.cs)          theme (single source of truth) + global exception handling
    ├─ MainWindow.xaml(.cs)   toolbar, layout, engine orchestration, poll loop, runaway unhook
    ├─ UI/                    FunctionListView, CallListView, CallersView (caller tree),

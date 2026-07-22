@@ -9,19 +9,37 @@ namespace Cda.Core.Model
         public ulong BaseAddress;
         public ulong Size;
 
+        /// <summary>
+        /// Link-time image base used by static disassemblers. This differs from
+        /// <see cref="BaseAddress"/> when ASLR relocates a live module. Zero means
+        /// unknown (older saved traces and synthetic/runtime-only modules).
+        /// </summary>
+        public ulong PreferredBaseAddress;
+
         /// <summary>Full path on disk, when known (used by the PE inspector / hex view).</summary>
         public string? Path;
 
-        public ModuleInfo(string name, ulong baseAddress, ulong size, string? path = null)
+        public ModuleInfo(string name, ulong baseAddress, ulong size, string? path = null,
+            ulong preferredBaseAddress = 0)
         {
             Name = name;
             BaseAddress = baseAddress;
             Size = size;
             Path = path;
+            PreferredBaseAddress = preferredBaseAddress;
         }
 
         public bool Contains(ulong address) =>
-            address >= BaseAddress && address < BaseAddress + Size;
+            address >= BaseAddress && address - BaseAddress < Size;
+
+        /// <summary>Convert a live VA to the link-time VA shown by a static disassembler.</summary>
+        public bool TryToPreferredAddress(ulong address, out ulong preferredAddress)
+        {
+            preferredAddress = 0;
+            if (PreferredBaseAddress == 0 || !Contains(address)) return false;
+            preferredAddress = PreferredBaseAddress + (address - BaseAddress);
+            return true;
+        }
     }
 
     /// <summary>
@@ -34,18 +52,27 @@ namespace Cda.Core.Model
         public string? Name;
         public ulong ModuleBase;
 
+        /// <summary>
+        /// Link-time/static-disassembler VA for presentation. Address remains the
+        /// live VA used for reads and capture. Defaults to Address when no rebase
+        /// information is available.
+        /// </summary>
+        public ulong DisplayAddress;
+
         /// <summary>How many times the function was observed (filled by capture).</summary>
         public long CallCount;
 
-        public TracedFunction(ulong address, ulong moduleBase, string? name = null)
+        public TracedFunction(ulong address, ulong moduleBase, string? name = null,
+            ulong displayAddress = 0)
         {
             Address = address;
             ModuleBase = moduleBase;
             Name = name;
+            DisplayAddress = displayAddress != 0 ? displayAddress : address;
         }
 
         public string DisplayName =>
-            string.IsNullOrEmpty(Name) ? "sub_" + Address.ToString("X") : Name!;
+            string.IsNullOrEmpty(Name) ? "sub_" + DisplayAddress.ToString("X") : Name!;
     }
 
     /// <summary>Convenience container produced by the engine (or the demo feeder).</summary>

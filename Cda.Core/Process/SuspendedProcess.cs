@@ -56,26 +56,82 @@ namespace Cda.Core.Process
         /// The ASLR-relocated base of the main image, or 0 if it can't be resolved
         /// or doesn't validate as a PE ('MZ'). Reads PEB-&gt;ImageBaseAddress.
         /// </summary>
-        public ulong GetImageBase()
-        {
-            var pbi = new NativeMethods.PROCESS_BASIC_INFORMATION();
-            int status = NativeMethods.NtQueryInformationProcess(
-                _hProcess, 0 /* ProcessBasicInformation */, ref pbi,
-                Marshal.SizeOf<NativeMethods.PROCESS_BASIC_INFORMATION>(), out _);
-            if (status != 0 || pbi.PebBaseAddress == IntPtr.Zero) return 0;
+        public ulong GetImageBase() => GetImageBase(out _);
 
-            // PEB->ImageBaseAddress is at +0x10 on x64.
-            byte[] baseBuf = new byte[8];
-            if (!NativeMethods.ReadProcessMemory(_hProcess, pbi.PebBaseAddress + 0x10, baseBuf, (IntPtr)8, out _))
+        /// <summary>
+        /// Resolve the main image base and return a compact failure reason when
+        /// Windows does not expose a readable/valid PEB image pointer.
+        /// </summary>
+        public ulong GetImageBase(out string diagnostic)
+        {
+            bool targetIs32Bit = IntPtr.Size == 4;
+            if (NativeMethods.IsWow64Process2(_hProcess, out ushort processMachine, out ushort nativeMachine))
+                targetIs32Bit = processMachine == NativeMethods.IMAGE_FILE_MACHINE_I386 ||
+                    (processMachine == NativeMethods.IMAGE_FILE_MACHINE_UNKNOWN &&
+                     nativeMachine == NativeMethods.IMAGE_FILE_MACHINE_I386);
+
+            IntPtr pebAddress;
+            int status;
+            int returned;
+            bool useWow64Peb = IntPtr.Size == 8 && targetIs32Bit;
+            if (useWow64Peb)
+            {
+                status = NativeMethods.NtQueryInformationProcessPointer(
+                    _hProcess, NativeMethods.ProcessWow64Information,
+                    out pebAddress, IntPtr.Size, out returned);
+            }
+            else
+            {
+                var pbi = new NativeMethods.PROCESS_BASIC_INFORMATION();
+                status = NativeMethods.NtQueryInformationProcess(
+                    _hProcess, 0 /* ProcessBasicInformation */, ref pbi,
+                    Marshal.SizeOf<NativeMethods.PROCESS_BASIC_INFORMATION>(), out returned);
+                pebAddress = pbi.PebBaseAddress;
+            }
+
+            if (status != 0 || pebAddress == IntPtr.Zero)
+            {
+                diagnostic = $"NtQueryInformationProcess status=0x{status:X8}, returned={returned}, PEB=0x{NativeMethods.ToUInt64(pebAddress):X}, WOW64={useWow64Peb}";
                 return 0;
-            ulong imageBase = BitConverter.ToUInt64(baseBuf, 0);
-            if (imageBase == 0) return 0;
+            }
+
+            // PEB->ImageBaseAddress is pointer-sized and has a different offset in
+            // the two layouts: +0x08 on x86, +0x10 on x64. A 64-bit host launching
+            // PE32 has two PEBs; ProcessWow64Information above selects PEB32.
+            int pointerSize = targetIs32Bit ? 4 : 8;
+            int imageBaseOffset = targetIs32Bit ? 0x08 : 0x10;
+            byte[] baseBuf = new byte[pointerSize];
+            if (!NativeMethods.ReadProcessMemory(_hProcess,
+                    pebAddress + imageBaseOffset, baseBuf,
+                    (IntPtr)pointerSize, out IntPtr bytesRead) ||
+                bytesRead.ToInt64() != pointerSize)
+            {
+                diagnostic = $"PEB image-base read failed (error {Marshal.GetLastWin32Error()}, PEB=0x{NativeMethods.ToUInt64(pebAddress):X}, offset=0x{imageBaseOffset:X}, read={bytesRead.ToInt64()}/{pointerSize})";
+                return 0;
+            }
+            ulong imageBase = pointerSize == 4
+                ? BitConverter.ToUInt32(baseBuf, 0)
+                : BitConverter.ToUInt64(baseBuf, 0);
+            if (imageBase == 0)
+            {
+                diagnostic = $"PEB image-base pointer was zero (PEB=0x{NativeMethods.ToUInt64(pebAddress):X}, offset=0x{imageBaseOffset:X})";
+                return 0;
+            }
 
             // Validate: the image must start with 'MZ'.
             byte[] mz = new byte[2];
-            if (!NativeMethods.ReadProcessMemory(_hProcess, (IntPtr)unchecked((long)imageBase), mz, (IntPtr)2, out _))
+            if (!NativeMethods.ReadProcessMemory(_hProcess, NativeMethods.ToIntPtr(imageBase),
+                    mz, (IntPtr)2, out _))
+            {
+                diagnostic = $"image base 0x{imageBase:X} was unreadable (error {Marshal.GetLastWin32Error()})";
                 return 0;
-            if (mz[0] != 0x4D || mz[1] != 0x5A) return 0; // 'M','Z'
+            }
+            if (mz[0] != 0x4D || mz[1] != 0x5A)
+            {
+                diagnostic = $"image base 0x{imageBase:X} did not contain MZ (bytes {mz[0]:X2} {mz[1]:X2})";
+                return 0;
+            }
+            diagnostic = $"PEB=0x{NativeMethods.ToUInt64(pebAddress):X}, offset=0x{imageBaseOffset:X}, WOW64={useWow64Peb}";
             return imageBase;
         }
 

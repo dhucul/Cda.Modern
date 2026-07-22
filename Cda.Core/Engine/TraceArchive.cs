@@ -21,7 +21,7 @@ namespace Cda.Core.Engine
         public const string FileExtension = ".cdatrace";
 
         private const uint Magic = 0x54414443; // 'C''D''A''T'
-        private const int Version = 1;
+        private const int Version = 2;
 
         public static void Save(string path, TraceDataset ds)
         {
@@ -40,6 +40,7 @@ namespace Cda.Core.Engine
                 w.Write(m.BaseAddress);
                 w.Write(m.Size);
                 WriteOpt(w, m.Path);
+                w.Write(m.PreferredBaseAddress);
             }
 
             w.Write(ds.Functions.Count);
@@ -47,6 +48,7 @@ namespace Cda.Core.Engine
             {
                 w.Write(f.Address);
                 w.Write(f.ModuleBase);
+                w.Write(f.DisplayAddress);
                 WriteOpt(w, f.Name);
                 w.Write(f.CallCount);
             }
@@ -88,7 +90,8 @@ namespace Cda.Core.Engine
 
             if (r.ReadUInt32() != Magic) throw new InvalidDataException("Not a CDA trace file.");
             int version = r.ReadInt32();
-            if (version != Version) throw new InvalidDataException($"Unsupported CDA trace version {version}.");
+            if (version < 1 || version > Version)
+                throw new InvalidDataException($"Unsupported CDA trace version {version}.");
 
             var ds = new TraceDataset
             {
@@ -103,7 +106,9 @@ namespace Cda.Core.Engine
                 ulong baseAddr = r.ReadUInt64();
                 ulong size = r.ReadUInt64();
                 string? p = ReadOpt(r);
-                ds.Modules.Add(new ModuleInfo(name, baseAddr, size, p));
+                ulong preferredBase = version >= 2 ? r.ReadUInt64() : 0;
+                ds.Modules.Add(new ModuleInfo(name, baseAddr, size, p,
+                    preferredBaseAddress: preferredBase));
             }
 
             int fnCount = r.ReadInt32();
@@ -111,9 +116,11 @@ namespace Cda.Core.Engine
             {
                 ulong addr = r.ReadUInt64();
                 ulong mbase = r.ReadUInt64();
+                ulong displayAddress = version >= 2 ? r.ReadUInt64() : addr;
                 string? nm = ReadOpt(r);
                 long cc = r.ReadInt64();
-                ds.Functions.Add(new TracedFunction(addr, mbase, nm) { CallCount = cc });
+                ds.Functions.Add(new TracedFunction(addr, mbase, nm, displayAddress)
+                    { CallCount = cc });
             }
 
             int recCount = r.ReadInt32();

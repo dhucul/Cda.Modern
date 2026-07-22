@@ -148,7 +148,8 @@ namespace Cda.Core.Engine
                         bool isBp = exCode == NativeMethods.EXCEPTION_BREAKPOINT ||
                                     exCode == NativeMethods.STATUS_WX86_BREAKPOINT;
                         int firstChance = Marshal.ReadInt32(evt, U + (IntPtr.Size == 8 ? 152 : 80)); // dwFirstChance
-                        ulong faultIp = (ulong)Marshal.ReadIntPtr(evt, U + 8 + IntPtr.Size).ToInt64();
+                        ulong faultIp = NativeMethods.ToUInt64(
+                            Marshal.ReadIntPtr(evt, U + 8 + IntPtr.Size));
 
                         if (isBp && !firstBreakpoint)
                         {

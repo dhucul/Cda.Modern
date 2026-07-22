@@ -329,7 +329,7 @@ namespace Cda.Core.Engine
                                     if (isHost)
                                     {
                                         _dialogHostSeen = true;
-                                        ArmDialogs((ulong)baseOfDll.ToInt64(), fn);
+                                        ArmDialogs(NativeMethods.ToUInt64(baseOfDll), fn);
                                     }
                                     else if (!_hooked && _dialogHostSeen)
                                     {

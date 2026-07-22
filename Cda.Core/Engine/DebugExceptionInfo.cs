@@ -80,21 +80,21 @@ namespace Cda.Core.Engine
             if (firstChance != 0 && !fatalEvenFirstChance)
                 return null; // first-chance AV / divide / in-page: wait for last-chance
 
-            ulong faultIp = (ulong)Marshal.ReadIntPtr(evt, u + 8 + ptr).ToInt64();      // ExceptionAddress
+            ulong faultIp = NativeMethods.ToUInt64(Marshal.ReadIntPtr(evt, u + 8 + ptr)); // ExceptionAddress
             int nParams   = Marshal.ReadInt32(evt, u + 8 + 2 * ptr);                    // NumberParameters
             int infoOff   = u + (ptr == 8 ? 32 : 20);                                   // ExceptionInformation[0]
 
             string detail = "";
             if ((code == ACCESS_VIOLATION || code == IN_PAGE_ERROR) && nParams >= 2)
             {
-                ulong kind = (ulong)Marshal.ReadIntPtr(evt, infoOff).ToInt64();
-                ulong addr = (ulong)Marshal.ReadIntPtr(evt, infoOff + ptr).ToInt64();
+                ulong kind = NativeMethods.ToUInt64(Marshal.ReadIntPtr(evt, infoOff));
+                ulong addr = NativeMethods.ToUInt64(Marshal.ReadIntPtr(evt, infoOff + ptr));
                 string verb = kind == 0 ? "reading" : kind == 1 ? "writing" : kind == 8 ? "executing" : "accessing";
                 detail = $" {verb} 0x{addr:X}";
             }
             else if (code == FAIL_FAST && nParams >= 1)
             {
-                ulong sub = (ulong)Marshal.ReadIntPtr(evt, infoOff).ToInt64();
+                ulong sub = NativeMethods.ToUInt64(Marshal.ReadIntPtr(evt, infoOff));
                 detail = $" subcode {sub}{FailFastNote(sub)}";
             }
 

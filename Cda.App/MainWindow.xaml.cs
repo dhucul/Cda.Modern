@@ -379,7 +379,8 @@ namespace Cda.App
             string veh = CaptureVehSelfTest.Run();
             string branch = DialogBranchConfirmerSelfTest.Run();
             string pt = PtDecoderSelfTest.Run();
-            StatusText.Text = $"Self-test · hook: {hook} · capture: {capture} · returns: {returns} · veh: {veh} · branch: {branch} · pt: {pt}";
+            string discovery = CallDiscoverySelfTest.Run();
+            StatusText.Text = $"Self-test · hook: {hook} · capture: {capture} · returns: {returns} · veh: {veh} · branch: {branch} · pt: {pt} · discovery: {discovery}";
         }
 
         private void LoadDemo()
@@ -475,7 +476,8 @@ namespace Cda.App
                         return (fs, es);
                     });
 
-                    var module = new ModuleInfo(name, pe.PreferredImageBase, pe.SizeOfImage, path);
+                    var module = new ModuleInfo(name, pe.PreferredImageBase, pe.SizeOfImage, path,
+                        preferredBaseAddress: pe.PreferredImageBase);
                     _currentPe = pe;
                     _is64 = is64;
                     _liveDataset = null;
@@ -592,7 +594,8 @@ namespace Cda.App
             }
 
             var pe = PeImage.FromFile(bytes);
-            var module = new ModuleInfo(name, pe.PreferredImageBase, pe.SizeOfImage, path);
+            var module = new ModuleInfo(name, pe.PreferredImageBase, pe.SizeOfImage, path,
+                preferredBaseAddress: pe.PreferredImageBase);
 
             // Managed (.NET) image: its executable sections are IL + metadata, not
             // native code, so the Iced call-site scan would produce garbage functions.
@@ -942,19 +945,17 @@ namespace Cda.App
             if (dlg.ShowDialog() != true) return;
             string exe = dlg.FileName;
 
-            // Pre-launch bitness gate. Managed capture is bitness-locked (ClrMD's live
-            // attach needs a same-bitness CDA). A .NET Core app's .exe is a NATIVE apphost
-            // whose machine is authoritative, so we can refuse a mismatch WITHOUT even
-            // launching it. A managed/AnyCPU image's file bitness may not reflect how it
-            // actually runs, so those are launched and checked at runtime (after attach).
+            // Managed discovery is unavailable for 32-bit .NET targets because
+            // ClrMD's DAC attach is same-bitness and CDA now ships one x64 host.
+            // A native .NET apphost has an authoritative machine type, so reject
+            // PE32 before launch. AnyCPU images are checked after runtime attach.
             try
             {
                 var probe = ProbePeHeader(exe);
-                if (!probe.IsManaged && probe.Is64Bit != Environment.Is64BitProcess)
+                if (!probe.IsManaged && !probe.Is64Bit)
                 {
-                    string need = probe.Is64Bit ? "x64" : "x86";
-                    Diag($"{System.IO.Path.GetFileName(exe)} is a {need} executable, but this is the {(Environment.Is64BitProcess ? "x64" : "x86")} CDA build — managed capture is bitness-locked (ClrMD). Run the {need} build of CDA. (Not launched.)");
-                    if (StatusText != null) StatusText.Text = $"That's a {need} app — run the {need} CDA build for managed capture (not launched).";
+                    Diag($"{System.IO.Path.GetFileName(exe)} is a 32-bit .NET apphost. CDA's x64 build can capture its native calls, but ClrMD cannot discover its managed methods cross-bitness. (Not launched.)");
+                    if (StatusText != null) StatusText.Text = "32-bit .NET managed capture is unavailable; use a native capture mode.";
                     return;
                 }
             }
@@ -1030,11 +1031,10 @@ namespace Cda.App
                 // current capture — on a mismatch, stop the target we launched (it can't be
                 // captured from this build) and leave any running trace untouched.
                 var session = await Task.Run(() => LiveSession.Attach(pid));
-                if (Environment.Is64BitProcess != session.Is64Bit)
+                if (!session.Is64Bit)
                 {
-                    string need = session.Is64Bit ? "x64" : "x86";
-                    Diag($"the launched target is a {need} .NET process, but this is the {(Environment.Is64BitProcess ? "x64" : "x86")} CDA build — managed capture is bitness-locked (ClrMD). Stopped it; run the {need} build of CDA and Launch .NET & capture again.");
-                    if (StatusText != null) StatusText.Text = $"That's a {need} .NET app — run the {need} CDA build to capture it (the launched process was stopped).";
+                    Diag("the launched target is a 32-bit .NET process. CDA's x64 build can capture native calls, but ClrMD cannot discover managed methods cross-bitness. The launched process was stopped.");
+                    if (StatusText != null) StatusText.Text = "32-bit .NET managed capture is unavailable; use a native capture mode.";
                     session.Dispose();
                     try { TargetProcess.Kill(pid); } catch { /* best effort */ }
                     return;
@@ -1072,18 +1072,14 @@ namespace Cda.App
         {
             if (_session == null) return;
 
-            // Managed capture requires a SAME-BITNESS CDA build. ClrMD's live attach loads
-            // a bitness-specific DAC into CDA's own process, so it fails with "Mismatched
-            // architecture" across bitness — a 64-bit CDA can't discover a 32-bit .NET
-            // target's JIT'd method addresses, and vice versa. (Native hooking itself is
-            // cross-bitness — the x64 host hooks WOW64 targets fine — so this limit is only
-            // on discovering managed methods, not on hooking them.) Confirmed by repro.
-            if (Environment.Is64BitProcess != _session.Is64Bit)
+            // ClrMD loads a bitness-specific DAC into CDA, so the x64-only host
+            // cannot discover a 32-bit .NET target's JIT method addresses. Native
+            // hooking remains cross-bitness and is available for that process.
+            if (!_session.Is64Bit)
             {
-                string need = _session.Is64Bit ? "x64" : "x86";
-                Diag($"managed capture needs the {need} CDA build for this {need} .NET target — ClrMD's live attach is bitness-locked (\"Mismatched architecture\"). Native captures (Start capture / Capture Windows API / imports) DO work cross-bitness; only discovering managed method names/addresses requires a same-bitness CDA.");
+                Diag("managed capture is unavailable for this 32-bit .NET target because ClrMD's DAC attach is bitness-locked. Native captures (Start capture / Capture Windows API / imports) work from the x64 host.");
                 if (StatusText != null)
-                    StatusText.Text = $"This is a {need} .NET target — run the {need} build of CDA to capture managed calls (native capture buttons work cross-bitness).";
+                    StatusText.Text = "32-bit .NET managed capture is unavailable; native capture modes still work.";
                 return;
             }
 
@@ -1554,8 +1550,8 @@ namespace Cda.App
             System.Windows.Input.Mouse.OverrideCursor = System.Windows.Input.Cursors.Wait;
 
             // === instrument BEFORE the first instruction runs ================
-            ulong imageBase = proc.GetImageBase();
-            _diag.Add($"image base=0x{imageBase:X}");
+            ulong imageBase = proc.GetImageBase(out string imageBaseProbe);
+            _diag.Add($"image base=0x{imageBase:X} ({imageBaseProbe})");
             if (imageBase != 0)
             {
                 try
@@ -1566,7 +1562,8 @@ namespace Cda.App
                     var (funcs, edges) = await Task.Run(() => DiscoverModuleSuspended(exeBytes, exe, imageBase));
                     _diag.Add($"suspended discovery (on-disk image, rebased to 0x{imageBase:X}): {funcs.Count} functions, {edges.Count} call sites");
 
-                    var discovered = BuildUiDataset(name, imageBase, exe.SizeOfImage, path, funcs, edges);
+                    var discovered = BuildUiDataset(name, imageBase, exe.PreferredImageBase,
+                        exe.SizeOfImage, path, funcs, edges);
                     // NOTE: the Strings tab is filled AFTER the target is running (see the
                     // background scan post-resume) — mining strings disassembles the image
                     // and must never sit in the suspended/arm/resume critical path.
@@ -1608,8 +1605,8 @@ namespace Cda.App
                             ? $"bisection test: arming {Math.Min(candidates.Count, StartupTraceFunctions)} suspect hook(s) (hidden)…"
                             : $"startup trace: arming up to {Math.Min(candidates.Count, StartupTraceFunctions)} function(s)…");
 
-                        // Pass the main module so the entry-point guard can do its
-                        // authoritative .pdata check even though we're pre-loader:
+                        // Pass the main module so the entry-point guard can use its
+                        // strong .pdata checks even though we're pre-loader:
                         // the process is still suspended here, so live module
                         // enumeration inside Start would come back empty and the
                         // guard would silently fall back to a weak heuristic that
@@ -2421,7 +2418,8 @@ namespace Cda.App
             ulong delta = unchecked(actualBase - exe.PreferredImageBase);
             var funcs = new List<TracedFunction>(rawFuncs.Count);
             foreach (var f in rawFuncs)
-                funcs.Add(new TracedFunction(unchecked(f.Address + delta), actualBase, f.Name));
+                funcs.Add(new TracedFunction(unchecked(f.Address + delta), actualBase, f.Name,
+                    displayAddress: f.DisplayAddress));
             var edges = new List<(ulong Site, ulong Target)>(rawEdges.Count);
             foreach (var (s, t) in rawEdges)
                 edges.Add((unchecked(s + delta), unchecked(t + delta)));
@@ -2429,11 +2427,12 @@ namespace Cda.App
         }
 
         private static TraceDataset BuildUiDataset(
-            string name, ulong imageBase, ulong size, string path,
+            string name, ulong imageBase, ulong preferredBase, ulong size, string path,
             List<TracedFunction> funcs, List<(ulong Site, ulong Target)> edges)
         {
             var ds = new TraceDataset { TimeStart = 0, TimeEnd = 1 };
-            ds.Modules.Add(new ModuleInfo(name, imageBase, size, path));
+            ds.Modules.Add(new ModuleInfo(name, imageBase, size, path,
+                preferredBaseAddress: preferredBase));
             ds.Functions.AddRange(funcs);
             int n = Math.Max(1, edges.Count);
             for (int i = 0; i < edges.Count; i++)
