@@ -255,7 +255,7 @@ namespace Cda.App.Model
         /// <summary>
         /// Point the model at a live, append-only record list <b>by reference</b>,
         /// without copying or sorting it. The caller owns the list and guarantees it
-        /// is (near) time-ordered — a capture drains the ring in call order — so a
+        /// is fully time-ordered (including concurrent ring-writer inversions), so a
         /// live capture never re-copies or re-sorts its whole history on every poll;
         /// it just appends and calls <see cref="SetActiveWindow"/> to refresh the
         /// highlighted tail. Contrast <see cref="SetRecords"/>, which takes ownership

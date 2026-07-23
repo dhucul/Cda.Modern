@@ -41,6 +41,7 @@ namespace Cda.App
         private ModuleMap? _chainResolverMap;          // module map the resolver was built for
         private readonly HashSet<ulong> _autoUnhooked = new(); // callees auto-removed mid-capture as runaways
         private readonly Dictionary<ulong, long> _runawayTotals = new(); // raw/unfiltered calls per callee for safety decisions
+        private long _captureLossBaseline; // cumulative RecordsLost value at the start of the current clear window
         private readonly List<string> _diag = new(); // step-by-step log, included in Copy results
         private DebugLoadCapture? _dllCapture; // active DLL-at-load capture, if any
         private LaunchApiCapture? _apiLaunch; // active launch-and-hook-imports-from-startup capture, if any
@@ -2295,7 +2296,7 @@ namespace Cda.App
 
             if (!_childView || pid != _childSelectedPid) return;
 
-            _captured.AddRange(recs);
+            AppendCapturedTimeOrdered(recs);
             TrimCapturedToChild();
             CallList.AddRecords(recs);
             FunctionList.AddCounts(recs);
@@ -2350,7 +2351,7 @@ namespace Cda.App
             _selectedFunctionAddr = 0;
 
             _captured.Clear();
-            _captured.AddRange(t.Records);
+            AppendCapturedTimeOrdered(t.Records);
             _maxCursorSeen = 0;
 
             SetCallersTarget(0);
@@ -3365,7 +3366,7 @@ namespace Cda.App
         {
             if (recs.Count == 0 || _hwbp == null) return;
 
-            _captured.AddRange(recs);
+            AppendCapturedTimeOrdered(recs);
             CallList.AddRecords(recs);
             FunctionList.AddCounts(recs);
             FoldCallers(recs);
@@ -3515,7 +3516,7 @@ namespace Cda.App
             // loss; retain the surviving sample and finish this hook immediately.
             if (focused)
             {
-                if (cap.RecordsLost > 0 && top == _captureFocus && !_autoUnhooked.Contains(top))
+                if (RecordsLostSinceClear(cap) > 0 && top == _captureFocus && !_autoUnhooked.Contains(top))
                 {
                     long focusedTotal = _runawayTotals.TryGetValue(top, out long ft) ? ft : topCount;
                     TryAutoUnhook(cap, top, focusedTotal);
@@ -3542,7 +3543,11 @@ namespace Cda.App
         {
             _autoUnhooked.Clear();
             _runawayTotals.Clear();
+            _captureLossBaseline = _capture?.RecordsLost ?? 0;
         }
+
+        private long RecordsLostSinceClear(CaptureSession cap) =>
+            Math.Max(0, cap.RecordsLost - _captureLossBaseline);
 
         // Remove one hooked callee and note it. Returns nothing; UnhookFunction is
         // the only mutation and it's idempotent per address via _autoUnhooked.
@@ -4942,6 +4947,46 @@ namespace Cda.App
             recs.RemoveAll(r => !cond.Matches(r, ResolveCalleeName));
         }
 
+        // Keep the live model's backing list globally time-sorted without restoring
+        // the old whole-history Sort on every poll. The usual single-threaded batch
+        // takes the allocation-free append path; concurrent claim/timestamp inversions
+        // sort only the incoming batch, and a rare boundary inversion is merged in O(n).
+        private void AppendCapturedTimeOrdered(List<CallRecord> records)
+        {
+            if (records.Count == 0) return;
+
+            List<CallRecord> ordered = records;
+            for (int i = 1; i < records.Count; i++)
+            {
+                if (records[i - 1].Time.CompareTo(records[i].Time) <= 0) continue;
+                ordered = new List<CallRecord>(records);
+                ordered.Sort(static (a, b) => a.Time.CompareTo(b.Time));
+                break;
+            }
+
+            int oldCount = _captured.Count;
+            if (oldCount == 0 || _captured[oldCount - 1].Time.CompareTo(ordered[0].Time) <= 0)
+            {
+                _captured.AddRange(ordered);
+                return;
+            }
+
+            // Both ranges are sorted. Grow the destination, then merge backwards so
+            // existing CallRecord objects (used by selection/navigation) stay intact.
+            _captured.AddRange(ordered);
+            int left = oldCount - 1;
+            int right = ordered.Count - 1;
+            int write = _captured.Count - 1;
+            while (left >= 0 && right >= 0)
+            {
+                if (_captured[left].Time.CompareTo(ordered[right].Time) > 0)
+                    _captured[write--] = _captured[left--];
+                else
+                    _captured[write--] = ordered[right--];
+            }
+            while (right >= 0) _captured[write--] = ordered[right--];
+        }
+
         private void OnCaptureConditionChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
         {
             string text = CaptureCondBox.Text ?? "";
@@ -5121,6 +5166,10 @@ namespace Cda.App
             // recording from where it is; only this stale batch is discarded.
             if (clearGen != _captureClearGen)
             {
+                // DrainDecoded may have incremented the session's cumulative loss
+                // count after Clear calls took its snapshot. This discarded batch is
+                // wholly pre-clear, so advance the baseline past its loss as well.
+                _captureLossBaseline = cap.RecordsLost;
                 FinishAutoUnhookedCapture(cap);
                 return;
             }
@@ -5172,7 +5221,7 @@ namespace Cda.App
             }
 
             if (_captured.Count == 0) _diag.Add($"poll: first {recs.Count} record(s) decoded");
-            _captured.AddRange(recs);
+            AppendCapturedTimeOrdered(recs);
             CallList.AddRecords(recs);
             FunctionList.AddCounts(recs);
             // Caller graph: chains were resolved on the worker thread, so this is now
@@ -5198,8 +5247,9 @@ namespace Cda.App
                 _model.SetActiveWindow(_captured[from].Time, _captured[_captured.Count - 1].Time + 1e-9);
                 GraphView.RefreshActive();
             }
-            string lost = cap.RecordsLost > 0
-                ? $" · {cap.RecordsLost} dropped (target outran the poll)"
+            long recordsLost = RecordsLostSinceClear(cap);
+            string lost = recordsLost > 0
+                ? $" · {recordsLost} dropped (target outran the poll)"
                 : "";
             string runaway = _autoUnhooked.Count > 0
                 ? $" · {_autoUnhooked.Count} runaway hook(s) auto-removed"
@@ -5263,7 +5313,7 @@ namespace Cda.App
                 {
                     var tail = cap.Poll();
                     ApplyCaptureCondition(tail);
-                    _captured.AddRange(tail);
+                    AppendCapturedTimeOrdered(tail);
                     CallList.AddRecords(tail);
                     FunctionList.AddCounts(tail);
                     FoldCallers(tail);
@@ -5409,6 +5459,7 @@ namespace Cda.App
             // fresh observation window for hooks that are still installed. Keep
             // _autoUnhooked intact because those hooks cannot be restored mid-session.
             _runawayTotals.Clear();
+            _captureLossBaseline = _capture?.RecordsLost ?? 0;
             FunctionList.ResetCounts(); // zeroes counts AND first-call ranks (resets to "show all")
             // Optionally show only the calls captured SINCE the clear on the left, too:
             // hide every function with no post-clear calls, and (live) reveal each one as
