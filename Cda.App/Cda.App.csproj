@@ -13,7 +13,7 @@
     <!-- Product version. Kept in lockstep with the installer version in
          tools\installer\Cda.iss. The About/Help window and the crash-log header
          read this assembly version, so bump both together each release. -->
-    <Version>1.19.0</Version>
+    <Version>1.20.0</Version>
 
     <!-- One x64 host analyzes and instruments both native x64 and WOW64 x86
          targets. 32-bit managed-method discovery is the sole exception because
