@@ -5169,6 +5169,7 @@ namespace Cda.App
                 // DrainDecoded may have incremented the session's cumulative loss
                 // count after Clear calls took its snapshot. This discarded batch is
                 // wholly pre-clear, so advance the baseline past its loss as well.
+                cap.ResetReturnPairingForClear();
                 _captureLossBaseline = cap.RecordsLost;
                 FinishAutoUnhookedCapture(cap);
                 return;
@@ -5387,6 +5388,15 @@ namespace Cda.App
             // the _capture poll loop reads this; the callback-driven captures — hardware
             // bp and child-follow — run on the UI thread, so it's a harmless no-op there.)
             _captureClearGen++;
+
+            // When the poll loop is idle, advance its ring cursor to the writer's
+            // current claim before clearing the host-side views. Without this, calls
+            // already waiting between timer ticks (and any loss they caused) would be
+            // decoded by the next poll and incorrectly reappear as post-clear data.
+            // An in-flight poll owns the cursor; its generation mismatch below drops
+            // that batch instead.
+            if (_capture != null && !_polling)
+                _capture.DiscardPendingForClear();
 
             // Child-follow drives the views from the SELECTED child's retained records
             // (not _captured alone), so reset that target's records + running count too;

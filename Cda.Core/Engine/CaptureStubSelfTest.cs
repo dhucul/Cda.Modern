@@ -58,14 +58,23 @@ namespace Cda.Core.Engine
             mem.Flush(stub, stubBytes.Length);
 
             var fn = Marshal.GetDelegateForFunctionPointer<IntFunc>((IntPtr)unchecked((long)func));
-            const int n = 5;
+            int stale = buffer.SlotCount + 3; // force pre-clear loss as well as pending calls
             int lastRet = 0;
+            for (int i = 0; i < stale; i++) lastRet = fn();
+
+            uint readSeq = 0;
+            if (!buffer.DiscardSince(mem, ref readSeq, out int lostAtClear))
+                return "FAIL: clear boundary could not read the ring cursor.";
+            int expectedLostAtClear = stale - buffer.SlotCount;
+            if (lostAtClear != expectedLostAtClear)
+                return $"FAIL: clear boundary reported {lostAtClear} lost record(s), expected {expectedLostAtClear}.";
+
+            const int n = 5;
             for (int i = 0; i < n; i++) lastRet = fn();
             GC.KeepAlive(fn);
 
             hook.Remove();
 
-            uint readSeq = 0;
             byte[] data = buffer.DrainSince(mem, ref readSeq, out _);
             var records = RingBufferReader.Decode(data, qpcBase: 0, qpcFrequency: 1.0);
 

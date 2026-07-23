@@ -601,6 +601,30 @@ namespace Cda.Core.Engine
         }
 
         /// <summary>
+        /// Establish a Clear calls boundary while no poll is running. Pending claims
+        /// are discarded without copying or decoding their records; claims made after
+        /// the cursor snapshot remain visible to the next poll. Pre-clear loss is
+        /// folded into the cumulative counter so the caller can baseline it away.
+        /// </summary>
+        public bool DiscardPendingForClear()
+        {
+            bool advanced = _buffer.DiscardSince(_code, ref _readSeq, out int lost);
+            if (lost > 0) RecordsLost += lost;
+            ResetReturnPairingForClear();
+            return advanced;
+        }
+
+        /// <summary>
+        /// Drop call/return correlations from the previous clear window. Called
+        /// directly by an idle clear and after a poll batch invalidated by a clear.
+        /// </summary>
+        public void ResetReturnPairingForClear()
+        {
+            _outstanding.Clear();
+            _outstandingOrder.Clear();
+        }
+
+        /// <summary>
         /// Finish a batch returned by <see cref="DrainDecoded"/>: enrich captured
         /// pointers and fold return records into their corresponding calls.
         /// </summary>

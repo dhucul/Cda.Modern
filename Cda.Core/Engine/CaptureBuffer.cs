@@ -79,9 +79,35 @@ namespace Cda.Core.Engine
         /// <summary>The monotonically increasing count of slots ever claimed.</summary>
         public uint ReadClaimSeq(ICodeMemory mem)
         {
+            return TryReadClaimSeq(mem, out uint claimSeq) ? claimSeq : 0;
+        }
+
+        private bool TryReadClaimSeq(ICodeMemory mem, out uint claimSeq)
+        {
+            claimSeq = 0;
             Span<byte> hdr = stackalloc byte[16];
-            mem.Read(ControlAddress, hdr);
-            return BinaryPrimitives.ReadUInt32LittleEndian(hdr.Slice(8));
+            if (mem.Read(ControlAddress, hdr) < 16) return false;
+            claimSeq = BinaryPrimitives.ReadUInt32LittleEndian(hdr.Slice(8));
+            return true;
+        }
+
+        /// <summary>
+        /// Advance <paramref name="readSeq"/> to the writer's current claim without
+        /// copying or decoding the pending slots. Used to establish a precise Clear
+        /// calls boundary while capture continues. Claims made after this snapshot
+        /// remain pending for the next normal drain.
+        /// </summary>
+        public bool DiscardSince(ICodeMemory mem, ref uint readSeq, out int recordsLost)
+        {
+            recordsLost = 0;
+            if (!TryReadClaimSeq(mem, out uint claim)) return false;
+
+            uint delta = claim - readSeq; // unsigned subtraction: wrap-safe
+            uint slots = (uint)SlotCount;
+            if (delta > slots)
+                recordsLost = (int)Math.Min(delta - slots, (uint)int.MaxValue);
+            readSeq = claim;
+            return true;
         }
 
         /// <summary>
@@ -96,12 +122,8 @@ namespace Cda.Core.Engine
         {
             recordsLost = 0;
 
-            // Read the control block directly so we can tell a real zero counter
-            // from a failed read (e.g. the target has exited): if we can't read the
-            // full 16-byte control block, there's nothing to drain.
-            Span<byte> hdr = stackalloc byte[16];
-            if (mem.Read(ControlAddress, hdr) < 16) return Array.Empty<byte>();
-            uint claim = BinaryPrimitives.ReadUInt32LittleEndian(hdr.Slice(8));
+            // Tell a real zero counter from a failed read (e.g. target exit).
+            if (!TryReadClaimSeq(mem, out uint claim)) return Array.Empty<byte>();
 
             uint delta = claim - readSeq;          // unsigned subtraction: wrap-safe
             if (delta == 0) return Array.Empty<byte>();
@@ -110,7 +132,7 @@ namespace Cda.Core.Engine
             uint start = readSeq;
             if (delta > slots)                     // writer lapped the reader
             {
-                recordsLost = (int)(delta - slots);
+                recordsLost = (int)Math.Min(delta - slots, (uint)int.MaxValue);
                 start = claim - slots;             // keep only the freshest full ring
                 delta = slots;
             }

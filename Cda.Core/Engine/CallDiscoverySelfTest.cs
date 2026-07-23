@@ -5,6 +5,7 @@ using Cda.Core.Cpu;
 using Cda.Core.Memory;
 using Cda.Core.Model;
 using Cda.Core.Pe;
+using Cda.Core.Process;
 
 namespace Cda.Core.Engine
 {
@@ -117,6 +118,25 @@ namespace Cda.Core.Engine
                 new X64Architecture(), pdataFunctions, pdataEdges, maxEdges: 32);
             if (!HasEdge(pdataEdges, PreferredBase + 0x1000, PreferredBase + 0x1020))
                 return "FAIL: exception metadata consumed a record beyond .pdata.";
+
+            // The live hook guard consumes the same metadata independently of the
+            // scanner. Poison the bytes immediately after the real .pdata record;
+            // an unbounded read treats them as a second function body and rejects
+            // the genuine leaf target at RVA 0x1020.
+            byte[] mappedPdata = new byte[0x4000];
+            Array.Copy(malformedPdata, 0, mappedPdata, 0, 0x200);
+            Array.Copy(malformedPdata, 0x200, mappedPdata, 0x1000, 0x200);
+            Array.Copy(malformedPdata, 0x400, mappedPdata, 0x2000, 12);
+            Array.Copy(malformedPdata, 0x40C, mappedPdata, 0x200C, 12);
+
+            var guardModule = new ModuleInfo(
+                "pdata.dll", LiveBase, (ulong)mappedPdata.Length);
+            var guard = new EntryPointGuard(
+                new BufferMemorySource(mappedPdata, LiveBase, is64Bit: true),
+                new ModuleMap(new[] { guardModule }), isX64: true,
+                new[] { LiveBase + 0x1020 });
+            if (!guard.IsHookable(LiveBase + 0x1020, out _, out string? reason))
+                return "FAIL: hook guard consumed bytes beyond .pdata: " + reason;
 
             return null;
         }

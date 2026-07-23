@@ -128,12 +128,19 @@ namespace Cda.Core.Engine
                 if (!_x64 || !pe.Is64Bit) return result;
 
                 var (pdataRva, pdataSize) = pe.GetDirectory(PeImage.DataDirectory.Exception);
-                if (pdataRva == 0 || pdataSize == 0) return result;
+                if (pdataRva == 0 || pdataSize < 12) return result;
+                if (!TryGetMappedSectionBounds(pe, module, pdataRva,
+                        out ulong pdataAddress, out ulong pdataAvailable))
+                    return result;
 
                 const uint MaxPdataBytes = 8u * 1024 * 1024;
-                int size = (int)Math.Min(pdataSize, MaxPdataBytes);
+                int size = (int)Math.Min(
+                    Math.Min((ulong)pdataSize, pdataAvailable), MaxPdataBytes);
+                size -= size % 12;
+                if (size < 12) return result;
+
                 byte[] pdata = new byte[size];
-                int read = _memory.ReadMemory(module.BaseAddress + pdataRva, pdata);
+                int read = _memory.ReadMemory(pdataAddress, pdata);
                 // A short/failed read must NOT zero out coverage: leave the table
                 // absent so the fallback path applies instead of rejecting all.
                 if (read < 12) return result;
@@ -168,6 +175,42 @@ namespace Cda.Core.Engine
                 // fallback path applies — never a hard reject of the whole module.
             }
             return result;
+        }
+
+        // Resolve metadata from a live mapped image, but expose only bytes that
+        // remain in the RVA's containing section and in the module/image bounds.
+        // A corrupt directory size must never make the hook-safety guard interpret
+        // section padding, a later section, or an adjacent mapping as .pdata.
+        private static bool TryGetMappedSectionBounds(
+            PeImage pe, ModuleInfo module, uint rva,
+            out ulong address, out ulong available)
+        {
+            address = 0;
+            available = 0;
+            if (rva >= pe.SizeOfImage || module.BaseAddress > ulong.MaxValue - rva)
+                return false;
+
+            foreach (var section in pe.Sections)
+            {
+                if (rva < section.VirtualAddress) continue;
+                ulong delta = (ulong)rva - section.VirtualAddress;
+                ulong sectionSize = section.VirtualSize != 0
+                    ? section.VirtualSize
+                    : section.RawSize;
+                if (delta >= sectionSize) continue;
+
+                available = Math.Min(sectionSize - delta, (ulong)pe.SizeOfImage - rva);
+                if (module.Size != 0)
+                {
+                    if (rva >= module.Size) return false;
+                    available = Math.Min(available, module.Size - rva);
+                }
+                if (available == 0) return false;
+
+                address = module.BaseAddress + rva;
+                return true;
+            }
+            return false;
         }
 
         // 5-byte "call $+5" (E8 00 00 00 00) ending exactly at <address>: the
