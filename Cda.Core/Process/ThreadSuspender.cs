@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Runtime.InteropServices;
 
 namespace Cda.Core.Process
@@ -23,26 +24,54 @@ namespace Cda.Core.Process
         public ThreadSuspender(int pid)
         {
             IntPtr snap = NativeMethods.CreateToolhelp32Snapshot(NativeMethods.TH32CS_SNAPTHREAD, 0);
-            if (snap == NativeMethods.INVALID_HANDLE_VALUE) return;
+            if (snap == NativeMethods.INVALID_HANDLE_VALUE)
+                throw new Win32Exception(Marshal.GetLastWin32Error(),
+                    "Could not enumerate target threads.");
             try
             {
                 var te = new NativeMethods.THREADENTRY32
                 {
                     dwSize = (uint)Marshal.SizeOf<NativeMethods.THREADENTRY32>(),
                 };
-                if (!NativeMethods.Thread32First(snap, ref te)) return;
-                do
+                if (!NativeMethods.Thread32First(snap, ref te))
+                    throw new Win32Exception(Marshal.GetLastWin32Error(),
+                        "Could not enumerate target threads.");
+
+                int matched = 0;
+                while (true)
                 {
-                    if (te.th32OwnerProcessID != (uint)pid) continue;
-                    IntPtr h = NativeMethods.OpenThread(NativeMethods.THREAD_SUSPEND_RESUME, false, te.th32ThreadID);
-                    if (h == IntPtr.Zero) continue;
-                    if (NativeMethods.SuspendThread(h) == unchecked((uint)-1))
+                    if (te.th32OwnerProcessID == (uint)pid)
                     {
-                        NativeMethods.CloseHandle(h);
-                        continue;
+                        matched++;
+                        IntPtr h = NativeMethods.OpenThread(NativeMethods.THREAD_SUSPEND_RESUME, false, te.th32ThreadID);
+                        if (h == IntPtr.Zero)
+                            throw new Win32Exception(Marshal.GetLastWin32Error(),
+                                $"Could not open target thread {te.th32ThreadID}.");
+                        if (NativeMethods.SuspendThread(h) == unchecked((uint)-1))
+                        {
+                            NativeMethods.CloseHandle(h);
+                            throw new Win32Exception(Marshal.GetLastWin32Error(),
+                                $"Could not suspend target thread {te.th32ThreadID}.");
+                        }
+                        _suspended.Add(h);
                     }
-                    _suspended.Add(h);
-                } while (NativeMethods.Thread32Next(snap, ref te));
+
+                    if (NativeMethods.Thread32Next(snap, ref te)) continue;
+                    int error = Marshal.GetLastWin32Error();
+                    if (error != NativeMethods.ERROR_NO_MORE_FILES)
+                        throw new Win32Exception(error, "Target thread enumeration was incomplete.");
+                    break;
+                }
+
+                if (matched == 0)
+                    throw new InvalidOperationException("The target has no enumerable threads.");
+            }
+            catch
+            {
+                // Construction did not establish the all-threads-frozen invariant.
+                // Undo every suspension already acquired before propagating failure.
+                Dispose();
+                throw;
             }
             finally
             {

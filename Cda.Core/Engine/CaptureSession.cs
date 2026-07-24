@@ -39,6 +39,7 @@ namespace Cda.Core.Engine
         private ulong _tscBase;
         private bool _haveBase;
         private uint _readSeq;
+        private readonly object _drainGate = new();
 
         // Return-value pairing: a call record is remembered by correlation id until
         // its return record arrives (usually the same poll batch, sometimes a later
@@ -99,7 +100,9 @@ namespace Cda.Core.Engine
 
         /// <summary>True if this session installs return-value capture (a return
         /// stub + per-hook return slot on every inline hook).</summary>
-        public bool CapturesReturns => _captureReturns;
+        private bool ReturnCaptureActive =>
+            _captureReturns && (!_process.Is64Bit || _vehRegistry != 0);
+        public bool CapturesReturns => ReturnCaptureActive;
 
         private CaptureSession(TargetProcess process, RemoteCodeMemory code,
             CaptureBuffer buffer, int argCount, bool captureReturns = false)
@@ -380,7 +383,7 @@ namespace Cda.Core.Engine
             // Return-value capture (opt-in): a private return context (zeroed → free)
             // + a shared return stub; on failure, fall back to entry-only for this hook.
             ulong retStub = 0, retCtx = 0;
-            if (_captureReturns)
+            if (ReturnCaptureActive)
             {
                 try
                 {
@@ -397,15 +400,25 @@ namespace Cda.Core.Engine
                 // so a fault unwinding through its redirected return is fixed up (see
                 // TryRegisterReturnVeh). Write the address, THEN bump the count, so the
                 // in-target handler never reads a half-added entry.
-                if (retCtx != 0 && _vehRegistry != 0 && _vehCount < MaxVehContexts)
+                if (retCtx != 0 && _process.Is64Bit)
                 {
+                    bool registered = false;
                     try
                     {
-                        _code.Write(_vehRegistry + 8 + (ulong)_vehCount * 8, BitConverter.GetBytes(retCtx));
-                        _vehCount++;
-                        _code.Write(_vehRegistry, BitConverter.GetBytes((ulong)_vehCount));
+                        if (_vehRegistry != 0 && _vehCount < MaxVehContexts)
+                        {
+                            int index = _vehCount;
+                            _code.Write(_vehRegistry + 8 + (ulong)index * 8, BitConverter.GetBytes(retCtx));
+                            _code.Write(_vehRegistry, BitConverter.GetBytes((ulong)(index + 1)));
+                            _vehCount = index + 1;
+                            registered = true;
+                        }
                     }
-                    catch { /* best effort — the hook still works without VEH coverage */ }
+                    catch { }
+
+                    // Never redirect an x64 return unless this exact context is in
+                    // the live handler's registry. Entry capture remains usable.
+                    if (!registered) { retStub = 0; retCtx = 0; }
                 }
             }
 
@@ -438,9 +451,9 @@ namespace Cda.Core.Engine
         /// while a call's return is redirected, its on-stack return address points at the
         /// return stub (no <c>.pdata</c>), so an exception unwinding through that live
         /// frame would mis-unwind and crash. The VEH restores such slots before the
-        /// unwind. Best-effort and idempotent-per-session; on any failure return capture
-        /// still works, just without the exception-unwind net. x64 only. Call once, before
-        /// any hook is armed, so the handler is live before the first redirect.
+        /// unwind. Idempotent per session; on any registration failure x64 capture
+        /// remains entry-only. Call once, before any hook is armed, so the handler is
+        /// live before the first redirect.
         /// </summary>
         private void TryRegisterReturnVeh()
         {
@@ -466,8 +479,19 @@ namespace Cda.Core.Engine
                 IntPtr th = NativeMethods.CreateRemoteThread(_process.Handle, IntPtr.Zero, IntPtr.Zero,
                 NativeMethods.ToIntPtr(boot), IntPtr.Zero, 0, out _);
                 if (th == IntPtr.Zero) return; // registry stays 0 → InstallHook skips VEH bookkeeping
-                NativeMethods.WaitForSingleObject(th, 5000); // let AddVectoredExceptionHandler complete
-                NativeMethods.CloseHandle(th);
+                bool registered;
+                try
+                {
+                    uint wait = NativeMethods.WaitForSingleObject(th, 5000);
+                    registered = wait == NativeMethods.WAIT_OBJECT_0 &&
+                        NativeMethods.GetExitCodeThread(th, out uint exitCode) &&
+                        exitCode == 1;
+                }
+                finally
+                {
+                    NativeMethods.CloseHandle(th);
+                }
+                if (!registered) return;
                 _vehRegistry = registry; // only now is the handler live and the registry usable
             }
             catch { _vehRegistry = 0; }
@@ -585,8 +609,12 @@ namespace Cda.Core.Engine
         /// </summary>
         public List<CallRecord> DrainDecoded()
         {
-            byte[] data = _buffer.DrainSince(_code, ref _readSeq, out int lost);
-            if (lost > 0) RecordsLost += lost;
+            byte[] data;
+            lock (_drainGate)
+            {
+                data = _buffer.DrainSince(_code, ref _readSeq, out int lost);
+                if (lost > 0) RecordsLost += lost;
+            }
             if (data.Length < 8) return new List<CallRecord>();
 
             if (!_haveBase)
@@ -597,7 +625,7 @@ namespace Cda.Core.Engine
 
             // TSC frequency is unknown/variable; a nominal 1 GHz scale keeps the
             // timeline monotonic and roughly seconds-shaped. Exact timing later.
-            return RingBufferReader.Decode(data, _tscBase, 1_000_000_000.0);
+            return RingBufferReader.Decode(data, _buffer.RecordSize, _tscBase, 1_000_000_000.0);
         }
 
         /// <summary>
@@ -606,11 +634,16 @@ namespace Cda.Core.Engine
         /// the cursor snapshot remain visible to the next poll. Pre-clear loss is
         /// folded into the cumulative counter so the caller can baseline it away.
         /// </summary>
-        public bool DiscardPendingForClear()
+        public bool DiscardPendingForClear(bool resetReturnPairing = true)
         {
-            bool advanced = _buffer.DiscardSince(_code, ref _readSeq, out int lost);
-            if (lost > 0) RecordsLost += lost;
-            ResetReturnPairingForClear();
+            bool advanced;
+            lock (_drainGate)
+            {
+                advanced = _buffer.DiscardSince(_code, ref _readSeq, out int lost);
+                if (lost > 0) RecordsLost += lost;
+            }
+            if (resetReturnPairing)
+                ResetReturnPairingForClear();
             return advanced;
         }
 
@@ -631,7 +664,7 @@ namespace Cda.Core.Engine
         public List<CallRecord> CompleteDecodedPoll(List<CallRecord> records)
         {
             EnrichDereferences(records);
-            return _captureReturns ? PairReturns(records) : records;
+            return ReturnCaptureActive ? PairReturns(records) : records;
         }
 
         /// <summary>Drain, decode, enrich, and finalize records captured since the last poll.</summary>

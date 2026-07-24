@@ -35,6 +35,8 @@ namespace Cda.App
         private int _maxCursorSeen;  // diagnostic: high-water mark of in-target buffer writes
         private bool _captureBursting; // true while polls are draining a heavy startup flood
         private bool _polling;         // true while a background Poll() is in flight (re-entrancy guard)
+        private TaskCompletionSource<bool>? _pollCompletion; // lets shutdown wait without closing handles under Poll()
+        private bool _closeAfterPoll;  // a close request is waiting for the active poll to yield
         private int _captureClearGen;  // bumped by "Clear calls"; a poll batch decoded across a clear is dropped
         private CaptureChainResolver? _chainResolver;  // worker-thread caller-chain resolver for live polls
         private LiveSession? _chainResolverSession;    // session the resolver was built for (rebuild on change)
@@ -5111,6 +5113,8 @@ namespace Cda.App
             // belongs to the pre-clear trace and must be dropped (see below).
             int clearGen = _captureClearGen;
             _polling = true;
+            _pollCompletion = new TaskCompletionSource<bool>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
             PolledBatch batch;
             try
             {
@@ -5124,7 +5128,7 @@ namespace Cda.App
                 // resolver; disposal was deliberately handed off to this continuation.
                 if (!ReferenceEquals(_capture, cap))
                 {
-                    _polling = false;
+                    FinishPoll();
                     try { cap.Dispose(); } catch { }
                     return;
                 }
@@ -5146,12 +5150,12 @@ namespace Cda.App
             }
             catch (Exception ex)
             {
-                _polling = false;
+                FinishPoll();
                 if (ReferenceEquals(_capture, cap)) { StatusText.Text = "Capture poll error: " + ex.Message; StopCapture(); }
                 else { try { cap.Dispose(); } catch { } } // stopped mid-poll: dispose the orphan
                 return;
             }
-            _polling = false;
+            FinishPoll();
 
             // Capture was stopped or refocused while we were off the UI thread:
             // discard this batch and dispose the session that StopCapture /
@@ -5264,6 +5268,12 @@ namespace Cda.App
             // instead of appearing to capture forever with zero hooks.
             if (cap.HookedCount == 0 && _autoUnhooked.Count > 0)
                 FinishAutoUnhookedCapture(cap);
+        }
+
+        private void FinishPoll()
+        {
+            _polling = false;
+            _pollCompletion?.TrySetResult(true);
         }
 
         private bool FinishAutoUnhookedCapture(CaptureSession cap)
@@ -5389,14 +5399,13 @@ namespace Cda.App
             // bp and child-follow — run on the UI thread, so it's a harmless no-op there.)
             _captureClearGen++;
 
-            // When the poll loop is idle, advance its ring cursor to the writer's
-            // current claim before clearing the host-side views. Without this, calls
-            // already waiting between timer ticks (and any loss they caused) would be
-            // decoded by the next poll and incorrectly reappear as post-clear data.
-            // An in-flight poll owns the cursor; its generation mismatch below drops
-            // that batch instead.
-            if (_capture != null && !_polling)
-                _capture.DiscardPendingForClear();
+            // Advance the ring cursor at the clear boundary even when a poll is in
+            // flight. CaptureSession serializes this snapshot with DrainSince, so a
+            // queued drain cannot consume post-clear calls into the stale batch.
+            // Return pairing is reset here only when idle; an active stale poll owns
+            // that state until its generation-mismatch path resets it below.
+            if (_capture != null)
+                _capture.DiscardPendingForClear(resetReturnPairing: !_polling);
 
             // Child-follow drives the views from the SELECTED child's retained records
             // (not _captured alone), so reset that target's records + running count too;
@@ -5941,6 +5950,24 @@ namespace Cda.App
             DpiText.Text = $"DPI {dpi.PixelsPerInchX:0}×{dpi.PixelsPerInchY:0}  ·  scale {dpi.DpiScaleX * 100:0}%";
         }
 
+        protected override async void OnClosing(System.ComponentModel.CancelEventArgs e)
+        {
+            if (_polling)
+            {
+                e.Cancel = true;
+                if (_closeAfterPoll) return;
+
+                _closeAfterPoll = true;
+                _pollTimer?.Stop();
+                Task? pending = _pollCompletion?.Task;
+                if (pending != null) await pending;
+                Close();
+                return;
+            }
+
+            base.OnClosing(e);
+        }
+
         protected override void OnClosed(EventArgs e)
         {
             _dllCapture?.Stop();
@@ -5950,7 +5977,7 @@ namespace Cda.App
             _hwbp?.WaitForExit(600); // let it clear debug registers + detach before we exit
             DisposeAttachPt(); // stop attach-mode Intel PT tracing (no-op if inactive)
             if (_pollTimer != null) { _pollTimer.Stop(); _pollTimer = null; }
-            if (!_polling) _capture?.Dispose(); // don't close the handle under an in-flight poll at shutdown
+            try { _capture?.Dispose(); } catch { }
             _session?.Dispose();
             DisposeFileMap();
 

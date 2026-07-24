@@ -76,7 +76,7 @@ namespace Cda.Core.Engine
             hook.Remove();
 
             byte[] data = buffer.DrainSince(mem, ref readSeq, out _);
-            var records = RingBufferReader.Decode(data, qpcBase: 0, qpcFrequency: 1.0);
+            var records = RingBufferReader.Decode(data, recordSize, qpcBase: 0, qpcFrequency: 1.0);
 
             if (lastRet != 0x1234)
                 return $"FAIL: function returned 0x{lastRet:X}, expected 0x1234 (trampoline chain broken).";

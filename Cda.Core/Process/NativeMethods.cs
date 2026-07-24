@@ -57,6 +57,12 @@ namespace Cda.Core.Process
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetExitCodeThread(IntPtr thread, out uint exitCode);
+
+        public const uint WAIT_OBJECT_0 = 0;
+
         // Used by the startup trace's auto-bisection to discard a hidden test instance
         // that ran clean (we only want the search verdict, not a survivor left running).
         [DllImport("kernel32.dll", SetLastError = true)]
@@ -265,6 +271,7 @@ namespace Cda.Core.Process
 
         public const uint TH32CS_SNAPTHREAD = 0x00000004;
         public const uint THREAD_SUSPEND_RESUME = 0x0002;
+        public const int ERROR_NO_MORE_FILES = 18;
         public const uint THREAD_GET_CONTEXT = 0x0008;
         public const uint THREAD_SET_CONTEXT = 0x0010;
         public const uint THREAD_QUERY_INFORMATION = 0x0040;

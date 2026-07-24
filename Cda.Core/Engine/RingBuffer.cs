@@ -30,6 +30,10 @@ namespace Cda.Core.Engine
     ///       u32 dataLen
     ///       u8[dataLen] data
     ///   }
+    ///   u32 commitSequence
+    ///   u32 commitSequenceInverse
+    /// The commit footer is publication metadata and is not part of the decoded
+    /// payload.
     /// </summary>
     public static class RingBufferReader
     {
@@ -41,61 +45,67 @@ namespace Cda.Core.Engine
         /// <paramref name="qpcFrequency"/> (ticks per second).
         /// </summary>
         public static List<CallRecord> Decode(
-            ReadOnlySpan<byte> buffer, ulong qpcBase, double qpcFrequency)
+            ReadOnlySpan<byte> buffer, int recordSize, ulong qpcBase, double qpcFrequency)
         {
             var result = new List<CallRecord>();
             double freq = qpcFrequency > 0 ? qpcFrequency : 1.0;
-            int pos = 0;
+            if (recordSize < CaptureStub.CommitBytes)
+                return result;
+            int payloadSize = recordSize - CaptureStub.CommitBytes;
+            if (payloadSize < FixedHeader + 8)
+                return result;
 
-            while (pos + FixedHeader <= buffer.Length)
+            // The target ring is fixed-stride. Decode exactly one logical record
+            // from each committed slot so corrupt metadata in one slot can never
+            // shift the starting point of every record that follows it.
+            for (int slotStart = 0; slotStart <= buffer.Length - recordSize; slotStart += recordSize)
             {
-                int start = pos;
-                ulong ts = BinaryPrimitives.ReadUInt64LittleEndian(buffer.Slice(pos)); pos += 8;
-                ulong src = BinaryPrimitives.ReadUInt64LittleEndian(buffer.Slice(pos)); pos += 8;
-                ulong dst = BinaryPrimitives.ReadUInt64LittleEndian(buffer.Slice(pos)); pos += 8;
-                ulong sp = BinaryPrimitives.ReadUInt64LittleEndian(buffer.Slice(pos)); pos += 8;
-                uint argcRaw = BinaryPrimitives.ReadUInt32LittleEndian(buffer.Slice(pos)); pos += 4;
+                ReadOnlySpan<byte> slot = buffer.Slice(slotStart, payloadSize);
+                int pos = 0;
+                ulong ts = BinaryPrimitives.ReadUInt64LittleEndian(slot.Slice(pos)); pos += 8;
+                ulong src = BinaryPrimitives.ReadUInt64LittleEndian(slot.Slice(pos)); pos += 8;
+                ulong dst = BinaryPrimitives.ReadUInt64LittleEndian(slot.Slice(pos)); pos += 8;
+                ulong sp = BinaryPrimitives.ReadUInt64LittleEndian(slot.Slice(pos)); pos += 8;
+                uint argcRaw = BinaryPrimitives.ReadUInt32LittleEndian(slot.Slice(pos)); pos += 4;
                 bool isReturn = (argcRaw & CaptureStub.KindReturn) != 0;
                 uint argc = argcRaw & ~CaptureStub.KindReturn;
 
-                if (argc > 256) break; // corrupt / wrapped; stop
-                if (pos + 4 > buffer.Length) { pos = start; break; }        // room for the correlation id
-                uint corrId = BinaryPrimitives.ReadUInt32LittleEndian(buffer.Slice(pos)); pos += 4;
-                if (pos + (int)argc * 8 + 4 > buffer.Length) { pos = start; break; }
+                if (argc > 256 || pos + 4 > slot.Length) continue;
+                uint corrId = BinaryPrimitives.ReadUInt32LittleEndian(slot.Slice(pos)); pos += 4;
+                if (pos + (int)argc * 8 + 4 > slot.Length) continue;
 
                 var args = new ulong[argc];
                 for (int i = 0; i < argc; i++)
                 {
-                    args[i] = BinaryPrimitives.ReadUInt64LittleEndian(buffer.Slice(pos));
+                    args[i] = BinaryPrimitives.ReadUInt64LittleEndian(slot.Slice(pos));
                     pos += 8;
                 }
 
                 // Stack snapshot (entry SP upward), for host-side caller walking.
-                if (pos + 4 > buffer.Length) { pos = start; break; }
-                uint stackSlots = BinaryPrimitives.ReadUInt32LittleEndian(buffer.Slice(pos)); pos += 4;
-                if (stackSlots > 4096) break;
-                if (pos + (int)stackSlots * 8 + 4 > buffer.Length) { pos = start; break; }
+                if (pos + 4 > slot.Length) continue;
+                uint stackSlots = BinaryPrimitives.ReadUInt32LittleEndian(slot.Slice(pos)); pos += 4;
+                if (stackSlots > 4096 || pos + (int)stackSlots * 8 + 4 > slot.Length) continue;
                 var snapshot = new ulong[stackSlots];
                 for (int i = 0; i < stackSlots; i++)
                 {
-                    snapshot[i] = BinaryPrimitives.ReadUInt64LittleEndian(buffer.Slice(pos));
+                    snapshot[i] = BinaryPrimitives.ReadUInt64LittleEndian(slot.Slice(pos));
                     pos += 8;
                 }
 
-                uint derefc = BinaryPrimitives.ReadUInt32LittleEndian(buffer.Slice(pos)); pos += 4;
-                if (derefc > 256) break;
+                uint derefc = BinaryPrimitives.ReadUInt32LittleEndian(slot.Slice(pos)); pos += 4;
+                if (derefc > 256) continue;
 
                 var derefs = new List<Dereference>((int)derefc);
                 bool truncated = false;
                 for (int d = 0; d < derefc; d++)
                 {
-                    if (pos + 12 > buffer.Length) { truncated = true; break; }
-                    uint argIndex = BinaryPrimitives.ReadUInt32LittleEndian(buffer.Slice(pos)); pos += 4;
-                    uint kind = BinaryPrimitives.ReadUInt32LittleEndian(buffer.Slice(pos)); pos += 4;
-                    uint len = BinaryPrimitives.ReadUInt32LittleEndian(buffer.Slice(pos)); pos += 4;
-                    if (len > 4096 || pos + (int)len > buffer.Length) { truncated = true; break; }
+                    if (pos + 12 > slot.Length) { truncated = true; break; }
+                    uint argIndex = BinaryPrimitives.ReadUInt32LittleEndian(slot.Slice(pos)); pos += 4;
+                    uint kind = BinaryPrimitives.ReadUInt32LittleEndian(slot.Slice(pos)); pos += 4;
+                    uint len = BinaryPrimitives.ReadUInt32LittleEndian(slot.Slice(pos)); pos += 4;
+                    if (len > 4096 || pos + (int)len > slot.Length) { truncated = true; break; }
 
-                    var data = buffer.Slice(pos, (int)len).ToArray(); pos += (int)len;
+                    var data = slot.Slice(pos, (int)len).ToArray(); pos += (int)len;
                     derefs.Add(new Dereference
                     {
                         ArgumentIndex = (int)argIndex,
@@ -103,7 +113,9 @@ namespace Cda.Core.Engine
                         Data = data,
                     });
                 }
-                if (truncated) { pos = start; break; }
+                // A target record occupies the complete payload region. Reject a
+                // slot whose counts leave trailing bytes or overrun the boundary.
+                if (truncated || pos != slot.Length) continue;
 
                 // Clamp: cross-core rdtsc skew (or the base not being the earliest record)
                 // can make ts < qpcBase; an unsigned subtraction would then wrap to a huge

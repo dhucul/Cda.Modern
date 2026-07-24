@@ -42,9 +42,9 @@ namespace Cda.Core.Engine
     /// (<see cref="BuildReturnVehX64"/>): before any unwind, it restores every
     /// outstanding redirected return address at/above the fault SP to its real value, so
     /// the unwinder sees the correct address. Restoring a slot only un-redirects that one
-    /// call (no crash), so it is always safe. Best-effort — if the handler can't be
-    /// installed, return capture still runs, just without the net. (x86's chain-based SEH
-    /// is unaffected and needs no handler.)
+    /// call (no crash), so it is always safe. If the handler cannot be installed,
+    /// x64 capture stays in entry-only mode; it never redirects a return without
+    /// this safety net. (x86's chain-based SEH is unaffected and needs no handler.)
     ///
     /// Record layout matches <see cref="RingBufferReader"/>.
     /// </summary>
@@ -59,7 +59,7 @@ namespace Cda.Core.Engine
         /// stack"), and decoding string arguments that sit past the few captured
         /// integer args (argument <c>i</c> lives at <c>snapshot[i+1]</c>). 64 words
         /// (512 bytes on x64, 256 on x86) reaches up to ~arg63 and deeper wrapper
-        /// stacks; RecordSize(4) is then 592 bytes, so a 65,536-slot ring is ~38 MB
+        /// stacks; RecordSize(4) is then 600 bytes, so a 65,536-slot ring is ~39 MB
         /// in the target. Raising this deepens both at a linear memory cost; because
         /// it changes the record format, re-run the capture Self-test after changing
         /// it.
@@ -80,6 +80,7 @@ namespace Cda.Core.Engine
         private const int OffArgCount = 32;
         private const int OffCorrelation = 36;
         private const int OffArgs = 40;
+        internal const int CommitBytes = 8;
 
         /// <summary>Per-hook return context laid out in target memory (zero-initialised).</summary>
         internal const int CtxBusy = 0;     // u32: 0 free, 1 owned
@@ -94,7 +95,11 @@ namespace Cda.Core.Engine
              + argCount * 8        // integer args
              + 4                   // stackSlots count
              + StackSlots * 8      // stack snapshot
-             + 4;                  // derefCount
+             + 4                   // derefCount
+             + CommitBytes;        // own claim sequence + bitwise complement, published last
+
+        private static int CommitSequenceOffset(int argCount) => RecordSize(argCount) - CommitBytes;
+        private static int CommitInverseOffset(int argCount) => RecordSize(argCount) - sizeof(uint);
 
         /// <summary>
         /// Build the stub for the address it will be written to. Absolute target
@@ -116,6 +121,8 @@ namespace Cda.Core.Engine
             int stackCountOff = OffArgs + argCount * 8;
             int snapshotOff = stackCountOff + 4;
             int derefCountOff = snapshotOff + StackSlots * 8;
+            int commitSequenceOff = CommitSequenceOffset(argCount);
+            int commitInverseOff = CommitInverseOffset(argCount);
 
             var a = new Assembler(32);
 
@@ -137,6 +144,9 @@ namespace Cda.Core.Engine
 
             a.mov(edi, buf);
             a.add(edi, eax);                   // edi = &slot
+            // Invalidate the previous occupant before touching its payload. The host
+            // accepts a slot only when commitSeq == seq and commitInv == ~seq.
+            a.mov(__dword_ptr[edi + commitInverseOff], ecx);
 
             // timestamp (edx:eax)
             a.rdtsc();
@@ -188,6 +198,12 @@ namespace Cda.Core.Engine
 
             // derefCount = 0 (no in-target pointer-following in this version)
             a.mov(__dword_ptr[edi + derefCountOff], 0);
+
+            // Publish the slot only after every payload field is complete.
+            a.mov(eax, __dword_ptr[edi + OffCorrelation]);
+            a.mov(__dword_ptr[edi + commitSequenceOff], eax);
+            a.not(eax);
+            a.mov(__dword_ptr[edi + commitInverseOff], eax);
 
             // --- optional return redirect: claim the hook's single return slot ---
             if (returnStubAddress != 0 && returnCtxAddress != 0)
@@ -248,6 +264,8 @@ namespace Cda.Core.Engine
             int stackCountOff = OffArgs + argCount * 8;
             int snapshotOff = stackCountOff + 4;
             int derefCountOff = snapshotOff + StackSlots * 8;
+            int commitSequenceOff = CommitSequenceOffset(argCount);
+            int commitInverseOff = CommitInverseOffset(argCount);
 
             var a = new Assembler(64);
 
@@ -268,11 +286,13 @@ namespace Cda.Core.Engine
             a.mov(eax, 1);
             a.@lock.xadd(__dword_ptr[rbx + 8], eax); // eax = old claimSeq (correlation id; zero-extends rax)
             a.mov(ecx, eax);                          // keep the correlation id (rcx free until the snapshot loop)
+            a.mov(r10d, eax);                         // keep our own claim sequence through the copy loop
             a.and(eax, mask);                         // slot index
             a.imul(eax, eax, recordSize);             // byte offset (zero-extends rax)
 
             a.mov(rdi, bufferAddress);
             a.add(rdi, rax);                          // rdi = &slot
+            a.mov(__dword_ptr[rdi + commitInverseOff], r10d); // invalidate previous occupant
 
             a.rdtsc();                                // edx:eax (upper halves cleared)
             a.mov(__dword_ptr[rdi + OffTimestamp], eax);
@@ -318,6 +338,11 @@ namespace Cda.Core.Engine
             a.jnz(copy);
 
             a.mov(__dword_ptr[rdi + derefCountOff], 0); // derefCount = 0
+
+            // Publish the slot only after every payload field is complete.
+            a.mov(__dword_ptr[rdi + commitSequenceOff], r10d);
+            a.not(r10d);
+            a.mov(__dword_ptr[rdi + commitInverseOff], r10d);
 
             // --- optional return redirect: claim the hook's single return slot ---
             if (returnStubAddress != 0 && returnCtxAddress != 0)
@@ -379,6 +404,8 @@ namespace Cda.Core.Engine
             int mask = slotCount - 1;
             int stackCountOff = OffArgs + argCount * 8;
             int derefCountOff = stackCountOff + 4 + StackSlots * 8;
+            int commitSequenceOff = CommitSequenceOffset(argCount);
+            int commitInverseOff = CommitInverseOffset(argCount);
             int kindArg = unchecked((int)(KindReturn | (uint)argCount));
 
             var a = new Assembler(64);
@@ -397,10 +424,12 @@ namespace Cda.Core.Engine
             a.mov(rbx, controlAddress);
             a.mov(eax, 1);
             a.@lock.xadd(__dword_ptr[rbx + 8], eax);
+            a.mov(ecx, eax);                           // this return record's own claim sequence
             a.and(eax, mask);
             a.imul(eax, eax, recordSize);
             a.mov(rdi, bufferAddress);
             a.add(rdi, rax);                          // rdi = &slot
+            a.mov(__dword_ptr[rdi + commitInverseOff], ecx); // invalidate previous occupant
 
             a.rdtsc();
             a.mov(__dword_ptr[rdi + OffTimestamp], eax);
@@ -424,6 +453,10 @@ namespace Cda.Core.Engine
 
             a.mov(__dword_ptr[rdi + stackCountOff], StackSlots); // snapshot count (content unused for returns)
             a.mov(__dword_ptr[rdi + derefCountOff], 0);
+
+            a.mov(__dword_ptr[rdi + commitSequenceOff], ecx);
+            a.not(ecx);
+            a.mov(__dword_ptr[rdi + commitInverseOff], ecx);
 
             a.mov(r11, __qword_ptr[rbx + CtxOrigRet]); // grab the resume address (last read of ctx)
             a.mov(__dword_ptr[rbx + CtxBusy], 0);      // release the hook's return slot
@@ -453,6 +486,8 @@ namespace Cda.Core.Engine
             int ctx = unchecked((int)(uint)returnCtxAddress);
             int stackCountOff = OffArgs + argCount * 8;
             int derefCountOff = stackCountOff + 4 + StackSlots * 8;
+            int commitSequenceOff = CommitSequenceOffset(argCount);
+            int commitInverseOff = CommitInverseOffset(argCount);
             int kindArg = unchecked((int)(KindReturn | (uint)argCount));
 
             var a = new Assembler(32);
@@ -473,10 +508,12 @@ namespace Cda.Core.Engine
             a.mov(eax, 1);
             a.mov(ebx, ctrl);
             a.@lock.xadd(__dword_ptr[ebx + 8], eax);
+            a.mov(ecx, eax);                           // this return record's own claim sequence
             a.and(eax, mask);
             a.imul(eax, eax, recordSize);
             a.mov(edi, buf);
             a.add(edi, eax);
+            a.mov(__dword_ptr[edi + commitInverseOff], ecx); // invalidate previous occupant
 
             a.rdtsc();
             a.mov(__dword_ptr[edi + OffTimestamp], eax);
@@ -505,6 +542,10 @@ namespace Cda.Core.Engine
 
             a.mov(__dword_ptr[edi + stackCountOff], StackSlots);
             a.mov(__dword_ptr[edi + derefCountOff], 0);
+
+            a.mov(__dword_ptr[edi + commitSequenceOff], ecx);
+            a.not(ecx);
+            a.mov(__dword_ptr[edi + commitInverseOff], ecx);
 
             a.mov(eax, __dword_ptr[ebx + CtxOrigRet]);  // resume address
             a.mov(__dword_ptr[esp + 24], eax);          // store it in the reserved slot ([entrySP-4])
@@ -594,7 +635,9 @@ namespace Cda.Core.Engine
             a.mov(rax, addVehAddress);  // AddVectoredExceptionHandler
             a.call(rax);
             a.add(rsp, 0x28);
-            a.xor(eax, eax);
+            a.test(rax, rax);
+            a.setne(al);
+            a.movzx(eax, al);           // thread exit code: 1 only when registration succeeded
             a.ret();
 
             var writer = new Cda.Core.Cpu.ListCodeWriter();

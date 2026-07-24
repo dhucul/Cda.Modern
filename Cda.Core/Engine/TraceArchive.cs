@@ -13,8 +13,8 @@ namespace Cda.Core.Engine
     /// x86 capture reloads fine in an x64 build and vice-versa.
     ///
     /// The format is deliberately simple and little-endian (matching the rest of
-    /// the engine). It is meant for this tool's own files; it trusts its input
-    /// beyond a magic + version check.
+    /// the engine). Loading validates collection sizes, string/payload lengths,
+    /// and exact reads before allocating from file-controlled values.
     /// </summary>
     public static class TraceArchive
     {
@@ -22,6 +22,14 @@ namespace Cda.Core.Engine
 
         private const uint Magic = 0x54414443; // 'C''D''A''T'
         private const int Version = 2;
+        private const int MaxModules = 65_536;
+        private const int MaxFunctions = 10_000_000;
+        private const int MaxRecords = 20_000_000;
+        private const int MaxSnapshotWords = 4_096;
+        private const int MaxArguments = 256;
+        private const int MaxDereferences = 256;
+        private const int MaxDereferenceBytes = 4_096;
+        private const int MaxStringBytes = 1_048_576;
 
         public static void Save(string path, TraceDataset ds)
         {
@@ -99,10 +107,11 @@ namespace Cda.Core.Engine
                 TimeEnd = r.ReadDouble(),
             };
 
-            int modCount = r.ReadInt32();
+            int modCount = ReadCount(r, "module", MaxModules,
+                minimumBytesPerItem: version >= 2 ? 26 : 18);
             for (int i = 0; i < modCount; i++)
             {
-                string name = r.ReadString();
+                string name = ReadString(r);
                 ulong baseAddr = r.ReadUInt64();
                 ulong size = r.ReadUInt64();
                 string? p = ReadOpt(r);
@@ -111,7 +120,8 @@ namespace Cda.Core.Engine
                     preferredBaseAddress: preferredBase));
             }
 
-            int fnCount = r.ReadInt32();
+            int fnCount = ReadCount(r, "function", MaxFunctions,
+                minimumBytesPerItem: version >= 2 ? 33 : 25);
             for (int i = 0; i < fnCount; i++)
             {
                 ulong addr = r.ReadUInt64();
@@ -123,7 +133,7 @@ namespace Cda.Core.Engine
                     { CallCount = cc });
             }
 
-            int recCount = r.ReadInt32();
+            int recCount = ReadCount(r, "record", MaxRecords, minimumBytesPerItem: 44);
             if (recCount > 0) ds.Records.Capacity = recCount;
             for (int i = 0; i < recCount; i++)
             {
@@ -135,25 +145,29 @@ namespace Cda.Core.Engine
                     StackPointer = r.ReadUInt64(),
                 };
 
-                int snapN = r.ReadInt32();
+                int snapN = ReadCount(r, "stack snapshot word", MaxSnapshotWords,
+                    minimumBytesPerItem: sizeof(ulong));
                 var snap = new ulong[snapN];
                 for (int s = 0; s < snapN; s++) snap[s] = r.ReadUInt64();
                 rec.StackSnapshot = snap;
 
-                int argN = r.ReadInt32();
+                int argN = ReadCount(r, "argument", MaxArguments,
+                    minimumBytesPerItem: sizeof(ulong));
                 var args = new ulong[argN];
                 for (int a = 0; a < argN; a++) args[a] = r.ReadUInt64();
                 rec.IntegerArgs = args;
 
-                int derefN = r.ReadInt32();
+                int derefN = ReadCount(r, "dereference", MaxDereferences,
+                    minimumBytesPerItem: 17);
                 var derefs = new Dereference[derefN];
                 for (int d = 0; d < derefN; d++)
                 {
                     int ai = r.ReadInt32();
                     byte kind = r.ReadByte();
                     ulong ptr = r.ReadUInt64();
-                    int dataN = r.ReadInt32();
-                    byte[] data = r.ReadBytes(dataN);
+                    int dataN = ReadCount(r, "dereference payload byte", MaxDereferenceBytes,
+                        minimumBytesPerItem: 1);
+                    byte[] data = ReadBytesExact(r, dataN, "dereference payload");
                     derefs[d] = new Dereference
                     {
                         ArgumentIndex = ai,
@@ -175,6 +189,50 @@ namespace Cda.Core.Engine
             if (s != null) w.Write(s);
         }
 
-        private static string? ReadOpt(BinaryReader r) => r.ReadBoolean() ? r.ReadString() : null;
+        private static string? ReadOpt(BinaryReader r) => r.ReadBoolean() ? ReadString(r) : null;
+
+        private static int ReadCount(BinaryReader r, string field, int hardMaximum,
+            int minimumBytesPerItem = 0)
+        {
+            int value = r.ReadInt32();
+            if (value < 0 || value > hardMaximum)
+                throw new InvalidDataException($"Invalid {field} count: {value}.");
+
+            if (minimumBytesPerItem > 0 && r.BaseStream.CanSeek)
+            {
+                long remaining = r.BaseStream.Length - r.BaseStream.Position;
+                if ((long)value * minimumBytesPerItem > remaining)
+                    throw new InvalidDataException(
+                        $"{field} count {value} exceeds the remaining trace data.");
+            }
+            return value;
+        }
+
+        private static byte[] ReadBytesExact(BinaryReader r, int count, string field)
+        {
+            if (count < 0)
+                throw new InvalidDataException($"Invalid {field} length: {count}.");
+            if (r.BaseStream.CanSeek && count > r.BaseStream.Length - r.BaseStream.Position)
+                throw new EndOfStreamException($"Truncated {field}.");
+
+            byte[] data = r.ReadBytes(count);
+            if (data.Length != count)
+                throw new EndOfStreamException($"Truncated {field}.");
+            return data;
+        }
+
+        private static string ReadString(BinaryReader r)
+        {
+            int byteCount;
+            try { byteCount = r.Read7BitEncodedInt(); }
+            catch (Exception ex) when (ex is FormatException or EndOfStreamException)
+            {
+                throw new InvalidDataException("Invalid trace string length.", ex);
+            }
+            if (byteCount < 0 || byteCount > MaxStringBytes)
+                throw new InvalidDataException($"Invalid trace string length: {byteCount}.");
+            return System.Text.Encoding.UTF8.GetString(
+                ReadBytesExact(r, byteCount, "trace string"));
+        }
     }
 }

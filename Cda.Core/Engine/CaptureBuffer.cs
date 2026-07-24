@@ -15,9 +15,11 @@ namespace Cda.Core.Engine
     /// no bounds branch — if the writer laps the reader the oldest slot is simply
     /// overwritten, but the ring is sized so that does not happen between polls.
     ///
-    /// The host remembers the last sequence number it drained and copies only the
-    /// records claimed since then (in one or two reads, handling wrap-around), so
-    /// nothing is dropped at poll boundaries. This replaces the earlier
+    /// Each slot ends with a sequence/complement commit footer written after its
+    /// payload. The host remembers the last sequence number it drained and copies
+    /// only the contiguous committed records since then (handling wrap-around), so
+    /// a claim that is still being written remains pending for the next poll. This
+    /// replaces the earlier
     /// drain-then-reset buffer, which lost the tail of every batch and corrupted
     /// once the cursor ran past the end.
     ///
@@ -44,7 +46,10 @@ namespace Cda.Core.Engine
 
         public static CaptureBuffer Create(ICodeMemory mem, int requestedSlots, int recordSize)
         {
-            if (recordSize <= 0) throw new ArgumentOutOfRangeException(nameof(recordSize), "record size must be positive");
+            if (recordSize < CaptureStub.CommitBytes)
+                throw new ArgumentOutOfRangeException(nameof(recordSize), "record size is too small for the commit footer");
+            if ((long)recordSize * 256 > MaxRingBytes)
+                throw new ArgumentOutOfRangeException(nameof(recordSize), "record size cannot fit the minimum ring within the byte ceiling");
 
             // Slot count: at least 256, a power of two, and small enough that the ring
             // (slots * recordSize bytes) stays within the ceiling. The request is clamped
@@ -111,10 +116,10 @@ namespace Cda.Core.Engine
         }
 
         /// <summary>
-        /// Copy every record claimed since <paramref name="readSeq"/> into a
+        /// Copy every contiguous committed record since <paramref name="readSeq"/> into a
         /// contiguous, in-order byte buffer, then advance <paramref name="readSeq"/>
-        /// to the latest claim. Records wrap around the end of the ring, so this may
-        /// issue two reads. If the writer got more than a full ring ahead (lapping),
+        /// through the latest safely published claim. Records wrap around the end of
+        /// the ring, so each snapshot may issue two reads. If the writer got more than a full ring ahead (lapping),
         /// only the most recent <see cref="SlotCount"/> records survive and the rest
         /// are reported in <paramref name="recordsLost"/>.
         /// </summary>
@@ -130,28 +135,73 @@ namespace Cda.Core.Engine
 
             uint slots = (uint)SlotCount;
             uint start = readSeq;
+            int pendingLost = 0;
             if (delta > slots)                     // writer lapped the reader
             {
-                recordsLost = (int)Math.Min(delta - slots, (uint)int.MaxValue);
+                pendingLost = (int)Math.Min(delta - slots, (uint)int.MaxValue);
                 start = claim - slots;             // keep only the freshest full ring
                 delta = slots;
             }
 
             int rec = RecordSize;
+            byte[] snapshot = new byte[(int)delta * rec];
+            ulong[] firstCommits = new ulong[delta];
+            int commitOff = rec - CaptureStub.CommitBytes;
+
+            // Read twice. A committed marker in both snapshots proves that the
+            // writer completed this sequence before the first copy and did not
+            // begin reusing its slot before the second copy completed.
+            if (!TryReadRange(mem, start, delta, snapshot))
+                return Array.Empty<byte>();
+            for (uint i = 0; i < delta; i++)
+            {
+                int off = (int)i * rec + commitOff;
+                firstCommits[i] = BinaryPrimitives.ReadUInt64LittleEndian(snapshot.AsSpan(off));
+            }
+            if (!TryReadRange(mem, start, delta, snapshot))
+                return Array.Empty<byte>();
+
+            uint committed = 0;
+            for (; committed < delta; committed++)
+            {
+                uint expected = start + committed;
+                int off = (int)committed * rec + commitOff;
+                ulong first = firstCommits[committed];
+                uint seq1 = (uint)first;
+                uint inv1 = (uint)(first >> 32);
+                uint seq2 = BinaryPrimitives.ReadUInt32LittleEndian(snapshot.AsSpan(off));
+                uint inv2 = BinaryPrimitives.ReadUInt32LittleEndian(snapshot.AsSpan(off + 4));
+                if (seq1 != expected || inv1 != ~expected ||
+                    seq2 != expected || inv2 != ~expected)
+                    break;
+            }
+
+            // Anything before 'start' was already overwritten and is irrecoverable.
+            // An uncommitted slot at/after start remains pending for the next poll.
+            readSeq = start + committed;
+            recordsLost = pendingLost;
+            if (committed == 0) return Array.Empty<byte>();
+            if (committed < delta)
+                Array.Resize(ref snapshot, (int)committed * rec);
+            return snapshot;
+        }
+
+        private bool TryReadRange(ICodeMemory mem, uint start, uint count, Span<byte> destination)
+        {
+            int rec = RecordSize;
+            uint slots = (uint)SlotCount;
             uint mask = slots - 1;
-            byte[] outBuf = new byte[(int)delta * rec];
-
             uint startIndex = start & mask;
-            uint firstCount = Math.Min(delta, slots - startIndex);
-            mem.Read(DataAddress + (ulong)(startIndex * (uint)rec),
-                     outBuf.AsSpan(0, (int)firstCount * rec));
+            uint firstCount = Math.Min(count, slots - startIndex);
+            int firstBytes = (int)firstCount * rec;
+            if (mem.Read(DataAddress + (ulong)(startIndex * (uint)rec),
+                    destination.Slice(0, firstBytes)) != firstBytes)
+                return false;
 
-            uint second = delta - firstCount;      // wrapped tail, if any
-            if (second > 0)
-                mem.Read(DataAddress, outBuf.AsSpan((int)firstCount * rec, (int)second * rec));
-
-            readSeq = claim;
-            return outBuf;
+            uint second = count - firstCount;
+            if (second == 0) return true;
+            int secondBytes = (int)second * rec;
+            return mem.Read(DataAddress, destination.Slice(firstBytes, secondBytes)) == secondBytes;
         }
 
         private static int RoundUpPow2(int v)

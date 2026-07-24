@@ -9,7 +9,7 @@
 ;  Output: tools\installer\Output\CDA-Setup-<version>-x64.exe
 ; ============================================================================
 
-#define AppVersion   "1.21.0"
+#define AppVersion   "1.21.1"
 #define AppExeName   "Cda.App.exe"
 #define AppPublisher "CDA"
 #define AppFullName  "CDA - Modern"

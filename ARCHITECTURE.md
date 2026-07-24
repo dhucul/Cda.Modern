@@ -140,15 +140,17 @@ snapshot, then a host-filled dereference payload.
 | 44 + 8·argCount | 8 × stackSlots | stack snapshot from entry SP upward, zero-extended |
 | 44 + 8·argCount + 8·stackSlots | 4 | derefCount (0 in-target; filled host-side) |
 | … | derefCount × | dereference: u32 argIndex, u32 kind, u32 dataLen, u8[dataLen] |
+| payload end | 4 | commitSequence — the claimed sequence, published after the payload |
+| payload end + 4 | 4 | commitSequenceInverse — bitwise complement of commitSequence |
 
 ```
-RecordSize = 40 + argCount*8 + 4 + StackSlots*8 + 4   (before host dereferences)
+RecordSize = 40 + argCount*8 + 4 + StackSlots*8 + 4 + 8   (payload + commit footer)
 ```
 
 `CaptureStub.StackSlots` is **64** (512 bytes on x64, 256 on x86). For the usual
-`argCount = 4`, that makes a fixed record of **592 bytes** before any dereference
-payload — the figure the capture Self-test reports. A 65,536-slot ring is therefore
-~38 MB in the target. The `argCount` field carries a **kind flag** in its high bit
+`argCount = 4`, that makes a fixed record of **600 bytes**, including its commit
+footer — the figure the capture Self-test reports. A 65,536-slot ring is therefore
+~39 MB in the target. The `argCount` field carries a **kind flag** in its high bit
 (so a value > 256 never collides with a real arity, which the decoder already rejects)
 and a **correlationId** follows it, so both a call and its later return decode through
 the same fixed layout and pair up host-side. The stack snapshot is what lets the host walk back past
@@ -156,13 +158,14 @@ runtime/CRT wrapper frames to the program's own caller (see *Caller attribution*
 below) **and** recover string arguments that sit past the captured integer args (see
 *Capture session lifecycle*); raising `StackSlots` deepens both at a linear memory
 cost. **Because it changes the record format, re-run the capture Self-test after
-changing it** — the 592-byte figure is the end-to-end check that the stub writes and
+changing it** — the 600-byte figure is the end-to-end check that the stub writes and
 the reader decodes the same layout.
 
 The stub saves flags + GP registers (so the function sees its entry state intact),
 claims a slot with `lock xadd` on the control block's `claimSeq`, masks to a slot
-index (`seq & (slotCount-1)`), writes the fields (including copying `StackSlots`
-words from the entry SP upward), restores, and jumps to the trampoline. x64 reads
+index (`seq & (slotCount-1)`), invalidates the slot's old footer, writes the fields
+(including copying `StackSlots` words from the entry SP upward), then publishes the
+sequence/complement footer, restores, and jumps to the trampoline. x64 reads
 the first four args from the saved RCX/RDX/R8/R9 slots and the rest past the shadow
 space. There is **no bounds branch** — the power-of-two slot count makes the index
 always valid.
@@ -185,15 +188,16 @@ data: slotCount × recordSize, slotCount rounded up to a power of two
 
 Each hooked thread claims a slot by atomically incrementing `claimSeq`. The host
 remembers the last sequence it drained; `DrainSince(ref readSeq, out recordsLost)`
-copies only records claimed since then — in one or two reads to handle wrap-around —
-then advances `readSeq`, so nothing is dropped at poll boundaries. The subtraction
+copies the range twice and advances through only the contiguous slots whose
+sequence/complement commit footer is stable in both snapshots. A claimed slot still
+being written therefore remains pending for the next poll. The subtraction
 `claim - readSeq` is unsigned and therefore wrap-safe. If the writer got more than a
 full ring ahead (lapping), only the freshest `slotCount` records survive and the rest
 are reported as `recordsLost`. A short read of the control block (e.g. the target
 exited) returns empty rather than misreading a zero counter.
 
 The ring is sized so a hooked function can't lap the reader between 100 ms polls.
-At the defaults (65,536 slots × a 592-byte record) that is ~38 MB in the target. The
+At the defaults (65,536 slots × a 600-byte record) that is ~39 MB in the target. The
 byte size is computed in 64-bit and bounded by a **256 MB ceiling** — a larger record
 (a deeper `StackSlots` snapshot) or a big `bufferRecords` drops the slot count to fit
 rather than overflow the 32-bit allocation size, which would otherwise hand the stub a
@@ -649,7 +653,8 @@ return address at/above the faulting SP to its real value (releasing the slot) *
 unwind proceeds, so the unwinder sees the correct address. Restoring a slot only
 un-redirects that one call — never a crash or corruption — so no per-thread stack-bounds
 check is needed and touching another thread's slot merely costs that call its return value.
-It's best-effort (if the handler can't be installed, return capture still runs) and x64-only
+Registration is verified through the remote thread's exit code; if it fails, x64 capture
+stays entry-only rather than redirecting returns without an exception safety net. It is x64-only
 (x86's chain-based SEH is unaffected). Validated by `CaptureVehSelfTest` (the fixup logic)
 and a cross-process return-capture run. `CaptureSession.Poll` folds each return record into its originating call
 (`ReturnValue`/`HasReturned`) by correlationId and drops it. Enabled with the
