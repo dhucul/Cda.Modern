@@ -37,7 +37,9 @@ namespace Cda.Core.Model
         {
             preferredAddress = 0;
             if (PreferredBaseAddress == 0 || !Contains(address)) return false;
-            preferredAddress = PreferredBaseAddress + (address - BaseAddress);
+            ulong delta = address - BaseAddress;
+            if (delta > ulong.MaxValue - PreferredBaseAddress) return false;
+            preferredAddress = PreferredBaseAddress + delta;
             return true;
         }
     }

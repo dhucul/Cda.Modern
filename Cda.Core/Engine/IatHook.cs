@@ -41,6 +41,7 @@ namespace Cda.Core.Engine
         private readonly ICodeMemory _mem;
         private readonly int _ptr;
         private bool _removed;
+        internal bool NeedsCleanup => !_removed;
 
         private IatHook(ICodeMemory mem, ulong slot, ulong target, ulong stub, int ptr)
         {
@@ -80,8 +81,19 @@ namespace Cda.Core.Engine
             }
             if (original == stub) { skipReason = "IAT slot already points at our stub."; return false; }
 
-            WriteSlot(mem, slot, stub, ptr);
             hook = new IatHook(mem, slot, original, stub, ptr);
+            try
+            {
+                WriteSlot(mem, slot, stub, ptr);
+            }
+            catch
+            {
+                // The candidate is exposed before the target mutation. A successful
+                // rollback marks it removed; a failed rollback leaves NeedsCleanup
+                // true so CaptureSession can retain and retry it at teardown.
+                try { hook.Remove(); } catch { }
+                throw;
+            }
             return true;
         }
 
@@ -102,8 +114,14 @@ namespace Cda.Core.Engine
             Span<byte> b = stackalloc byte[8];
             if (ptr == 8) BinaryPrimitives.WriteUInt64LittleEndian(b, value);
             else BinaryPrimitives.WriteUInt32LittleEndian(b, (uint)value);
-            mem.Write(slot, b.Slice(0, ptr));
-            mem.Protect(slot, ptr, old);
+            try
+            {
+                mem.Write(slot, b.Slice(0, ptr));
+            }
+            finally
+            {
+                mem.Protect(slot, ptr, old);
+            }
         }
     }
 }

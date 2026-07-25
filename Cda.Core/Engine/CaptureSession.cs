@@ -36,6 +36,8 @@ namespace Cda.Core.Engine
         private readonly CaptureBuffer _buffer;
         private readonly List<InlineHook> _hooks = new();
         private readonly List<IatHook> _iatHooks = new();
+        private readonly object _hookGate = new();
+        private bool _disposed;
         private ulong _tscBase;
         private bool _haveBase;
         private uint _readSeq;
@@ -63,7 +65,10 @@ namespace Cda.Core.Engine
         public long RecordsLost { get; private set; }
 
         public bool Is64Bit => _process.Is64Bit;
-        public int HookedCount => _hooks.Count + _iatHooks.Count;
+        public int HookedCount
+        {
+            get { lock (_hookGate) return _hooks.Count + _iatHooks.Count; }
+        }
         public int Pid => _process.Pid;
         public int ArgCount { get; }
 
@@ -72,7 +77,10 @@ namespace Cda.Core.Engine
         /// for diagnostics and for the CDA_HOOK_RANGE bisection aid, so a crash can
         /// be narrowed to the exact culprit function.
         /// </summary>
-        public IReadOnlyList<ulong> HookedTargets => _hooks.ConvertAll(h => h.Target);
+        public IReadOnlyList<ulong> HookedTargets
+        {
+            get { lock (_hookGate) return _hooks.ConvertAll(h => h.Target); }
+        }
 
         /// <summary>
         /// Non-null when CDA_HOOK_RANGE restricted which slice of the candidate list
@@ -320,6 +328,7 @@ namespace Cda.Core.Engine
                 foreach (var (slotVa, target) in imports)
                 {
                     if (instrumented >= maxFunctions) break;
+                    IatHook? pendingHook = null;
                     try
                     {
                         ulong stub = memory.Allocate(StubBytesMax, executable: true);
@@ -335,17 +344,20 @@ namespace Cda.Core.Engine
 
                         // Point the slot at the stub (saving the original for teardown).
                         if (!IatHook.TryInstall(code, slotVa, stub, proc.Is64Bit,
-                                out var hook, out string? skipReason))
+                                out pendingHook, out string? skipReason))
                         {
                             skipped++;
                             firstError ??= skipReason;
                             continue;
                         }
-                        session._iatHooks.Add(hook!);
+                        session._iatHooks.Add(pendingHook!);
+                        pendingHook = null;
                         instrumented++;
                     }
                     catch (Exception ex)
                     {
+                        if (pendingHook?.NeedsCleanup == true)
+                            session._iatHooks.Add(pendingHook);
                         skipped++;
                         firstError ??= ex.Message;
                     }
@@ -430,8 +442,18 @@ namespace Cda.Core.Engine
             _code.Write(stub, stubBytes);
             _code.Flush(stub, stubBytes.Length);
 
-            hook.Activate();          // stub fully written; arm the entry detour
             _hooks.Add(hook);
+            try
+            {
+                hook.Activate();      // stub fully written; arm the entry detour
+            }
+            catch
+            {
+                // If Activate rolled back completely there is nothing left to own.
+                // Otherwise keep it in _hooks so teardown restores the uncertain site.
+                if (!hook.IsActive) _hooks.Remove(hook);
+                throw;
+            }
             return true;
         }
 
@@ -499,32 +521,36 @@ namespace Cda.Core.Engine
 
         public int HookMore(IEnumerable<ulong> addresses, out int skipped, out string? firstError)
         {
-            skipped = 0;
-            firstError = null;
-            int added = 0;
-
-            var arch = CpuArchitectures.For(_process.Is64Bit);
-            var have = new HashSet<ulong>();
-            foreach (var h in _hooks) have.Add(h.Target);
-
-            // No .pdata bound for JIT code; allow a generous steal (InlineHook still
-            // refuses a site it can't relocate safely, so this can't corrupt code).
-            int maxPatch = _process.Is64Bit ? 24 : 16;
-
-            using (new ThreadSuspender(_process.Pid))
+            lock (_hookGate)
             {
-                foreach (ulong func in addresses)
+                if (_disposed) throw new ObjectDisposedException(nameof(CaptureSession));
+                skipped = 0;
+                firstError = null;
+                int added = 0;
+
+                var arch = CpuArchitectures.For(_process.Is64Bit);
+                var have = new HashSet<ulong>();
+                foreach (var h in _hooks) have.Add(h.Target);
+
+                // No .pdata bound for JIT code; allow a generous steal (InlineHook still
+                // refuses a site it can't relocate safely, so this can't corrupt code).
+                int maxPatch = _process.Is64Bit ? 24 : 16;
+
+                using (new ThreadSuspender(_process.Pid))
                 {
-                    if (func == 0 || !have.Add(func)) continue; // skip null / already hooked
-                    try
+                    foreach (ulong func in addresses)
                     {
-                        if (InstallHook(func, arch, maxPatch, out string? skipReason)) added++;
-                        else { skipped++; firstError ??= skipReason; }
+                        if (func == 0 || !have.Add(func)) continue; // skip null / already hooked
+                        try
+                        {
+                            if (InstallHook(func, arch, maxPatch, out string? skipReason)) added++;
+                            else { skipped++; firstError ??= skipReason; }
+                        }
+                        catch (Exception ex) { skipped++; firstError ??= ex.Message; }
                     }
-                    catch (Exception ex) { skipped++; firstError ??= ex.Message; }
                 }
+                return added;
             }
-            return added;
         }
 
         /// <summary>
@@ -550,29 +576,33 @@ namespace Cda.Core.Engine
         /// </summary>
         public bool UnhookFunction(ulong functionAddress)
         {
-            bool removed = false;
-
-            int idx = _hooks.FindIndex(h => h.Target == functionAddress);
-            if (idx >= 0)
+            lock (_hookGate)
             {
-                using (new ThreadSuspender(_process.Pid))
+                if (_disposed) return false;
+                bool removed = false;
+
+                int idx = _hooks.FindIndex(h => h.Target == functionAddress);
+                if (idx >= 0)
                 {
-                    try { _hooks[idx].Remove(); } catch { /* best effort */ }
+                    using (new ThreadSuspender(_process.Pid))
+                    {
+                        try { _hooks[idx].Remove(); } catch { /* best effort */ }
+                    }
+                    _hooks.RemoveAt(idx);
+                    removed = true;
                 }
-                _hooks.RemoveAt(idx);
-                removed = true;
-            }
 
-            // IAT: a runaway callee may be reached through several import slots; drop
-            // every one (atomic pointer restores, no suspend needed).
-            for (int i = _iatHooks.Count - 1; i >= 0; i--)
-            {
-                if (_iatHooks[i].Target != functionAddress) continue;
-                try { _iatHooks[i].Remove(); } catch { /* best effort */ }
-                _iatHooks.RemoveAt(i);
-                removed = true;
+                // IAT: a runaway callee may be reached through several import slots; drop
+                // every one (atomic pointer restores, no suspend needed).
+                for (int i = _iatHooks.Count - 1; i >= 0; i--)
+                {
+                    if (_iatHooks[i].Target != functionAddress) continue;
+                    try { _iatHooks[i].Remove(); } catch { /* best effort */ }
+                    _iatHooks.RemoveAt(i);
+                    removed = true;
+                }
+                return removed;
             }
-            return removed;
         }
 
         /// <summary>
@@ -585,9 +615,13 @@ namespace Cda.Core.Engine
         /// </summary>
         public ulong OwningHook(ulong address)
         {
-            foreach (var h in _hooks)
-                if (h.OwnsAddress(address, StubBytesMax)) return h.Target;
-            return 0;
+            lock (_hookGate)
+            {
+                if (_disposed) return 0;
+                foreach (var h in _hooks)
+                    if (h.OwnsAddress(address, StubBytesMax)) return h.Target;
+                return 0;
+            }
         }
 
         /// <summary>
@@ -857,6 +891,10 @@ namespace Cda.Core.Engine
 
         public void Dispose()
         {
+            lock (_hookGate)
+            {
+            if (_disposed) return;
+            _disposed = true;
             // Inline hooks rewrite .text, so restore them with the target frozen (no
             // thread mid-instruction in a site we're rewriting). Skip the freeze
             // entirely for an IAT-only session.
@@ -886,6 +924,7 @@ namespace Cda.Core.Engine
             // return into one; freeing would crash the target. These regions are
             // reclaimed when the target exits. (Bounded leak per capture session.)
             _process.Dispose();
+            }
         }
     }
 }

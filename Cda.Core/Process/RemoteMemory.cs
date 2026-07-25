@@ -26,6 +26,7 @@ namespace Cda.Core.Process
         /// <summary>Commit a block in the target. <paramref name="executable"/> picks RWX vs RW.</summary>
         public ulong Allocate(int size, bool executable)
         {
+            if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size));
             uint protect = executable ? NativeMethods.PAGE_EXECUTE_READWRITE : NativeMethods.PAGE_READWRITE;
             IntPtr p = NativeMethods.VirtualAllocEx(
                 _process.Handle, IntPtr.Zero, (IntPtr)size,
@@ -72,6 +73,8 @@ namespace Cda.Core.Process
         /// </summary>
         public ulong AllocateNear(int size, ulong anchor)
         {
+            if (size <= 0 || size > int.MaxValue - 15)
+                throw new ArgumentOutOfRangeException(nameof(size));
             int need = (size + 15) & ~15;
 
             // Reuse a near block that still has room AND is in rel32 range of this
@@ -151,7 +154,7 @@ namespace Cda.Core.Process
                 ulong rBase = NativeMethods.ToUInt64(mbi.BaseAddress);
                 ulong rSize = NativeMethods.ToUInt64(mbi.RegionSize);
                 if (rSize == 0) break;
-                ulong rEnd = rBase + rSize;
+                ulong rEnd = rSize > ulong.MaxValue - rBase ? ulong.MaxValue : rBase + rSize;
 
                 if (mbi.State == NativeMethods.MEM_FREE)
                 {
@@ -160,7 +163,7 @@ namespace Cda.Core.Process
                     if (winHi > size && winHi - size >= winLo)
                     {
                         ulong fit = preferHighest ? FloorGran(winHi - size) : RoundUpGran(winLo);
-                        if (fit >= winLo && fit + size <= winHi)
+                        if (fit >= winLo && fit <= winHi - size)
                         {
                             if (!preferHighest) return fit;
                             best = fit; // remember the highest fit (closest below the anchor)
@@ -168,13 +171,21 @@ namespace Cda.Core.Process
                     }
                 }
                 ulong next = rEnd;
-                if (next <= addr) next = addr + NearGranularity; // guarantee forward progress
+                if (next <= addr)
+                {
+                    if (addr > ulong.MaxValue - NearGranularity) break;
+                    next = addr + NearGranularity; // guarantee forward progress
+                }
                 addr = next;
             }
             return best;
         }
 
-        private static ulong RoundUpGran(ulong v) => (v + (NearGranularity - 1)) & ~(NearGranularity - 1);
+        private static ulong RoundUpGran(ulong v)
+        {
+            ulong mask = NearGranularity - 1;
+            return v > ulong.MaxValue - mask ? FloorGran(ulong.MaxValue) : (v + mask) & ~mask;
+        }
         private static ulong FloorGran(ulong v) => v & ~(NearGranularity - 1);
 
         public void Write(ulong address, ReadOnlySpan<byte> data)

@@ -218,12 +218,12 @@ namespace Cda.Core.Engine
             var sideB = Tally(b);
 
             // Index B for the two-phase join.
-            var bByRva = new Dictionary<string, Side>(sideB.Count);
-            var bByName = new Dictionary<string, Side>(sideB.Count);
+            var bByRva = new Dictionary<string, List<Side>>(sideB.Count);
+            var bByName = new Dictionary<string, List<Side>>(sideB.Count);
             foreach (var s in sideB)
             {
-                bByRva[s.RvaKey] = s;
-                if (s.NameKey != null) bByName[s.NameKey] = s; // last wins on a duplicate name
+                AddIndex(bByRva, s.RvaKey, s);
+                if (s.NameKey != null) AddIndex(bByName, s.NameKey, s);
             }
 
             var result = new TraceComparisonResult();
@@ -233,10 +233,11 @@ namespace Cda.Core.Engine
             foreach (var ea in sideA)
             {
                 Side? eb = null;
-                if (bByRva.TryGetValue(ea.RvaKey, out var byRva) && !pairedB.Contains(byRva))
-                    eb = byRva;
-                else if (ea.NameKey != null && bByName.TryGetValue(ea.NameKey, out var byName) && !pairedB.Contains(byName))
-                    eb = byName;
+                if (bByRva.TryGetValue(ea.RvaKey, out var byRva))
+                    eb = FirstUnpaired(byRva, pairedB);
+                if (eb == null && ea.NameKey != null &&
+                    bByName.TryGetValue(ea.NameKey, out var byName))
+                    eb = FirstUnpaired(byName, pairedB);
 
                 if (eb != null) pairedB.Add(eb);
                 result.Functions.Add(MakeDiff(ea, eb));
@@ -286,6 +287,25 @@ namespace Cda.Core.Engine
             return result;
         }
 
+        private static void AddIndex(
+            Dictionary<string, List<Side>> index, string key, Side value)
+        {
+            if (!index.TryGetValue(key, out var values))
+            {
+                values = new List<Side>();
+                index[key] = values;
+            }
+            values.Add(value);
+        }
+
+        private static Side? FirstUnpaired(List<Side> values, HashSet<Side> paired)
+        {
+            foreach (var value in values)
+                if (!paired.Contains(value))
+                    return value;
+            return null;
+        }
+
         private static void SortByDelta(List<FunctionDiff> list) =>
             list.Sort((x, y) =>
             {
@@ -319,12 +339,23 @@ namespace Cda.Core.Engine
 
         private static List<EdgeDiff> CompareEdges(TraceDataset a, TraceDataset b, TraceComparisonResult result)
         {
-            // Shared endpoint display info, keyed by RVA key; A is tallied first so its
-            // label + A-address win.
+            // Reuse the function join above for edge endpoints. Without this mapping,
+            // functions paired by module+name after an RVA shift still produced two
+            // unrelated OnlyA/OnlyB edges.
             var endpoints = new Dictionary<string, (string label, ulong addrA)>();
+            var canonicalA = new Dictionary<ulong, string>();
+            var canonicalB = new Dictionary<ulong, string>();
+            for (int i = 0; i < result.Functions.Count; i++)
+            {
+                var function = result.Functions[i];
+                string canonical = "#function:" + i;
+                if (function.AddressA != 0) canonicalA[function.AddressA] = canonical;
+                if (function.AddressB != 0) canonicalB[function.AddressB] = canonical;
+                endpoints[canonical] = (function.Label, function.AddressA);
+            }
 
-            var tA = TallyEdges(a, endpoints, isA: true);
-            var tB = TallyEdges(b, endpoints, isA: false);
+            var tA = TallyEdges(a, endpoints, canonicalA, isA: true);
+            var tB = TallyEdges(b, endpoints, canonicalB, isA: false);
 
             var keys = new HashSet<string>(tA.Keys);
             keys.UnionWith(tB.Keys);
@@ -383,7 +414,10 @@ namespace Cda.Core.Engine
         }
 
         private static Dictionary<string, EdgeAgg> TallyEdges(
-            TraceDataset ds, Dictionary<string, (string label, ulong addrA)> endpoints, bool isA)
+            TraceDataset ds,
+            Dictionary<string, (string label, ulong addrA)> endpoints,
+            Dictionary<ulong, string> canonical,
+            bool isA)
         {
             var map = new ModuleMap(ds.Modules);
             var byAddr = new Dictionary<ulong, TracedFunction>();
@@ -398,9 +432,9 @@ namespace Cda.Core.Engine
             var tally = new Dictionary<string, EdgeAgg>();
             foreach (var r in ds.Records)
             {
-                ulong callerEntry = FloorEntry(entries, r.Source);
-                string callerKey = EndpointKey(map, byAddr, callerEntry, endpoints, isA);
-                string calleeKey = EndpointKey(map, byAddr, r.Destination, endpoints, isA);
+                ulong callerEntry = FloorEntry(entries, r.Source, map);
+                string callerKey = EndpointKey(map, byAddr, callerEntry, endpoints, canonical, isA);
+                string calleeKey = EndpointKey(map, byAddr, r.Destination, endpoints, canonical, isA);
 
                 string ekey = callerKey + "\n" + calleeKey; // '\n' can't occur in a key
                 if (!tally.TryGetValue(ekey, out var agg))
@@ -419,21 +453,32 @@ namespace Cda.Core.Engine
         // seen (A first, so A's label and entry address win).
         private static string EndpointKey(
             ModuleMap map, Dictionary<ulong, TracedFunction> byAddr,
-            ulong addr, Dictionary<string, (string label, ulong addrA)> endpoints, bool isA)
+            ulong addr,
+            Dictionary<string, (string label, ulong addrA)> endpoints,
+            Dictionary<ulong, string> canonical,
+            bool isA)
         {
+            if (canonical.TryGetValue(addr, out string? pairedKey))
+                return pairedKey;
+
             var id = Identify(map, byAddr, addr);
-            if (!endpoints.ContainsKey(id.rvaKey))
-                endpoints[id.rvaKey] = (id.label, isA ? addr : 0);
-            return id.rvaKey;
+            string key = id.nameKey ?? id.rvaKey;
+            if (!endpoints.ContainsKey(key))
+                endpoints[key] = (id.label, isA ? addr : 0);
+            return key;
         }
 
-        private static ulong FloorEntry(ulong[] sortedEntries, ulong addr)
+        private static ulong FloorEntry(ulong[] sortedEntries, ulong addr, ModuleMap map)
         {
             if (sortedEntries.Length == 0) return addr;
             int i = Array.BinarySearch(sortedEntries, addr);
             if (i >= 0) return sortedEntries[i];
             i = ~i - 1;                       // predecessor
-            return i >= 0 ? sortedEntries[i] : addr;
+            if (i < 0) return addr;
+
+            ulong candidate = sortedEntries[i];
+            var containing = map.Resolve(addr);
+            return containing != null && containing.Contains(candidate) ? candidate : addr;
         }
 
         // --- first-call order ------------------------------------------------

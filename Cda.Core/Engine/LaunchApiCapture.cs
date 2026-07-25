@@ -83,12 +83,11 @@ namespace Cda.Core.Engine
 
         /// <summary>
         /// (Dialogs mode) Raised when a dialog host that loads AFTER the first one is
-        /// hooked (e.g. comctl32 after user32) is discovered — carrying its new dialog
-        /// functions. The subscriber must install them with
-        /// <see cref="CaptureSession.HookMore"/> on the poll thread (hook-list mutation
-        /// isn't synchronized against the loop thread), so it can't be armed here.
+        /// hooked (e.g. comctl32 after user32) is discovered. The entries are installed
+        /// synchronously before the LOAD_DLL event resumes; this event carries the
+        /// successfully installed functions and their newly visible modules to the UI.
         /// </summary>
-        public event Action<IReadOnlyList<TracedFunction>>? MoreDialogsHooked;
+        public event Action<IReadOnlyList<TracedFunction>, IReadOnlyList<ModuleInfo>>? MoreDialogsHooked;
 
         /// <summary>
         /// Raised (with a reason) when the loader breakpoint was reached but nothing
@@ -112,6 +111,7 @@ namespace Cda.Core.Engine
         private volatile bool _stop;
         private int _pid;
         private bool _hooked;
+        private bool _attached;
         private bool _loaderBpSeen;   // the initial loader breakpoint has been consumed
         private bool _dialogHostSeen; // (Dialogs mode) a dialog-host LOAD_DLL (user32/comctl32/comdlg32/credui) has arrived post-loader-BP
 
@@ -209,7 +209,18 @@ namespace Cda.Core.Engine
         /// target is left running.</summary>
         public void Stop() => _stop = true;
 
-        public void Dispose() => Stop();
+        public bool WaitForExit(int timeoutMs)
+        {
+            Thread? thread = _thread;
+            return thread == null || ReferenceEquals(Thread.CurrentThread, thread) ||
+                   thread.Join(timeoutMs);
+        }
+
+        public void Dispose()
+        {
+            Stop();
+            WaitForExit(1000);
+        }
 
         private void Run()
         {
@@ -218,6 +229,9 @@ namespace Cda.Core.Engine
             // 8-byte aligned on x64 = offset 16, 4-byte aligned on x86 = 12).
             IntPtr evt = Marshal.AllocHGlobal(4096);
             int U = IntPtr.Size == 8 ? 16 : 12;
+            bool eventPending = false;
+            uint pendingPid = 0, pendingTid = 0;
+            uint pendingStatus = NativeMethods.DBG_CONTINUE;
             try
             {
                 string? workDir = Path.GetDirectoryName(_exePath);
@@ -231,6 +245,7 @@ namespace Cda.Core.Engine
                     return;
                 }
                 _pid = (int)pi.dwProcessId;
+                _attached = true;
                 NativeMethods.CloseHandle(pi.hThread);
                 NativeMethods.CloseHandle(pi.hProcess);
 
@@ -294,6 +309,10 @@ namespace Cda.Core.Engine
                     uint evtPid = (uint)Marshal.ReadInt32(evt, 4);
                     uint evtTid = (uint)Marshal.ReadInt32(evt, 8);
                     uint cont = NativeMethods.DBG_CONTINUE;
+                    eventPending = true;
+                    pendingPid = evtPid;
+                    pendingTid = evtTid;
+                    pendingStatus = cont;
 
                     switch (code)
                     {
@@ -412,14 +431,22 @@ namespace Cda.Core.Engine
                         }
 
                         case NativeMethods.EXIT_PROCESS_DEBUG_EVENT:
-                            NativeMethods.ContinueDebugEvent(evtPid, evtTid, NativeMethods.DBG_CONTINUE);
+                            if (NativeMethods.ContinueDebugEvent(evtPid, evtTid, NativeMethods.DBG_CONTINUE))
+                            {
+                                eventPending = false;
+                                _attached = false;
+                            }
                             try { _pt?.Dispose(); _pt = null; } catch { }
                             Log?.Invoke("target exited.");
                             TargetExited?.Invoke();
                             return;
                     }
 
-                    NativeMethods.ContinueDebugEvent(evtPid, evtTid, cont);
+                    pendingStatus = cont;
+                    if (NativeMethods.ContinueDebugEvent(evtPid, evtTid, cont))
+                        eventPending = false;
+                    else
+                        break;
 
                     ServiceProbeRequests(); // pick up any UI-requested branch probe
                     if (_stop) { Detach(); break; }
@@ -435,19 +462,36 @@ namespace Cda.Core.Engine
             }
             finally
             {
+                if (eventPending)
+                {
+                    try { NativeMethods.ContinueDebugEvent(pendingPid, pendingTid, pendingStatus); } catch { }
+                }
+                Detach();
                 Marshal.FreeHGlobal(evt);
             }
         }
 
         private void Detach()
         {
+            if (!_attached)
+            {
+                try { _pt?.Dispose(); _pt = null; } catch { }
+                return;
+            }
             // The debug registers we set are part of each thread's context and are NOT
             // cleared by detaching — leave them armed and the next candidate hit raises an
             // unhandled #DB in the target. Clear them on every thread first.
             try { if (_armedProbeAddrs.Length > 0) DisarmProbeAllThreads(); } catch { /* best effort */ }
             try { _pt?.Dispose(); _pt = null; } catch { /* best effort — stops PT tracing */ }
-            try { NativeMethods.DebugActiveProcessStop((uint)_pid); } catch { /* best effort */ }
-            Log?.Invoke("detached from target (left running).");
+            try
+            {
+                if (NativeMethods.DebugActiveProcessStop((uint)_pid))
+                {
+                    _attached = false;
+                    Log?.Invoke("detached from target (left running).");
+                }
+            }
+            catch { /* best effort; a later finally/Dispose may retry */ }
         }
 
         // --- hardware branch probe (arm / disarm / service / hit) ----------------------
@@ -828,13 +872,15 @@ namespace Cda.Core.Engine
                     return;
                 }
                 _dialogSession = session;
-                foreach (var f in fresh) _dialogHookedAddrs.Add(f.Address);
+                var hooked = new HashSet<ulong>(session.HookedTargets);
+                var installed = fresh.FindAll(f => hooked.Contains(f.Address));
+                foreach (var f in installed) _dialogHookedAddrs.Add(f.Address);
                 foreach (var m in dlg.Modules)
                     if (!_dialogModules.Exists(x => x.BaseAddress == m.BaseAddress)) _dialogModules.Add(m);
 
                 var ds = new TraceDataset { TimeStart = 0, TimeEnd = 1 };
                 ds.Modules.AddRange(_dialogModules);
-                ds.Functions.AddRange(fresh);
+                ds.Functions.AddRange(installed);
                 ds.PruneUnreferencedModules();
 
                 _hooked = true;
@@ -844,17 +890,33 @@ namespace Cda.Core.Engine
                 {
                     Pid = _pid, Is64Bit = is64, Mode = _mode, Session = session, Dataset = ds,
                     ModuleMap = map, Instrumented = instrumented, Skipped = skipped, FirstError = firstError,
-                    DistinctApis = fresh.Count, ApiModules = dlg.Modules.Count,
+                    DistinctApis = installed.Count, ApiModules = ds.Modules.Count,
                 });
             }
             else
             {
-                // A later host: mark hooked and let the UI install them (HookMore must
-                // run on the poll thread). Marking now prevents re-raising on retries.
-                foreach (var f in fresh) _dialogHookedAddrs.Add(f.Address);
-                Log?.Invoke($"dialog capture: {fresh.Count} more dialog function(s) available (from " +
-                            $"{ensureName ?? "a newly-loaded module"}) — installing…");
-                MoreDialogsHooked?.Invoke(fresh);
+                // Install before continuing this LOAD_DLL event. Deferring HookMore to
+                // the UI let the target run and call the newly mapped APIs first.
+                int added = _dialogSession.HookMore(addrs, out _, out string? firstError);
+                var hooked = new HashSet<ulong>(_dialogSession.HookedTargets);
+                var installed = fresh.FindAll(f => hooked.Contains(f.Address));
+                foreach (var f in installed) _dialogHookedAddrs.Add(f.Address);
+
+                if (added <= 0 || installed.Count == 0)
+                {
+                    Log?.Invoke($"later dialog module added no hooks ({firstError ?? "already hooked"}); will retry on a later loader event.");
+                    return;
+                }
+
+                var moduleBases = new HashSet<ulong>();
+                foreach (var f in installed) moduleBases.Add(f.ModuleBase);
+                var installedModules = dlg.Modules.FindAll(m => moduleBases.Contains(m.BaseAddress));
+                foreach (var m in installedModules)
+                    if (!_dialogModules.Exists(x => x.BaseAddress == m.BaseAddress)) _dialogModules.Add(m);
+
+                Log?.Invoke($"hooked {installed.Count} dialog function(s) from " +
+                            $"{ensureName ?? "a newly-loaded module"} before resuming its LOAD_DLL event.");
+                MoreDialogsHooked?.Invoke(installed, installedModules);
             }
         }
 

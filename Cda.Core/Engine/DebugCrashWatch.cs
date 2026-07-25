@@ -82,7 +82,18 @@ namespace Cda.Core.Engine
         /// <summary>Ask the loop to detach (leaving the target running) and end. Non-blocking.</summary>
         public void Stop() => _stop = true;
 
-        public void Dispose() => _stop = true;
+        public bool WaitForExit(int timeoutMs)
+        {
+            Thread? thread = _thread;
+            return thread == null || ReferenceEquals(Thread.CurrentThread, thread) ||
+                   thread.Join(timeoutMs);
+        }
+
+        public void Dispose()
+        {
+            Stop();
+            WaitForExit(1000);
+        }
 
         private void Run()
         {
@@ -93,6 +104,9 @@ namespace Cda.Core.Engine
             int U = IntPtr.Size == 8 ? 16 : 12;
             bool attached = false;
             bool processGone = false;
+            bool eventPending = false;
+            uint pendingPid = 0, pendingTid = 0;
+            uint pendingStatus = NativeMethods.DBG_CONTINUE;
             try
             {
                 if (!NativeMethods.DebugActiveProcess((uint)_pid))
@@ -132,12 +146,19 @@ namespace Cda.Core.Engine
                     uint evtPid = (uint)Marshal.ReadInt32(evt, 4);
                     uint evtTid = (uint)Marshal.ReadInt32(evt, 8);
                     uint cont = NativeMethods.DBG_CONTINUE;
+                    eventPending = true;
+                    pendingPid = evtPid;
+                    pendingTid = evtTid;
+                    pendingStatus = cont;
 
                     if (code == NativeMethods.EXIT_PROCESS_DEBUG_EVENT)
                     {
                         uint exit = (uint)Marshal.ReadInt32(evt, U); // EXIT_PROCESS_DEBUG_INFO.dwExitCode
-                        NativeMethods.ContinueDebugEvent(evtPid, evtTid, NativeMethods.DBG_CONTINUE);
-                        processGone = true;
+                        if (NativeMethods.ContinueDebugEvent(evtPid, evtTid, NativeMethods.DBG_CONTINUE))
+                        {
+                            eventPending = false;
+                            processGone = true;
+                        }
                         try { Exited?.Invoke(exit); } catch { }
                         return;
                     }
@@ -215,7 +236,11 @@ namespace Cda.Core.Engine
                         }
                     }
 
-                    NativeMethods.ContinueDebugEvent(evtPid, evtTid, cont);
+                    pendingStatus = cont;
+                    if (NativeMethods.ContinueDebugEvent(evtPid, evtTid, cont))
+                        eventPending = false;
+                    else
+                        break;
                     if (_stop) break;
                 }
             }
@@ -225,6 +250,10 @@ namespace Cda.Core.Engine
             }
             finally
             {
+                if (eventPending)
+                {
+                    try { NativeMethods.ContinueDebugEvent(pendingPid, pendingTid, pendingStatus); } catch { }
+                }
                 if (attached && !processGone)
                 {
                     try { NativeMethods.DebugActiveProcessStop((uint)_pid); } catch { }

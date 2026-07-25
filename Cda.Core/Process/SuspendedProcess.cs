@@ -135,7 +135,13 @@ namespace Cda.Core.Process
             return imageBase;
         }
 
-        public void Resume() => NativeMethods.ResumeThread(_hThread);
+        public void Resume()
+        {
+            uint previous = NativeMethods.ResumeThread(_hThread);
+            if (previous == uint.MaxValue)
+                throw new System.ComponentModel.Win32Exception(
+                    Marshal.GetLastWin32Error(), "Could not resume the launched target.");
+        }
 
         public void Dispose()
         {

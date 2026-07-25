@@ -150,18 +150,36 @@ namespace Cda.Core.Process
                 NativeMethods.LIST_MODULES_ALL);
             if (needed == 0) return result;
 
-            int count = (int)(needed / (uint)IntPtr.Size);
-            var mods = new IntPtr[count];
-            if (!NativeMethods.EnumProcessModulesEx(_handle, mods, needed, out needed,
-                    NativeMethods.LIST_MODULES_ALL))
-                return result;
-
-            var name = new char[260];
-            foreach (var m in mods)
+            IntPtr[] mods = Array.Empty<IntPtr>();
+            uint returnedBytes = 0;
+            for (int attempt = 0; attempt < 8; attempt++)
             {
+                ulong count64 = ((ulong)needed + (uint)IntPtr.Size - 1) / (uint)IntPtr.Size;
+                if (count64 == 0 || count64 > 1_000_000)
+                    return result;
+
+                mods = new IntPtr[(int)count64];
+                uint capacityBytes = checked((uint)(mods.Length * IntPtr.Size));
+                if (!NativeMethods.EnumProcessModulesEx(_handle, mods, capacityBytes,
+                        out returnedBytes, NativeMethods.LIST_MODULES_ALL))
+                    return result;
+
+                // Modules can load between the sizing and fill calls. Retry with the
+                // newly reported size instead of silently returning a truncated map.
+                if (returnedBytes <= capacityBytes)
+                    break;
+                needed = returnedBytes;
+            }
+
+            if (mods.Length == 0 || returnedBytes > (ulong)mods.Length * (uint)IntPtr.Size)
+                return result;
+            int returnedCount = Math.Min(mods.Length, (int)(returnedBytes / (uint)IntPtr.Size));
+
+            for (int moduleIndex = 0; moduleIndex < returnedCount; moduleIndex++)
+            {
+                IntPtr m = mods[moduleIndex];
                 if (m == IntPtr.Zero) continue;
-                uint len = NativeMethods.GetModuleFileNameExW(_handle, m, name, (uint)name.Length);
-                string path = len > 0 ? new string(name, 0, (int)len) : "";
+                string path = ReadModulePath(m);
                 string shortName = path.Length > 0 ? System.IO.Path.GetFileName(path) : "0x" + m.ToString("X");
 
                 ulong size = 0;
@@ -187,6 +205,21 @@ namespace Cda.Core.Process
                     preferredBaseAddress: preferredBase));
             }
             return result;
+        }
+
+        private string ReadModulePath(IntPtr module)
+        {
+            for (int capacity = 260; ;)
+            {
+                var buffer = new char[capacity];
+                uint length = NativeMethods.GetModuleFileNameExW(
+                    _handle, module, buffer, (uint)buffer.Length);
+                if (length == 0) return "";
+                if (length < buffer.Length)
+                    return new string(buffer, 0, (int)length);
+                if (capacity == 32_768) return "";
+                capacity = Math.Min(capacity * 2, 32_768);
+            }
         }
 
         public void Dispose()

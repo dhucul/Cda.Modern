@@ -63,6 +63,7 @@ namespace Cda.Core.Engine
         private int _pid;
         private bool _hooked;
         private bool _loaderBpSeen; // the loader breakpoint has been consumed
+        private bool _attached;
 
         public DebugLoadCapture(string hostPath, string commandLine, string dllPath,
             int maxFunctions, int candidatePool, int bufferRecords, bool disableAslr = false)
@@ -86,7 +87,18 @@ namespace Cda.Core.Engine
         /// <summary>Ask the loop to detach from the host and end (non-blocking).</summary>
         public void Stop() => _stop = true;
 
-        public void Dispose() => Stop();
+        public bool WaitForExit(int timeoutMs)
+        {
+            Thread? thread = _thread;
+            return thread == null || ReferenceEquals(Thread.CurrentThread, thread) ||
+                   thread.Join(timeoutMs);
+        }
+
+        public void Dispose()
+        {
+            Stop();
+            WaitForExit(1000);
+        }
 
         private void Run()
         {
@@ -96,6 +108,9 @@ namespace Cda.Core.Engine
             // x64 (offset 16) and 4-byte aligned on x86 (offset 12).
             IntPtr evt = Marshal.AllocHGlobal(4096);
             int U = IntPtr.Size == 8 ? 16 : 12;
+            bool eventPending = false;
+            uint pendingPid = 0, pendingTid = 0;
+            uint pendingStatus = NativeMethods.DBG_CONTINUE;
             try
             {
                 string? workDir = Path.GetDirectoryName(_hostPath);
@@ -108,6 +123,7 @@ namespace Cda.Core.Engine
                     return;
                 }
                 _pid = (int)pi.dwProcessId;
+                _attached = true;
                 NativeMethods.CloseHandle(pi.hThread);
                 NativeMethods.CloseHandle(pi.hProcess);
 
@@ -133,6 +149,10 @@ namespace Cda.Core.Engine
                     uint evtPid = (uint)Marshal.ReadInt32(evt, 4);
                     uint evtTid = (uint)Marshal.ReadInt32(evt, 8);
                     uint cont = NativeMethods.DBG_CONTINUE;
+                    eventPending = true;
+                    pendingPid = evtPid;
+                    pendingTid = evtTid;
+                    pendingStatus = cont;
 
                     switch (code)
                     {
@@ -189,13 +209,21 @@ namespace Cda.Core.Engine
                         }
 
                         case NativeMethods.EXIT_PROCESS_DEBUG_EVENT:
-                            NativeMethods.ContinueDebugEvent(evtPid, evtTid, NativeMethods.DBG_CONTINUE);
+                            if (NativeMethods.ContinueDebugEvent(evtPid, evtTid, NativeMethods.DBG_CONTINUE))
+                            {
+                                eventPending = false;
+                                _attached = false;
+                            }
                             Log?.Invoke("host exited.");
                             TargetExited?.Invoke();
                             return;
                     }
 
-                    NativeMethods.ContinueDebugEvent(evtPid, evtTid, cont);
+                    pendingStatus = cont;
+                    if (NativeMethods.ContinueDebugEvent(evtPid, evtTid, cont))
+                        eventPending = false;
+                    else
+                        break;
 
                     if (_stop) { Detach(); break; }
                 }
@@ -206,14 +234,27 @@ namespace Cda.Core.Engine
             }
             finally
             {
+                if (eventPending)
+                {
+                    try { NativeMethods.ContinueDebugEvent(pendingPid, pendingTid, pendingStatus); } catch { }
+                }
+                Detach();
                 Marshal.FreeHGlobal(evt);
             }
         }
 
         private void Detach()
         {
-            try { NativeMethods.DebugActiveProcessStop((uint)_pid); } catch { /* best effort */ }
-            Log?.Invoke("detached from host (left running).");
+            if (!_attached) return;
+            try
+            {
+                if (NativeMethods.DebugActiveProcessStop((uint)_pid))
+                {
+                    _attached = false;
+                    Log?.Invoke("detached from host (left running).");
+                }
+            }
+            catch { /* best effort; a later finally/Dispose may retry */ }
         }
 
         private static void CloseEventFile(IntPtr h)

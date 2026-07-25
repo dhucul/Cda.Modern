@@ -133,7 +133,18 @@ namespace Cda.Core.Engine
         /// </summary>
         public void Stop() => _stop = true;
 
-        public void Dispose() => Stop();
+        public bool WaitForExit(int timeoutMs)
+        {
+            Thread? thread = _thread;
+            return thread == null || ReferenceEquals(Thread.CurrentThread, thread) ||
+                   thread.Join(timeoutMs);
+        }
+
+        public void Dispose()
+        {
+            Stop();
+            WaitForExit(1000);
+        }
 
         private void Run()
         {
@@ -142,6 +153,9 @@ namespace Cda.Core.Engine
             // header, 8-byte aligned on x64 = offset 16, 4-byte aligned on x86 = 12).
             IntPtr evt = Marshal.AllocHGlobal(4096);
             int U = IntPtr.Size == 8 ? 16 : 12;
+            bool eventPending = false;
+            uint pendingPid = 0, pendingTid = 0;
+            uint pendingStatus = NativeMethods.DBG_CONTINUE;
             try
             {
                 string? workDir = Path.GetDirectoryName(_exePath);
@@ -186,6 +200,10 @@ namespace Cda.Core.Engine
                     uint evtPid = (uint)Marshal.ReadInt32(evt, 4);
                     uint evtTid = (uint)Marshal.ReadInt32(evt, 8);
                     uint cont = NativeMethods.DBG_CONTINUE;
+                    eventPending = true;
+                    pendingPid = evtPid;
+                    pendingTid = evtTid;
+                    pendingStatus = cont;
 
                     switch (code)
                     {
@@ -279,14 +297,21 @@ namespace Cda.Core.Engine
                             }
 
                             ProcessExited?.Invoke((int)evtPid);
-                            NativeMethods.ContinueDebugEvent(evtPid, evtTid, NativeMethods.DBG_CONTINUE);
+                            if (NativeMethods.ContinueDebugEvent(evtPid, evtTid, NativeMethods.DBG_CONTINUE))
+                                eventPending = false;
+                            else
+                                return;
                             if (last) { TreeExited?.Invoke(); return; }
                             if (_stop) { DisposeAllSessions(); DetachAll(); return; }
                             continue; // already continued this event
                         }
                     }
 
-                    NativeMethods.ContinueDebugEvent(evtPid, evtTid, cont);
+                    pendingStatus = cont;
+                    if (NativeMethods.ContinueDebugEvent(evtPid, evtTid, cont))
+                        eventPending = false;
+                    else
+                        break;
                     if (_stop) { DisposeAllSessions(); DetachAll(); break; }
                 }
             }
@@ -296,6 +321,12 @@ namespace Cda.Core.Engine
             }
             finally
             {
+                if (eventPending)
+                {
+                    try { NativeMethods.ContinueDebugEvent(pendingPid, pendingTid, pendingStatus); } catch { }
+                }
+                try { DisposeAllSessions(); } catch { }
+                try { DetachAll(); } catch { }
                 Marshal.FreeHGlobal(evt);
             }
         }
@@ -456,11 +487,20 @@ namespace Cda.Core.Engine
         {
             int[] pids = new int[_live.Count];
             _live.CopyTo(pids);
+            bool detachedAny = false;
             foreach (int p in pids)
             {
-                try { NativeMethods.DebugActiveProcessStop((uint)p); } catch { /* best effort */ }
+                try
+                {
+                    if (NativeMethods.DebugActiveProcessStop((uint)p))
+                    {
+                        _live.Remove(p);
+                        detachedAny = true;
+                    }
+                }
+                catch { /* best effort; the final cleanup pass may retry */ }
             }
-            Log?.Invoke("detached from the process tree (left running).");
+            if (detachedAny) Log?.Invoke("detached from the process tree (left running).");
         }
 
         private long Count(int pid) => _counts.TryGetValue(pid, out long v) ? v : 0;

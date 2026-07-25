@@ -82,7 +82,11 @@ namespace Cda.Core.Engine
         }
 
         public void Stop() => _stop = true;
-        public void Dispose() => Stop();
+        public void Dispose()
+        {
+            Stop();
+            WaitForExit(1000);
+        }
 
         /// <summary>
         /// Block until the debug loop has exited (and so has cleared the debug

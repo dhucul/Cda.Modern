@@ -113,6 +113,8 @@ namespace Cda.App.Model
             _addressToNode.Clear();
             _activeNodes.Clear();
             _activeLinks.Clear();
+            ContentWidth = 0;
+            ContentHeight = 0;
 
             _modules.AddRange(data.Modules);
             _records = data.Records;
@@ -146,15 +148,12 @@ namespace Cda.App.Model
 
         private int FindModuleIndex(ulong address)
         {
-            int best = -1;
             for (int i = 0; i < _modules.Count; i++)
             {
-                if (_modules[i].Contains(address)) return i;
-                if (_modules[i].BaseAddress <= address &&
-                    (best < 0 || _modules[i].BaseAddress > _modules[best].BaseAddress))
-                    best = i;
+                if (_modules[i].BaseAddress == address || _modules[i].Contains(address))
+                    return i;
             }
-            return best;
+            return -1;
         }
 
         /// <summary>
@@ -164,6 +163,9 @@ namespace Cda.App.Model
         /// </summary>
         private void BuildLayout(List<List<TracedFunction>> byModule)
         {
+            if (_modules.Count == 0)
+                return;
+
             int numColumns = Math.Max(3, (int)Math.Ceiling(Math.Sqrt(Math.Max(1, _modules.Count))));
             var columnHeights = new double[numColumns];
 
@@ -225,10 +227,17 @@ namespace Cda.App.Model
 
             int lo = Array.BinarySearch(_functionAddrs, address);
             if (lo < 0) lo = ~lo - 1;
-            if (lo < 0) lo = 0;
-            if (lo >= _functionAddrs.Length) lo = _functionAddrs.Length - 1;
+            if (lo < 0 || lo >= _functionAddrs.Length)
+                return -1;
 
-            return _addressToNode.TryGetValue(_functionAddrs[lo], out int idx) ? idx : -1;
+            if (!_addressToNode.TryGetValue(_functionAddrs[lo], out int idx))
+                return -1;
+
+            int moduleIndex = _nodes[idx].ModuleIndex;
+            return moduleIndex >= 0 && moduleIndex < _modules.Count &&
+                   _modules[moduleIndex].Contains(address)
+                ? idx
+                : -1;
         }
 
         /// <summary>

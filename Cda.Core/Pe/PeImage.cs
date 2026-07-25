@@ -137,7 +137,12 @@ namespace Cda.Core.Pe
             return true;
         }
 
-        public ulong RvaToVa(uint rva) => ActualBase + rva;
+        public ulong RvaToVa(uint rva)
+        {
+            if (rva > ulong.MaxValue - ActualBase)
+                throw new BadImageFormatException("RVA overflows the image address space.");
+            return ActualBase + rva;
+        }
 
         /// <summary>
         /// The raw [RVA, size] of a data directory entry (e.g. Export, Import,
@@ -158,7 +163,9 @@ namespace Cda.Core.Pe
         {
             offset = 0;
             if (va < ActualBase) return false;
-            int o = RvaToOffset((uint)(va - ActualBase));
+            ulong delta = va - ActualBase;
+            if (delta > uint.MaxValue) return false;
+            int o = RvaToOffset((uint)delta);
             if (o < 0) return false;
             offset = (uint)o;
             return true;
@@ -166,14 +173,23 @@ namespace Cda.Core.Pe
 
         private int RvaToOffset(uint rva)
         {
-            if (_mapped) return (int)rva;
+            if (_mapped)
+                return rva < (ulong)_data.Length && rva <= int.MaxValue ? (int)rva : -1;
+
             foreach (var s in _sections)
             {
-                if (rva >= s.VirtualAddress && rva < s.VirtualAddress + Math.Max(s.VirtualSize, s.RawSize))
-                    return (int)(rva - s.VirtualAddress + s.RawPointer);
+                ulong extent = Math.Max(s.VirtualSize, s.RawSize);
+                if (rva < s.VirtualAddress || (ulong)rva - s.VirtualAddress >= extent)
+                    continue;
+
+                ulong delta = (ulong)rva - s.VirtualAddress;
+                if (delta >= s.RawSize) return -1; // virtual zero-fill has no file backing
+                ulong raw = (ulong)s.RawPointer + delta;
+                return raw < (ulong)_data.Length && raw <= int.MaxValue ? (int)raw : -1;
             }
             // Headers region (rva below first section) maps 1:1 in the file too.
-            if (rva < (_sections.Count > 0 ? _sections[0].VirtualAddress : SizeOfImage))
+            if (rva < (_sections.Count > 0 ? _sections[0].VirtualAddress : SizeOfImage) &&
+                rva < (ulong)_data.Length && rva <= int.MaxValue)
                 return (int)rva;
             return -1;
         }
@@ -188,7 +204,7 @@ namespace Cda.Core.Pe
                 throw new BadImageFormatException("Not a DOS/PE image (missing MZ).");
 
             int peOff = (int)U32(0x3C);
-            if (peOff <= 0 || peOff + 24 > _data.Length || U32(peOff) != 0x00004550) // 'PE\0\0'
+            if (peOff <= 0 || peOff > _data.Length - 24 || U32(peOff) != 0x00004550) // 'PE\0\0'
                 throw new BadImageFormatException("Missing PE signature.");
 
             int coff = peOff + 4;
@@ -196,11 +212,18 @@ namespace Cda.Core.Pe
             ushort numSections = U16(coff + 2);
             ushort optSize = U16(coff + 16);
             _optionalHeaderOffset = coff + 20;
+            int optionalEnd = _optionalHeaderOffset + optSize;
+            if (optionalEnd < _optionalHeaderOffset || optionalEnd > _data.Length || optSize < 2)
+                throw new BadImageFormatException("Truncated optional header.");
 
             ushort magic = U16(_optionalHeaderOffset);
             Is64Bit = magic == 0x20B;
             if (magic != 0x10B && magic != 0x20B)
                 throw new BadImageFormatException($"Unknown optional header magic 0x{magic:X}.");
+
+            int minimumOptionalSize = Is64Bit ? 112 : 96;
+            if (optSize < minimumOptionalSize)
+                throw new BadImageFormatException("Optional header is too small.");
 
             EntryPointRva = U32(_optionalHeaderOffset + 16);
 
@@ -220,7 +243,8 @@ namespace Cda.Core.Pe
 
             uint numDirs = U32(dirCountOffset);
             int dirOff = dirCountOffset + 4;
-            for (int i = 0; i < 16 && i < numDirs; i++)
+            int availableDirs = Math.Max(0, (optionalEnd - dirOff) / 8);
+            for (int i = 0; i < 16 && i < numDirs && i < availableDirs; i++)
             {
                 _dirs[i] = (U32(dirOff + i * 8), U32(dirOff + i * 8 + 4));
             }

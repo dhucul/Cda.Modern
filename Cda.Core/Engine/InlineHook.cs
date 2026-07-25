@@ -69,9 +69,6 @@ namespace Cda.Core.Engine
             skipReason = null;
             int bitness = arch.Is64Bit ? 64 : 32;
 
-            byte[] window = new byte[32];
-            mem.Read(target, window);
-
             // Reserve exactly what the entry jump needs: 5 bytes for an in-range
             // E9, or 14 for the x64 absolute indirect jump. Knowing the detour
             // address now avoids over-stealing 14 bytes from small functions when
@@ -79,10 +76,24 @@ namespace Cda.Core.Engine
             byte[] detourJmp = BuildJump(target, detour, arch.Is64Bit);
             int minPatch = detourJmp.Length;
 
+            byte[] window = new byte[32];
+            int read = mem.Read(target, window);
+            if (read < minPatch)
+            {
+                skipReason = $"Only {read} byte(s) were readable at the target; {minPatch} required.";
+                return false;
+            }
+            if (read != window.Length) Array.Resize(ref window, read);
+
             int patchLen = Disasm.HookLengthBytes(bitness, window, minPatch);
-            if (patchLen == 0)
+            if (patchLen == 0 || patchLen > read)
             {
                 skipReason = "Could not decode a clean patch site at the target.";
+                return false;
+            }
+            if ((ulong)patchLen > ulong.MaxValue - target)
+            {
+                skipReason = "The patch site crosses the end of the address space.";
                 return false;
             }
 
@@ -159,10 +170,30 @@ namespace Cda.Core.Engine
         {
             if (_activated || _removed) return;
             uint old = _mem.Protect(Target, PatchLength, Process.NativeMethods.PAGE_EXECUTE_READWRITE);
-            _mem.Write(Target, _patch);
-            _mem.Protect(Target, PatchLength, old);
-            _mem.Flush(Target, PatchLength);
+            // Establish conservative ownership before the first write. If a partial
+            // cross-process write fails and rollback also fails, IsActive remains true
+            // so the owning session retains this hook and retries removal at teardown.
             _activated = true;
+            try
+            {
+                _mem.Write(Target, _patch);
+                _mem.Flush(Target, PatchLength);
+            }
+            catch
+            {
+                try
+                {
+                    _mem.Write(Target, _original);
+                    _mem.Flush(Target, PatchLength);
+                    _activated = false;
+                }
+                catch { /* the site may still be patched; keep it owned */ }
+                throw;
+            }
+            finally
+            {
+                _mem.Protect(Target, PatchLength, old);
+            }
         }
 
         /// <summary>
@@ -174,10 +205,10 @@ namespace Cda.Core.Engine
         /// </summary>
         public bool OwnsAddress(ulong addr, int stubSize)
         {
-            if (addr >= Target && addr < Target + (ulong)PatchLength) return true;
-            if (addr >= Detour && addr < Detour + (ulong)stubSize) return true;
+            if (addr >= Target && addr - Target < (ulong)PatchLength) return true;
+            if (stubSize > 0 && addr >= Detour && addr - Detour < (ulong)stubSize) return true;
             int trampSize = PatchLength * 2 + 64; // matches the AllocateNear size in TryInstall
-            if (addr >= Trampoline && addr < Trampoline + (ulong)trampSize) return true;
+            if (addr >= Trampoline && addr - Trampoline < (ulong)trampSize) return true;
             return false;
         }
 
@@ -187,10 +218,17 @@ namespace Cda.Core.Engine
             if (_removed) return;
             if (!_activated) { _removed = true; return; }
             uint old = _mem.Protect(Target, PatchLength, Process.NativeMethods.PAGE_EXECUTE_READWRITE);
-            _mem.Write(Target, _original);
-            _mem.Protect(Target, PatchLength, old);
-            _mem.Flush(Target, PatchLength);
-            _removed = true;
+            try
+            {
+                _mem.Write(Target, _original);
+                _mem.Flush(Target, PatchLength);
+                _activated = false;
+                _removed = true;
+            }
+            finally
+            {
+                _mem.Protect(Target, PatchLength, old);
+            }
         }
 
         /// <summary>
@@ -208,7 +246,9 @@ namespace Cda.Core.Engine
             var reader = new ByteArrayCodeReader(code, 0, read);
             var decoder = Decoder.Create(bitness, reader, target, DecoderOptions.None);
             ulong lo = target;
-            ulong hi = target + (ulong)patchLen;
+            ulong hi = (ulong)patchLen > ulong.MaxValue - target
+                ? ulong.MaxValue
+                : target + (ulong)patchLen;
 
             while (reader.CanReadByte)
             {
@@ -234,13 +274,34 @@ namespace Cda.Core.Engine
         /// </summary>
         private static byte[] BuildJump(ulong from, ulong to, bool is64)
         {
-            long rel = (long)to - (long)(from + 5);
-            if (!is64 || (rel >= int.MinValue && rel <= int.MaxValue))
+            if (!is64)
             {
+                if (from > uint.MaxValue || to > uint.MaxValue)
+                    throw new ArgumentOutOfRangeException(nameof(to), "An x86 jump target must fit in 32 bits.");
+                uint next = unchecked((uint)from + 5);
+                int rel32 = unchecked((int)((uint)to - next));
                 var b = new byte[5];
                 b[0] = 0xE9;
-                BinaryPrimitives.WriteInt32LittleEndian(b.AsSpan(1), (int)rel);
+                BinaryPrimitives.WriteInt32LittleEndian(b.AsSpan(1), rel32);
                 return b;
+            }
+
+            if (from <= ulong.MaxValue - 5)
+            {
+                ulong next = from + 5;
+                bool fits = to >= next
+                    ? to - next <= int.MaxValue
+                    : next - to <= 0x80000000UL;
+                if (fits)
+                {
+                    long signed = to >= next
+                        ? (long)(to - next)
+                        : -(long)(next - to);
+                    var b = new byte[5];
+                    b[0] = 0xE9;
+                    BinaryPrimitives.WriteInt32LittleEndian(b.AsSpan(1), (int)signed);
+                    return b;
+                }
             }
 
             var far = new byte[14];

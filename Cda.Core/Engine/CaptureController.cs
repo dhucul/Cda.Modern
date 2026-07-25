@@ -69,6 +69,11 @@ namespace Cda.Core.Engine
             TimeSpan duration, Func<CallRecord, bool>? filter = null,
             int maxFunctions = 512, int bufferRecords = 65536, int pollMs = 100)
         {
+            if (duration < TimeSpan.Zero)
+                throw new ArgumentOutOfRangeException(nameof(duration));
+            if (pollMs <= 0)
+                throw new ArgumentOutOfRangeException(nameof(pollMs), "Poll interval must be positive.");
+
             var records = new List<CallRecord>();
             if (addresses.Count > 0)
             {
@@ -78,9 +83,13 @@ namespace Cda.Core.Engine
                 try
                 {
                     var sw = Stopwatch.StartNew();
-                    while (sw.Elapsed < duration)
+                    while (true)
                     {
-                        Thread.Sleep(pollMs);
+                        TimeSpan remaining = duration - sw.Elapsed;
+                        if (remaining <= TimeSpan.Zero) break;
+                        int sleep = (int)Math.Min(pollMs,
+                            Math.Max(1, Math.Ceiling(remaining.TotalMilliseconds)));
+                        Thread.Sleep(sleep);
                         Collect(capture.Poll(), records, filter);
                     }
                     Collect(capture.Poll(), records, filter); // final drain

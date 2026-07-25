@@ -82,6 +82,8 @@ namespace Cda.App
         private Func<List<ExtractedString>>? _pendingStringScan;
         private TraceDataset? _pendingStringScanDs;
         private int _stringScanGen; // bumps on every target change; invalidates an in-flight scan
+        private int _targetGeneration; // invalidates stale target-opening continuations and debugger callbacks
+        private int _targetBusyGeneration; // owns the wait cursor for one target-opening continuation
 
         // --- startup-trace crash watch --------------------------------------
         // The "Launch & capture" path runs the target under a side debugger
@@ -426,6 +428,7 @@ namespace Cda.App
             StopApiLaunch();
             StopChildFollow();
             StopCaptureQuietly(); // defers disposal if a background poll is in flight
+            int targetGeneration = unchecked(++_targetGeneration);
 
             // A static file view doesn't use the live session; release it so we
             // don't hold the target's process handle open while browsing a file,
@@ -463,6 +466,8 @@ namespace Cda.App
                 try
                 {
                     var pe = await Task.Run(() => ProbePeHeader(path));
+                    if (targetGeneration != _targetGeneration)
+                        return;
                     bool is64 = pe.Is64Bit;
 
                     // Discover on a worker, reading through a short-lived mapped source
@@ -478,6 +483,9 @@ namespace Cda.App
                         CallSiteScanner.ScanFileImage(scanSrc, pe, arch, fs, es, maxEdges: 20000);
                         return (fs, es);
                     });
+
+                    if (targetGeneration != _targetGeneration)
+                        return;
 
                     var module = new ModuleInfo(name, pe.PreferredImageBase, pe.SizeOfImage, path,
                         preferredBaseAddress: pe.PreferredImageBase);
@@ -512,7 +520,8 @@ namespace Cda.App
                 }
                 catch (Exception ex)
                 {
-                    StatusText.Text = $"Couldn't open {name}: {ex.Message}";
+                    if (targetGeneration == _targetGeneration)
+                        StatusText.Text = $"Couldn't open {name}: {ex.Message}";
                 }
                 return;
             }
@@ -523,6 +532,11 @@ namespace Cda.App
                 // module, so do it off the UI thread — otherwise the window appears
                 // frozen and looks like nothing happened.
                 var r = await Task.Run(() => OpenModuleCore(path, name));
+                if (targetGeneration != _targetGeneration)
+                {
+                    r.Managed?.Dispose();
+                    return;
+                }
 
                 _currentPe = r.Pe;
                 _is64 = r.Pe.Is64Bit;
@@ -563,7 +577,8 @@ namespace Cda.App
             }
             catch (Exception ex)
             {
-                StatusText.Text = $"Couldn't open {name}: {ex.Message}";
+                if (targetGeneration == _targetGeneration)
+                    StatusText.Text = $"Couldn't open {name}: {ex.Message}";
             }
         }
 
@@ -947,6 +962,7 @@ namespace Cda.App
             };
             if (dlg.ShowDialog() != true) return;
             string exe = dlg.FileName;
+            int targetGeneration = unchecked(++_targetGeneration);
 
             // Managed discovery is unavailable for 32-bit .NET targets because
             // ClrMD's DAC attach is same-bitness and CDA now ships one x64 host.
@@ -970,7 +986,7 @@ namespace Cda.App
             // session swap below), which also avoids the old poll racing a replaced session.
             _diag.Clear();
             Diag($"launch .NET: {System.IO.Path.GetFileName(exe)} — starting with DOTNET_TieredCompilation=0…");
-            System.Windows.Input.Mouse.OverrideCursor = System.Windows.Input.Cursors.Wait;
+            BeginTargetBusyCursor(targetGeneration);
             try
             {
                 int pid;
@@ -1018,6 +1034,8 @@ namespace Cda.App
                     }
                     return false;
                 });
+                if (targetGeneration != _targetGeneration)
+                    return;
 
                 if (!clrUp)
                 {
@@ -1034,6 +1052,11 @@ namespace Cda.App
                 // current capture — on a mismatch, stop the target we launched (it can't be
                 // captured from this build) and leave any running trace untouched.
                 var session = await Task.Run(() => LiveSession.Attach(pid));
+                if (targetGeneration != _targetGeneration)
+                {
+                    session.Dispose();
+                    return;
+                }
                 if (!session.Is64Bit)
                 {
                     Diag("the launched target is a 32-bit .NET process. CDA's x64 build can capture native calls, but ClrMD cannot discover managed methods cross-bitness. The launched process was stopped.");
@@ -1047,6 +1070,8 @@ namespace Cda.App
                 // before the swap — no window for the old poll to hit a new session) and
                 // adopt the fresh live session.
                 StopCapture();
+                targetGeneration = unchecked(++_targetGeneration);
+                BeginTargetBusyCursor(targetGeneration);
                 _session?.Dispose();
                 _session = session;
                 _offlineTrace = false;
@@ -1061,10 +1086,13 @@ namespace Cda.App
             }
             catch (Exception ex)
             {
-                Diag("launch .NET failed: " + ex.Message);
-                if (StatusText != null) StatusText.Text = "Launch .NET failed: " + ex.Message;
+                if (targetGeneration == _targetGeneration)
+                {
+                    Diag("launch .NET failed: " + ex.Message);
+                    if (StatusText != null) StatusText.Text = "Launch .NET failed: " + ex.Message;
+                }
             }
-            finally { System.Windows.Input.Mouse.OverrideCursor = null; }
+            finally { EndTargetBusyCursor(targetGeneration); }
         }
 
         // Shared core (requires _session set): discover the target's JIT-compiled app
@@ -1074,6 +1102,8 @@ namespace Cda.App
         private async Task StartManagedCapture()
         {
             if (_session == null) return;
+            var managedSession = _session;
+            int targetGeneration = _targetGeneration;
 
             // ClrMD loads a bitness-specific DAC into CDA, so the x64-only host
             // cannot discover a 32-bit .NET target's JIT method addresses. Native
@@ -1086,12 +1116,15 @@ namespace Cda.App
                 return;
             }
 
-            int pid = _session.Process.Pid;
+            int pid = managedSession.Process.Pid;
             bool captureReturns = CaptureReturns?.IsChecked == true;
-            System.Windows.Input.Mouse.OverrideCursor = System.Windows.Input.Cursors.Wait;
+            BeginTargetBusyCursor(targetGeneration);
             try
             {
-                if (!await Task.Run(() => IsClrLoaded(pid)))
+                bool clrLoaded = await Task.Run(() => IsClrLoaded(pid));
+                if (targetGeneration != _targetGeneration || !ReferenceEquals(_session, managedSession))
+                    return;
+                if (!clrLoaded)
                 {
                     Diag("No CLR runtime module (coreclr.dll/clr.dll) is loaded — the target is native or NativeAOT. Use the native capture buttons.");
                     if (StatusText != null) StatusText.Text = "Not a managed (.NET) process.";
@@ -1107,6 +1140,8 @@ namespace Cda.App
                     var m = ManagedMethodScanner.ScanJitted(pid, out var err);
                     return (m, err);
                 });
+                if (targetGeneration != _targetGeneration || !ReferenceEquals(_session, managedSession))
+                    return;
                 if (scanErr != null) Diag("managed method discovery (ClrMD): " + scanErr);
                 var app = methods.FindAll(m => !ManagedMethodScanner.IsFrameworkModule(m.ModuleName));
 
@@ -1122,20 +1157,24 @@ namespace Cda.App
                     _managedLiveNames[m.NativeCode] = m.FullName;
                     ds.Functions.Add(new TracedFunction(m.NativeCode, m.ModuleImageBase, m.FullName));
                     if (!modules.ContainsKey(m.ModuleImageBase))
-                        modules[m.ModuleImageBase] = new ModuleInfo(m.ModuleName, m.ModuleImageBase, 0, m.ModuleName);
+                        modules[m.ModuleImageBase] =
+                            managedSession.Modules.Resolve(m.NativeCode) ??
+                            new ModuleInfo(m.ModuleName, m.ModuleImageBase, 0, m.ModuleName);
                 }
                 ds.Modules.AddRange(modules.Values);
 
                 // Tear down any prior capture and set up the live managed view. This is a
                 // live trace, not the static managed file view, so clear that.
                 StopCapture();
+                targetGeneration = unchecked(++_targetGeneration);
+                BeginTargetBusyCursor(targetGeneration);
                 SetManaged(null);
                 _offlineTrace = false;
                 _childView = false;
                 _apiCaptureMode = true; // broad trace: clicking a method inspects, never re-hooks
                 _currentPe = null;
                 _liveDataset = ds;
-                _moduleMap = _session.Modules;
+                _moduleMap = managedSession.Modules;
                 _selectedFunctionAddr = 0;
 
                 _model.Load(ds);
@@ -1149,9 +1188,9 @@ namespace Cda.App
                 ClearCallerGraph();
                 ResetRunawayTracking();
                 DisposeFileMap();
-                ulong hexAt = app.Count > 0 ? app[0].NativeCode : _session.Process.MinAddress;
-                Hex.SetSource(_session.Process, hexAt);
-                Disasm.SetSource(_session.Process, hexAt);
+                ulong hexAt = app.Count > 0 ? app[0].NativeCode : managedSession.Process.MinAddress;
+                Hex.SetSource(managedSession.Process, hexAt);
+                Disasm.SetSource(managedSession.Process, hexAt);
 
                 // Empty guard-based Start (creates the session + ring), then hook the
                 // managed JIT entries directly (they have no .pdata for the guard).
@@ -1163,7 +1202,10 @@ namespace Cda.App
                     added = _capture.HookMore(app.ConvertAll(m => m.NativeCode), out _, out string? merr);
                     if (merr != null) Diag("managed hook — first skip: " + merr);
                 }
-                foreach (var m in app) _managedHooked.Add(m.NativeCode);
+                var installed = new HashSet<ulong>(_capture.HookedTargets);
+                foreach (var m in app)
+                    if (installed.Contains(m.NativeCode))
+                        _managedHooked.Add(m.NativeCode);
                 Diag($"managed capture: {added} of {app.Count} app method(s) hooked" +
                      $"{(captureReturns ? " · returns on" : "")} · re-scanning for methods that JIT later…");
 
@@ -1188,10 +1230,14 @@ namespace Cda.App
             }
             catch (Exception ex)
             {
-                Diag("managed capture failed: " + ex.Message);
-                if (StatusText != null) StatusText.Text = "Managed capture failed: " + ex.Message;
+                if (targetGeneration == _targetGeneration &&
+                    ReferenceEquals(_session, managedSession))
+                {
+                    Diag("managed capture failed: " + ex.Message);
+                    if (StatusText != null) StatusText.Text = "Managed capture failed: " + ex.Message;
+                }
             }
-            finally { System.Windows.Input.Mouse.OverrideCursor = null; }
+            finally { EndTargetBusyCursor(targetGeneration); }
         }
 
         // Re-scan the managed target for methods that have JIT-compiled since the last
@@ -1200,8 +1246,11 @@ namespace Cda.App
         private async void OnManagedRescan(object? sender, EventArgs e)
         {
             var cap = _capture;
-            if (cap == null || _session == null || _managedRescanning) return; // skip if a scan is still running
-            int pid = _session.Process.Pid;
+            var session = _session;
+            var dataset = _liveDataset;
+            int targetGeneration = _targetGeneration;
+            if (cap == null || session == null || dataset == null || _managedRescanning) return; // skip if a scan is still running
+            int pid = session.Process.Pid;
 
             // A ClrMD scan of a large app can exceed the 1 s timer interval; the guard
             // stops multiple heavy passive attaches from piling up under load.
@@ -1211,26 +1260,46 @@ namespace Cda.App
                 List<ManagedMethodInfo> methods;
                 try { methods = await Task.Run(() => ManagedMethodScanner.ScanJitted(pid, out _)); }
                 catch { return; }
-                if (_capture != cap || _liveDataset == null) return; // capture changed while scanning
+                if (targetGeneration != _targetGeneration ||
+                    !ReferenceEquals(_capture, cap) ||
+                    !ReferenceEquals(_session, session) ||
+                    !ReferenceEquals(_liveDataset, dataset))
+                    return; // capture changed while scanning
 
                 var fresh = methods.FindAll(m => !ManagedMethodScanner.IsFrameworkModule(m.ModuleName)
                                               && !_managedHooked.Contains(m.NativeCode));
                 if (fresh.Count == 0) return;
 
                 int added = cap.HookMore(fresh.ConvertAll(m => m.NativeCode), out _, out _);
+                var installed = new HashSet<ulong>(cap.HookedTargets);
                 var freshFns = new List<TracedFunction>(fresh.Count);
                 foreach (var m in fresh)
                 {
-                    _managedHooked.Add(m.NativeCode);
+                    if (installed.Contains(m.NativeCode))
+                        _managedHooked.Add(m.NativeCode);
+                    bool firstSeen = !_managedLiveNames.ContainsKey(m.NativeCode);
                     _managedLiveNames[m.NativeCode] = m.FullName;
+                    if (!firstSeen) continue;
                     var tf = new TracedFunction(m.NativeCode, m.ModuleImageBase, m.FullName);
-                    _liveDataset.Functions.Add(tf);
+                    dataset.Functions.Add(tf);
+                    if (!dataset.Modules.Exists(module => module.BaseAddress == m.ModuleImageBase))
+                        dataset.Modules.Add(
+                            session.Modules.Resolve(m.NativeCode) ??
+                            new ModuleInfo(m.ModuleName, m.ModuleImageBase, 0, m.ModuleName));
                     freshFns.Add(tf);
                 }
                 // Append the new methods WITHOUT reloading the list — a reload would rebuild
                 // every row from the dataset (call count 0) and wipe the counts the poll has
                 // been folding into the existing rows.
                 FunctionList.AddFunctions(freshFns, _moduleMap);
+                if (freshFns.Count > 0)
+                {
+                    _model.Load(dataset);
+                    _model.UseLiveRecords(_captured);
+                    GraphView.SetModel(_model);
+                    if (_selectedFunctionAddr != 0)
+                        GraphView.SetSelected(_selectedFunctionAddr);
+                }
                 if (added > 0)
                     Diag($"managed rescan: +{added} newly-JIT'd method(s) hooked (total {_managedHooked.Count}).");
             }
@@ -1348,12 +1417,35 @@ namespace Cda.App
             StartCaptureOn(new List<ulong> { address }, DescribeAddr(address), preserveLog: true);
         }
 
+        private void BeginTargetBusyCursor(int generation)
+        {
+            _targetBusyGeneration = generation;
+            System.Windows.Input.Mouse.OverrideCursor = System.Windows.Input.Cursors.Wait;
+        }
+
+        private void EndTargetBusyCursor(int generation)
+        {
+            if (_targetBusyGeneration != generation) return;
+            _targetBusyGeneration = 0;
+            if (!_captureBursting)
+                System.Windows.Input.Mouse.OverrideCursor = null;
+        }
+
+        private void CancelTargetBusyCursor()
+        {
+            _targetBusyGeneration = 0;
+            if (!_captureBursting)
+                System.Windows.Input.Mouse.OverrideCursor = null;
+        }
+
         // Tear down a running capture (restores the hooked bytes) without freezing
         // the recording into the view — used when switching to another function.
         private void StopCaptureQuietly()
         {
+            unchecked { _targetGeneration++; }
+            CancelTargetBusyCursor();
             _startupActive = false;
-            if (_debugWatch != null) { _debugWatch.Stop(); _debugWatch = null; }
+            StopDebugWatch();
             StopManagedRescan();
             if (_captureBursting) { _captureBursting = false; System.Windows.Input.Mouse.OverrideCursor = null; }
             if (_pollTimer != null) { _pollTimer.Stop(); _pollTimer.Tick -= OnPollTick; _pollTimer = null; }
@@ -1381,6 +1473,7 @@ namespace Cda.App
             StopDllCapture();
             StopApiLaunch();
             StopChildFollow();
+            int targetGeneration = unchecked(++_targetGeneration);
 
             int pid = picker.SelectedPid;
             string label = picker.SelectedEntry?.Name ?? pid.ToString();
@@ -1392,11 +1485,16 @@ namespace Cda.App
             SetManaged(null); // leaving any static managed view (frees its buffer; native addrs can't match tagged keys)
             ClearStringsTab(); // armed below to scan the live process image when the tab is opened
 
-            System.Windows.Input.Mouse.OverrideCursor = System.Windows.Input.Cursors.Wait;
+            BeginTargetBusyCursor(targetGeneration);
             try
             {
                 // Enumeration + code scanning can be slow; keep the UI responsive.
                 var session = await Task.Run(() => LiveSession.Attach(pid));
+                if (targetGeneration != _targetGeneration)
+                {
+                    session.Dispose();
+                    return;
+                }
 
                 _session?.Dispose();
                 _session = session;
@@ -1427,11 +1525,12 @@ namespace Cda.App
             }
             catch (Exception ex)
             {
-                Diag("attach failed: " + ex.Message);
+                if (targetGeneration == _targetGeneration)
+                    Diag("attach failed: " + ex.Message);
             }
             finally
             {
-                System.Windows.Input.Mouse.OverrideCursor = null;
+                EndTargetBusyCursor(targetGeneration);
             }
         }
 
@@ -1479,6 +1578,7 @@ namespace Cda.App
             StopDllCapture();
             StopApiLaunch();
             StopChildFollow();
+            int targetGeneration = unchecked(++_targetGeneration);
             _captured.Clear();
             ResetRunawayTracking();
             ClearStringsTab(); // armed once the target is running (deferred until the tab is opened)
@@ -1550,7 +1650,7 @@ namespace Cda.App
             // (UI) thread, so the window is briefly unresponsive. Show a busy cursor
             // until everything is wired up; it's cleared (with a "ready" message) in
             // the finally at the end, on every path.
-            System.Windows.Input.Mouse.OverrideCursor = System.Windows.Input.Cursors.Wait;
+            BeginTargetBusyCursor(targetGeneration);
 
             // === instrument BEFORE the first instruction runs ================
             ulong imageBase = proc.GetImageBase(out string imageBaseProbe);
@@ -1563,6 +1663,13 @@ namespace Cda.App
                     // is already mapped), then arm a broad set of its functions so the
                     // startup call flow is captured.
                     var (funcs, edges) = await Task.Run(() => DiscoverModuleSuspended(exeBytes, exe, imageBase));
+                    if (gen != _startupGeneration || targetGeneration != _targetGeneration || _startupStop)
+                    {
+                        try { TargetProcess.Kill(pid); } catch { }
+                        proc.Dispose();
+                        EndTargetBusyCursor(targetGeneration);
+                        return;
+                    }
                     _diag.Add($"suspended discovery (on-disk image, rebased to 0x{imageBase:X}): {funcs.Count} functions, {edges.Count} call sites");
 
                     var discovered = BuildUiDataset(name, imageBase, exe.PreferredImageBase,
@@ -1671,11 +1778,33 @@ namespace Cda.App
                             // and pinned to the hook that caused it, instead of just
                             // killing the target with an opaque exit code. A failed
                             // attach degrades to the old free-run mode.
-                            _debugWatch = new DebugCrashWatch(pid);
-                            _debugWatch.Log += OnStartupCrashWatchLog;
-                            _debugWatch.Crash += OnStartupCrash;
-                            _debugWatch.Start();
-                            bool attached = await Task.Run(() => _debugWatch!.WaitUntilAttached(3000));
+                            var crashWatch = new DebugCrashWatch(pid);
+                            _debugWatch = crashWatch;
+                            crashWatch.Log += s =>
+                            {
+                                if (gen == _startupGeneration &&
+                                    targetGeneration == _targetGeneration &&
+                                    ReferenceEquals(_debugWatch, crashWatch))
+                                    OnStartupCrashWatchLog(s);
+                            };
+                            crashWatch.Crash += c =>
+                            {
+                                if (gen == _startupGeneration &&
+                                    targetGeneration == _targetGeneration &&
+                                    ReferenceEquals(_debugWatch, crashWatch))
+                                    OnStartupCrash(c);
+                            };
+                            crashWatch.Start();
+                            bool attached = await Task.Run(() => crashWatch.WaitUntilAttached(3000));
+                            if (gen != _startupGeneration || targetGeneration != _targetGeneration || _startupStop)
+                            {
+                                crashWatch.Stop();
+                                crashWatch.WaitForExit(1000);
+                                try { TargetProcess.Kill(pid); } catch { }
+                                proc.Dispose();
+                                EndTargetBusyCursor(targetGeneration);
+                                return;
+                            }
                             _diag.Add(attached
                                 ? "crash watch: debugger attached — a hook-induced fault will be caught live and pinned to its hook."
                                 : "crash watch: couldn't attach a debugger; running without live fault capture (a crash will only show an exit code).");
@@ -1688,7 +1817,7 @@ namespace Cda.App
                 catch (Exception ex)
                 {
                     _diag.Add("suspended prep failed: " + ex.Message);
-                    if (_debugWatch != null) { _debugWatch.Stop(); _debugWatch = null; }
+                    StopDebugWatch();
                     _capture?.Dispose();
                     _capture = null;
                 }
@@ -1702,20 +1831,36 @@ namespace Cda.App
             // A CREATE_SUSPENDED target shows no window until resumed — the last point
             // we can abort silently. If the user hit Stop while we were arming, tear
             // down and kill the (never-resumed) target instead of letting it run.
-            if (_startupStop)
+            if (_startupStop || gen != _startupGeneration || targetGeneration != _targetGeneration)
             {
-                _diag.Add("startup trace stopped before launch — target not resumed.");
-                if (_debugWatch != null) { _debugWatch.Stop(); _debugWatch = null; }
-                StopCapture();
+                if (_startupStop)
+                {
+                    _diag.Add("startup trace stopped before launch — target not resumed.");
+                    StopDebugWatch();
+                    StopCapture();
+                }
                 try { TargetProcess.Kill(pid); } catch { }
                 proc.Dispose();
-                if (!_captureBursting) System.Windows.Input.Mouse.OverrideCursor = null;
+                EndTargetBusyCursor(targetGeneration);
                 return;
             }
 
-            proc.Resume();
-            _diag.Add(armed ? "resumed target (hooks already armed)" : "resumed target (no startup hooks)");
-            proc.Dispose();
+            try
+            {
+                proc.Resume();
+                _diag.Add(armed ? "resumed target (hooks already armed)" : "resumed target (no startup hooks)");
+            }
+            catch (Exception ex)
+            {
+                _diag.Add("couldn't resume target: " + ex.Message);
+                StopCapture();
+                try { TargetProcess.Kill(pid); } catch { }
+                return;
+            }
+            finally
+            {
+                proc.Dispose();
+            }
 
             // For a bisection test: if it runs BisectSurviveMs with no fatal fault, the
             // poll loop declares the subset clean (passed).
@@ -1739,6 +1884,11 @@ namespace Cda.App
             // and — if we couldn't arm startup hooks — fall back to the post-start
             // single-function mode that we know works.
             await Task.Delay(armed ? 400 : 800);
+            if (gen != _startupGeneration || targetGeneration != _targetGeneration)
+            {
+                EndTargetBusyCursor(targetGeneration);
+                return;
+            }
             try
             {
                 var session = await Task.Run(() => LiveSession.Attach(pid));
@@ -1746,7 +1896,11 @@ namespace Cda.App
                 // A crash during the post-start window may have superseded this attempt
                 // with a relaunch; if so, drop this (dead) target's session rather than
                 // overwrite the live one the new attempt just established.
-                if (gen != _startupGeneration) { session.Dispose(); return; }
+                if (gen != _startupGeneration || targetGeneration != _targetGeneration)
+                {
+                    session.Dispose();
+                    return;
+                }
 
                 _session?.Dispose();
                 _session = session;
@@ -1820,15 +1974,18 @@ namespace Cda.App
             }
             catch (Exception ex)
             {
-                _diag.Add($"post-start attach failed: {ex.Message}");
-                if (!armed) Diag($"launched {name} ({pid}) but attach failed: {ex.Message}");
+                if (gen == _startupGeneration && targetGeneration == _targetGeneration)
+                {
+                    _diag.Add($"post-start attach failed: {ex.Message}");
+                    if (!armed) Diag($"launched {name} ({pid}) but attach failed: {ex.Message}");
+                }
             }
             finally
             {
                 // Scan/launch finished — restore the cursor unless a heavy startup
                 // flood is still being drained (the poll loop owns the cursor then,
                 // and clears it once the batches subside).
-                if (!_captureBursting) System.Windows.Input.Mouse.OverrideCursor = null;
+                EndTargetBusyCursor(targetGeneration);
             }
         }
 
@@ -2081,6 +2238,7 @@ namespace Cda.App
             StopDllCapture();
             StopApiLaunch();
             StopChildFollow();
+            int targetGeneration = unchecked(++_targetGeneration);
             _captured.Clear();
             _maxCursorSeen = 0;
             _captureFocus = 0;
@@ -2092,28 +2250,50 @@ namespace Cda.App
             _childView = false;
             ClearStringsTab(); // DLL-at-load capture doesn't mine the strings tab
 
-            _dllCapture = new DebugLoadCapture(hostPath, commandLine, targetDll,
+            var worker = new DebugLoadCapture(hostPath, commandLine, targetDll,
                 StartupTraceFunctions, StartupCandidatePool, StartupBufferRecords,
                 disableAslr: disableAslr);
-            _dllCapture.Log += m => Dispatcher.BeginInvoke(new Action(() => Diag(m)));
-            _dllCapture.TargetExited += () => Dispatcher.BeginInvoke(new Action(() =>
+            _dllCapture = worker;
+            worker.Log += m => Dispatcher.BeginInvoke(new Action(() =>
             {
+                if (targetGeneration == _targetGeneration && ReferenceEquals(_dllCapture, worker))
+                    Diag(m);
+            }));
+            worker.TargetExited += () => Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (targetGeneration != _targetGeneration || !ReferenceEquals(_dllCapture, worker))
+                    return;
                 Diag("DLL capture: host exited.");
                 StopCapture();
             }));
-            _dllCapture.DllHooked += h => Dispatcher.BeginInvoke(new Action(() => OnDllHooked(h)));
-            _dllCapture.Start();
+            worker.DllHooked += h => Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (targetGeneration != _targetGeneration || !ReferenceEquals(_dllCapture, worker))
+                {
+                    h.Session.Dispose();
+                    return;
+                }
+                OnDllHooked(h, worker, targetGeneration);
+            }));
+            worker.Start();
             UpdateClearCallsState();
         }
 
         // Raised (marshalled to the UI thread) once the target DLL is hooked at
         // load: wire up the views and begin polling for its DllMain/startup calls.
-        private async void OnDllHooked(DebugLoadCapture.HookedDll h)
+        private async void OnDllHooked(DebugLoadCapture.HookedDll h, DebugLoadCapture worker, int targetGeneration)
         {
+            if (targetGeneration != _targetGeneration || !ReferenceEquals(_dllCapture, worker))
+            {
+                h.Session.Dispose();
+                return;
+            }
+
             if (h.Instrumented <= 0)
             {
                 Diag($"{h.Module.Name} loaded but no functions could be hooked ({h.FirstError ?? "no candidate"}).");
                 h.Session.Dispose();
+                StopDllCapture();
                 return;
             }
 
@@ -2146,6 +2326,13 @@ namespace Cda.App
             try
             {
                 var session = await Task.Run(() => LiveSession.Attach(h.Pid));
+                if (targetGeneration != _targetGeneration ||
+                    !ReferenceEquals(_dllCapture, worker) ||
+                    !ReferenceEquals(_capture, h.Session))
+                {
+                    session.Dispose();
+                    return;
+                }
                 _session?.Dispose();
                 _session = session;
                 _moduleMap = session.Modules;
@@ -2155,12 +2342,22 @@ namespace Cda.App
                 Disasm.SetSource(session.Process, h.Module.BaseAddress);
                 _diag.Add($"post-hook attach ok: {session.Dataset.Functions.Count} functions (UI/focus session)");
             }
-            catch (Exception ex) { _diag.Add("post-hook attach failed: " + ex.Message); }
+            catch (Exception ex)
+            {
+                if (targetGeneration == _targetGeneration && ReferenceEquals(_dllCapture, worker))
+                    _diag.Add("post-hook attach failed: " + ex.Message);
+            }
         }
 
         private void StopDllCapture()
         {
-            if (_dllCapture != null) { _dllCapture.Stop(); _dllCapture = null; }
+            var worker = _dllCapture;
+            _dllCapture = null;
+            if (worker != null)
+            {
+                worker.Stop();
+                worker.WaitForExit(1000);
+            }
             UpdateClearCallsState();
         }
 
@@ -2188,6 +2385,7 @@ namespace Cda.App
             StopApiLaunch();
             StopChildFollow();
             _diag.Clear();
+            int targetGeneration = unchecked(++_targetGeneration);
 
             // Fresh multi-target state for this run; reveal the target picker.
             ResetChildTargets();
@@ -2226,12 +2424,30 @@ namespace Cda.App
             var follow = new ChildFollowCapture(launchPath,
                 StartupTraceFunctions, StartupCandidatePool, StartupBufferRecords, MinPreRunFunctions,
                 skipSystemProcesses: skipSystem, disableAslr: disableAslr);
-            follow.Log += m => Dispatcher.BeginInvoke(new Action(() => Diag(m)));
-            follow.ProcessHooked += hp => Dispatcher.BeginInvoke(new Action(() => OnChildProcessHooked(hp)));
-            follow.RecordsCaptured += (pid, recs) => Dispatcher.BeginInvoke(new Action(() => OnChildRecords(pid, recs)));
-            follow.ProcessExited += pid => Dispatcher.BeginInvoke(new Action(() => OnChildProcessExited(pid)));
+            follow.Log += m => Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (targetGeneration == _targetGeneration && ReferenceEquals(_childFollow, follow))
+                    Diag(m);
+            }));
+            follow.ProcessHooked += hp => Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (targetGeneration == _targetGeneration && ReferenceEquals(_childFollow, follow))
+                    OnChildProcessHooked(hp);
+            }));
+            follow.RecordsCaptured += (pid, recs) => Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (targetGeneration == _targetGeneration && ReferenceEquals(_childFollow, follow))
+                    OnChildRecords(pid, recs);
+            }));
+            follow.ProcessExited += pid => Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (targetGeneration == _targetGeneration && ReferenceEquals(_childFollow, follow))
+                    OnChildProcessExited(pid);
+            }));
             follow.TreeExited += () => Dispatcher.BeginInvoke(new Action(() =>
             {
+                if (targetGeneration != _targetGeneration || !ReferenceEquals(_childFollow, follow))
+                    return;
                 Diag("follow tree: process tree finished.");
                 StopChildFollow();
             }));
@@ -2242,7 +2458,13 @@ namespace Cda.App
 
         private void StopChildFollow()
         {
-            if (_childFollow != null) { _childFollow.Stop(); _childFollow = null; }
+            var worker = _childFollow;
+            _childFollow = null;
+            if (worker != null)
+            {
+                worker.Stop();
+                worker.WaitForExit(1000);
+            }
             UpdateClearCallsState();
         }
 
@@ -2651,6 +2873,7 @@ namespace Cda.App
             _offlineTrace = false;
             _childView = false;
             var session = _session;
+            int targetGeneration = _targetGeneration;
             Diag("Windows API: discovering imported APIs…");
 
             ApiImportScanner.Result api;
@@ -2661,12 +2884,14 @@ namespace Cda.App
             }
             catch (Exception ex)
             {
-                Diag("API discovery failed: " + ex.Message);
+                if (targetGeneration == _targetGeneration && ReferenceEquals(_session, session))
+                    Diag("API discovery failed: " + ex.Message);
                 return;
             }
 
             // The session could have been torn down while we were scanning.
-            if (_session != session) { Diag("target changed during API discovery — aborted."); return; }
+            if (targetGeneration != _targetGeneration || !ReferenceEquals(_session, session))
+                return;
 
             if (api.Functions.Count == 0)
             {
@@ -2745,6 +2970,7 @@ namespace Cda.App
             _offlineTrace = false;
             _childView = false;
             var session = _session;
+            int targetGeneration = _targetGeneration;
             Diag("Dialogs: resolving the OS dialog-box functions (user32/comctl32/comdlg32/credui)…");
 
             DialogApiScanner.Result dlg;
@@ -2755,11 +2981,13 @@ namespace Cda.App
             }
             catch (Exception ex)
             {
-                Diag("dialog-API discovery failed: " + ex.Message);
+                if (targetGeneration == _targetGeneration && ReferenceEquals(_session, session))
+                    Diag("dialog-API discovery failed: " + ex.Message);
                 return;
             }
 
-            if (_session != session) { Diag("target changed during dialog-API discovery — aborted."); return; }
+            if (targetGeneration != _targetGeneration || !ReferenceEquals(_session, session))
+                return;
 
             if (dlg.Functions.Count == 0)
             {
@@ -2880,6 +3108,7 @@ namespace Cda.App
             _offlineTrace = false;
             _childView = false;
             var session = _session;
+            int targetGeneration = _targetGeneration;
             Diag("IAT: discovering imported APIs (import-table slots)…");
 
             ApiImportScanner.SlotResult slots;
@@ -2889,11 +3118,13 @@ namespace Cda.App
             }
             catch (Exception ex)
             {
-                Diag("IAT discovery failed: " + ex.Message);
+                if (targetGeneration == _targetGeneration && ReferenceEquals(_session, session))
+                    Diag("IAT discovery failed: " + ex.Message);
                 return;
             }
 
-            if (_session != session) { Diag("target changed during IAT discovery — aborted."); return; }
+            if (targetGeneration != _targetGeneration || !ReferenceEquals(_session, session))
+                return;
 
             if (slots.Slots.Count == 0)
             {
@@ -3031,6 +3262,7 @@ namespace Cda.App
             StopDllCapture();
             StopApiLaunch();
             StopChildFollow();
+            int targetGeneration = unchecked(++_targetGeneration);
             _captured.Clear();
             ResetRunawayTracking();
             _maxCursorSeen = 0;
@@ -3045,34 +3277,68 @@ namespace Cda.App
             _probeRequested.Clear();
             Diag($"launch & capture {modeLabel}: {name}" + (disableAslr ? " (ASLR disabled)" : "") + " — waiting for the loader…");
 
-            _apiLaunch = new LaunchApiCapture(launchPath, commandLine, mode,
+            var worker = new LaunchApiCapture(launchPath, commandLine, mode,
                 ApiTraceFunctions, StartupBufferRecords, disableAslr: disableAslr);
-            _apiLaunch.Log += m => Dispatcher.BeginInvoke(new Action(() => Diag(m)));
-            _apiLaunch.TargetExited += () => Dispatcher.BeginInvoke(new Action(() =>
+            _apiLaunch = worker;
+            worker.Log += m => Dispatcher.BeginInvoke(new Action(() =>
             {
+                if (targetGeneration == _targetGeneration && ReferenceEquals(_apiLaunch, worker))
+                    Diag(m);
+            }));
+            worker.TargetExited += () => Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (targetGeneration != _targetGeneration || !ReferenceEquals(_apiLaunch, worker))
+                    return;
                 Diag($"launch & capture {modeLabel}: target exited.");
                 StopCapture();
             }));
-            _apiLaunch.Hooked += h => Dispatcher.BeginInvoke(new Action(() => OnApiLaunchHooked(h)));
-            _apiLaunch.MoreDialogsHooked += funcs => Dispatcher.BeginInvoke(new Action(() => OnMoreDialogsHooked(funcs)));
-            _apiLaunch.BranchConfirmed += c => Dispatcher.BeginInvoke(new Action(() => OnBranchConfirmed(c)));
-            _apiLaunch.Aborted += m => Dispatcher.BeginInvoke(new Action(() =>
+            worker.Hooked += h => Dispatcher.BeginInvoke(new Action(() =>
             {
+                if (targetGeneration != _targetGeneration || !ReferenceEquals(_apiLaunch, worker))
+                {
+                    h.Session.Dispose();
+                    return;
+                }
+                OnApiLaunchHooked(h, worker, targetGeneration);
+            }));
+            worker.MoreDialogsHooked += (funcs, modules) => Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (targetGeneration == _targetGeneration && ReferenceEquals(_apiLaunch, worker))
+                    OnMoreDialogsHooked(funcs, modules);
+            }));
+            worker.BranchConfirmed += c => Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (targetGeneration == _targetGeneration && ReferenceEquals(_apiLaunch, worker))
+                    OnBranchConfirmed(c);
+            }));
+            worker.Aborted += m => Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (targetGeneration != _targetGeneration || !ReferenceEquals(_apiLaunch, worker))
+                    return;
                 // Loader breakpoint reached but nothing was hooked: the loop is now a
                 // debugger attached to a running target with no capture. Detach and free
                 // the toolbar (the target keeps running un-instrumented).
                 Diag(m);
                 StopApiLaunch();
             }));
-            _apiLaunch.Start();
+            worker.Start();
             UpdateClearCallsState();
         }
 
         // Raised (marshalled to the UI thread) once the launched target's imports are
         // hooked at the loader breakpoint: wire up the views and begin polling for the
         // startup API calls. Mirrors OnDllHooked.
-        private async void OnApiLaunchHooked(LaunchApiCapture.HookedApis h)
+        private async void OnApiLaunchHooked(
+            LaunchApiCapture.HookedApis h,
+            LaunchApiCapture worker,
+            int targetGeneration)
         {
+            if (targetGeneration != _targetGeneration || !ReferenceEquals(_apiLaunch, worker))
+            {
+                h.Session.Dispose();
+                return;
+            }
+
             if (h.Instrumented <= 0)
             {
                 Diag($"{SurfaceNoun(h.Mode)} discovered but no entry could be hooked " +
@@ -3125,6 +3391,13 @@ namespace Cda.App
             try
             {
                 var session = await Task.Run(() => LiveSession.Attach(h.Pid));
+                if (targetGeneration != _targetGeneration ||
+                    !ReferenceEquals(_apiLaunch, worker) ||
+                    !ReferenceEquals(_capture, h.Session))
+                {
+                    session.Dispose();
+                    return;
+                }
                 _session?.Dispose();
                 _session = session;
                 _moduleMap = session.Modules;
@@ -3136,29 +3409,50 @@ namespace Cda.App
                     session.Dataset.Functions.Count > 0 ? session.Dataset.Functions[0].Address : session.Process.MinAddress);
                 _diag.Add($"post-hook attach ok: {session.Dataset.Functions.Count} functions (UI/focus session)");
             }
-            catch (Exception ex) { _diag.Add("post-hook attach failed: " + ex.Message); }
+            catch (Exception ex)
+            {
+                if (targetGeneration == _targetGeneration && ReferenceEquals(_apiLaunch, worker))
+                    _diag.Add("post-hook attach failed: " + ex.Message);
+            }
         }
 
-        // A dialog host that loaded AFTER the first one (e.g. comctl32 after user32):
-        // install its dialog functions HERE, on the poll thread, because CaptureSession's
-        // hook list isn't synchronized against the launch loop's thread. Fold them into
-        // the dialog-report address set and the dataset so their calls are recognized and
-        // named.
-        private void OnMoreDialogsHooked(IReadOnlyList<TracedFunction> funcs)
+        // A dialog host that loaded AFTER the first one (e.g. comctl32 after user32).
+        // Its hooks were installed synchronously while LOAD_DLL still held the target;
+        // fold the confirmed functions/modules into every live view.
+        private void OnMoreDialogsHooked(
+            IReadOnlyList<TracedFunction> funcs,
+            IReadOnlyList<ModuleInfo> modules)
         {
             if (_capture == null || !_dialogMode || funcs.Count == 0) return;
-            var addrs = new List<ulong>(funcs.Count);
-            foreach (var f in funcs) addrs.Add(f.Address);
-            int added = _capture.HookMore(addrs, out _, out string? firstError);
             RegisterDialogFunctions(funcs);
+
             if (_liveDataset != null)
             {
-                _liveDataset.Functions.AddRange(funcs);
+                foreach (var module in modules)
+                    if (!_liveDataset.Modules.Exists(m => m.BaseAddress == module.BaseAddress))
+                        _liveDataset.Modules.Add(module);
+                foreach (var function in funcs)
+                    if (!_liveDataset.Functions.Exists(f => f.Address == function.Address))
+                        _liveDataset.Functions.Add(function);
                 _nameIndexFor = null; // force ResolveCalleeName to re-index so the new names resolve
+
+                var mergedModules = _moduleMap != null
+                    ? new List<ModuleInfo>(_moduleMap.Modules)
+                    : new List<ModuleInfo>();
+                foreach (var module in modules)
+                    if (!mergedModules.Exists(m => m.BaseAddress == module.BaseAddress))
+                        mergedModules.Add(module);
+                _moduleMap = new ModuleMap(mergedModules);
+                CallList.Configure(_moduleMap);
+
+                FunctionList.AddFunctions(funcs, _moduleMap);
+                _model.Load(_liveDataset);
+                _model.UseLiveRecords(_captured);
+                GraphView.SetModel(_model);
+                if (_selectedFunctionAddr != 0)
+                    GraphView.SetSelected(_selectedFunctionAddr);
             }
-            Diag(added > 0
-                ? $"hooked {added} more dialog function(s) from a later-loaded module (e.g. comctl32)."
-                : $"later dialog module added no new hooks ({firstError ?? "already hooked"}).");
+            Diag($"hooked {funcs.Count} more dialog function(s) from a later-loaded module (e.g. comctl32).");
         }
 
         // (UI thread) A dialog's gating branch was confirmed at runtime from hardware — the
@@ -3227,7 +3521,13 @@ namespace Cda.App
 
         private void StopApiLaunch()
         {
-            if (_apiLaunch != null) { _apiLaunch.Stop(); _apiLaunch = null; }
+            var worker = _apiLaunch;
+            _apiLaunch = null;
+            if (worker != null)
+            {
+                worker.Stop();
+                worker.WaitForExit(1000);
+            }
             UpdateClearCallsState();
         }
 
@@ -3385,7 +3685,13 @@ namespace Cda.App
 
         private void StopHwbp()
         {
-            if (_hwbp != null) { _hwbp.Stop(); _hwbp = null; }
+            var worker = _hwbp;
+            _hwbp = null;
+            if (worker != null)
+            {
+                worker.Stop();
+                worker.WaitForExit(1000);
+            }
             UpdateClearCallsState();
         }
 
@@ -5181,6 +5487,9 @@ namespace Cda.App
 
             var recs = batch.Records;
             var chains = batch.Chains;
+            // A return-only poll mutates a CallRecord shown by an older row but adds
+            // no new visible record. Refresh those rows before the empty-batch exit.
+            CallList.RefreshCompletedReturns();
 
             // "Capture only": drop non-matching records, keeping each surviving
             // record aligned with its precomputed chain.
@@ -5301,8 +5610,10 @@ namespace Cda.App
         }
         private void StopCapture()
         {
+            unchecked { _targetGeneration++; }
+            CancelTargetBusyCursor();
             _startupActive = false;
-            if (_debugWatch != null) { _debugWatch.Stop(); _debugWatch = null; }
+            StopDebugWatch();
             StopDllCapture();
             StopApiLaunch();
             StopChildFollow();
@@ -5323,6 +5634,7 @@ namespace Cda.App
                 try
                 {
                     var tail = cap.Poll();
+                    CallList.RefreshCompletedReturns();
                     ApplyCaptureCondition(tail);
                     AppendCapturedTimeOrdered(tail);
                     CallList.AddRecords(tail);
@@ -5628,6 +5940,7 @@ namespace Cda.App
             StopDllCapture();
             StopApiLaunch();
             StopChildFollow();
+            unchecked { _targetGeneration++; }
             _session?.Dispose();
             _session = null;
 
@@ -5968,13 +6281,22 @@ namespace Cda.App
             base.OnClosing(e);
         }
 
+        private void StopDebugWatch()
+        {
+            var worker = _debugWatch;
+            _debugWatch = null;
+            if (worker == null) return;
+            worker.Stop();
+            worker.WaitForExit(1000);
+        }
+
         protected override void OnClosed(EventArgs e)
         {
-            _dllCapture?.Stop();
-            _apiLaunch?.Stop();
-            _childFollow?.Stop();
-            _hwbp?.Stop();
-            _hwbp?.WaitForExit(600); // let it clear debug registers + detach before we exit
+            StopDebugWatch();
+            StopDllCapture();
+            StopApiLaunch();
+            StopChildFollow();
+            StopHwbp();
             DisposeAttachPt(); // stop attach-mode Intel PT tracing (no-op if inactive)
             if (_pollTimer != null) { _pollTimer.Stop(); _pollTimer = null; }
             try { _capture?.Dispose(); } catch { }

@@ -358,6 +358,24 @@ namespace Cda.App.UI
             };
         }
 
+        /// <summary>
+        /// Refresh rows whose return record arrived in a later capture poll. Return
+        /// pairing mutates the original CallRecord, while CallRow intentionally stores
+        /// preformatted strings and does not implement per-property notifications.
+        /// </summary>
+        public void RefreshCompletedReturns()
+        {
+            bool changed = false;
+            foreach (var row in _rows)
+            {
+                if (row.HasReturn || !row.Record.HasReturned) continue;
+                row.Return = FormatReturn(row.Record);
+                row.HasReturn = row.Return.Length != 0;
+                changed = true;
+            }
+            if (changed) _view?.Refresh();
+        }
+
         // Format the argument list. With a known Win32 signature, each captured
         // argument is shown as name=value (strings quoted, flags/handles as hex);
         // otherwise a plain hex list, still inlining any decoded string. Only the

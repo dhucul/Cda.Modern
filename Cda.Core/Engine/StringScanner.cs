@@ -131,7 +131,10 @@ namespace Cda.Core.Engine
             catch { return strings; }
 
             int bitness = pe.Is64Bit ? 64 : 32;
-            ulong moduleEnd = module.BaseAddress + Math.Max(module.Size, pe.SizeOfImage);
+            ulong moduleSpan = Math.Max(module.Size, pe.SizeOfImage);
+            ulong moduleEnd = moduleSpan > ulong.MaxValue - module.BaseAddress
+                ? ulong.MaxValue
+                : module.BaseAddress + moduleSpan;
 
             // (1) strings from every section with committed pages — including
             // executable ones (compilers park read-only literals in .text), matching
@@ -175,6 +178,7 @@ namespace Cda.Core.Engine
             uint vsize = sec.VirtualSize != 0 ? sec.VirtualSize : sec.RawSize;
             int len = (int)Math.Min(vsize, (uint)MaxSectionBytes);
             if (len <= 0) return true;
+            if (sec.VirtualAddress > ulong.MaxValue - moduleBase) return true;
             ulong secVa = moduleBase + sec.VirtualAddress;
             if (secVa >= moduleEnd) return true;
             // Never read past the module — a malformed/crafted PE could declare a
