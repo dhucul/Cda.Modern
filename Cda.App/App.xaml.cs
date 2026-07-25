@@ -29,41 +29,20 @@ namespace Cda.App
             TaskScheduler.UnobservedTaskException += OnUnobservedTaskException;
         }
 
-        private bool _errorDialogOpen;
-        private string? _lastErrorText;
-
         private void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
         {
-            e.Handled = true; // keep the app alive
-
-            // A failing layout pass or poll tick can throw on EVERY render/tick.
-            // Never stack modal dialogs for that — it produces a wall of windows
-            // and an effective hang. Show at most one at a time, and don't repeat
-            // an identical error (so a recurring fault surfaces once, readably,
-            // instead of crashing the app).
             string text = e.Exception.ToString();
-            if (_errorDialogOpen || text == _lastErrorText) return;
-
-            _lastErrorText = text;
-            _errorDialogOpen = true;
-
-            // Persist the full detail first — the dialog is transient, the log isn't.
-            LogCrash("UI thread (recovered)", e.Exception);
-
-            // Show the dialog AFTER the failed operation unwinds, never inline.
-            // The exception often fires mid-layout/-render; popping a modal dialog
-            // there re-enters WPF's dispatcher during a layout pass and can turn a
-            // recoverable error into a hard crash. Deferring to Background priority
-            // lets the current pass finish first.
-            Dispatcher.BeginInvoke(new Action(() =>
+            LogCrash("UI thread (fatal)", e.Exception);
+            try
             {
-                try
-                {
-                    MessageBox.Show(text + LogHint(), "CDA — unexpected error (recovered)",
-                        MessageBoxButton.OK, MessageBoxImage.Warning);
-                }
-                finally { _errorDialogOpen = false; }
-            }), DispatcherPriority.Background);
+                MessageBox.Show(text + LogHint(), "CDA — fatal UI error",
+                    MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            catch { /* preserve the original exception */ }
+
+            // Unknown dispatcher failures may indicate corrupted capture/UI state.
+            // Log and surface them, then let WPF terminate instead of continuing.
+            e.Handled = false;
         }
 
         private void OnDomainUnhandledException(object sender, UnhandledExceptionEventArgs e)

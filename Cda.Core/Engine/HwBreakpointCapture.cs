@@ -57,6 +57,8 @@ namespace Cda.Core.Engine
         private volatile bool _stop;
         private TargetProcess? _reader;        // read-only handle for stack/return reads
         private bool _firstHit;
+        private bool _initialBreakpointSeen;
+        private readonly Dictionary<uint, DebugRegisterState> _priorDebugState = new();
 
         private readonly long _t0 = Stopwatch.GetTimestamp();
         private static readonly double TicksPerSecond = Stopwatch.Frequency;
@@ -69,7 +71,7 @@ namespace Cda.Core.Engine
                 if (a != 0 && !list.Contains(a) && list.Count < 4) list.Add(a);
             _addrs = list.ToArray();
             _ourMask = _addrs.Length >= 4 ? 0xFUL : (1UL << _addrs.Length) - 1;
-            _snapshotWords = Math.Max(0, snapshotWords);
+            _snapshotWords = Math.Clamp(snapshotWords, 0, 4096);
         }
 
         /// <summary>How many addresses are actually being watched (1–4).</summary>
@@ -85,7 +87,7 @@ namespace Cda.Core.Engine
         public void Dispose()
         {
             Stop();
-            WaitForExit(1000);
+            WaitForExit(Timeout.Infinite);
         }
 
         /// <summary>
@@ -94,7 +96,8 @@ namespace Cda.Core.Engine
         /// shutdown so the target isn't left with armed breakpoints after the
         /// debugger is gone (which would fault it on the next hit).
         /// </summary>
-        public bool WaitForExit(int ms) => _thread == null || _thread.Join(ms);
+        public bool WaitForExit(int ms) =>
+            _thread == null || ReferenceEquals(Thread.CurrentThread, _thread) || _thread.Join(ms);
 
         // The whole debugger lifecycle runs on this one thread: DebugActiveProcess,
         // every WaitForDebugEvent/ContinueDebugEvent, and the detach must all be
@@ -154,10 +157,9 @@ namespace Cda.Core.Engine
                     switch (code)
                     {
                         case NativeMethods.CREATE_PROCESS_DEBUG_EVENT:
-                            // We own the file handle in CREATE_PROCESS_DEBUG_INFO.hFile
-                            // (union+0) and must close it; the process/thread handles
-                            // are the system's. Arm every existing thread now (the
-                            // process is frozen for this event).
+                            // Only hFile is debugger-owned; Windows closes the event's
+                            // process/thread handles after their EXIT events are continued.
+                            // Arm every existing thread now (the process is frozen).
                             CloseHandleSafe(Marshal.ReadIntPtr(evt, U));
                             ArmAllThreads();
                             break;
@@ -169,13 +171,22 @@ namespace Cda.Core.Engine
                             ArmThread(Marshal.ReadIntPtr(evt, U), evtTid);
                             break;
 
+                        case NativeMethods.EXIT_THREAD_DEBUG_EVENT:
+                            _priorDebugState.Remove(evtTid);
+                            break;
+
                         case NativeMethods.EXCEPTION_DEBUG_EVENT:
                         {
                             uint exCode = (uint)Marshal.ReadInt32(evt, U); // EXCEPTION_RECORD.ExceptionCode
                             if (exCode == NativeMethods.EXCEPTION_SINGLE_STEP && HandleHwBreak(evtTid, pending))
                                 cont = NativeMethods.DBG_CONTINUE;          // one of ours — consumed
-                            else if (exCode == NativeMethods.EXCEPTION_BREAKPOINT || exCode == NativeMethods.STATUS_WX86_BREAKPOINT)
-                                cont = NativeMethods.DBG_CONTINUE;          // initial attach breakpoint
+                            else if ((exCode == NativeMethods.EXCEPTION_BREAKPOINT ||
+                                      exCode == NativeMethods.STATUS_WX86_BREAKPOINT) &&
+                                     !_initialBreakpointSeen)
+                            {
+                                _initialBreakpointSeen = true;
+                                cont = NativeMethods.DBG_CONTINUE;
+                            }
                             else
                                 cont = NativeMethods.DBG_EXCEPTION_NOT_HANDLED; // not ours — hand back to the app
                             break;
@@ -184,6 +195,7 @@ namespace Cda.Core.Engine
                         case NativeMethods.EXIT_PROCESS_DEBUG_EVENT:
                             NativeMethods.ContinueDebugEvent(evtPid, evtTid, NativeMethods.DBG_CONTINUE);
                             Flush(pending);
+                            _priorDebugState.Clear();
                             Log?.Invoke("hardware bp: target exited.");
                             TargetExited?.Invoke();
                             return;
@@ -222,12 +234,16 @@ namespace Cda.Core.Engine
         // initial attach (process frozen) and so covers all existing threads.
         private void ArmAllThreads()
         {
-            int armed = ForEachThread(h =>
+            int armed = ForEachThread((h, tid) =>
             {
                 using var ctx = ThreadContextX64.Capture(h);
                 if (ctx == null) return false;
+                DebugRegisterState prior = ctx.CaptureDebugRegisters();
+                if (prior.HasEnabledBreakpoints) return false;
                 ctx.SetBreakpoints(_addrs);
-                return ctx.Apply(h);
+                if (!ctx.Apply(h)) return false;
+                _priorDebugState[tid] = prior;
+                return true;
             });
             Log?.Invoke($"hardware bp: armed {armed} existing thread(s).");
         }
@@ -239,7 +255,7 @@ namespace Cda.Core.Engine
             if (hThread != IntPtr.Zero && hThread != NativeMethods.INVALID_HANDLE_VALUE)
             {
                 using var ctx = ThreadContextX64.Capture(hThread);
-                if (ctx != null) { ctx.SetBreakpoints(_addrs); ctx.Apply(hThread); }
+                if (ctx != null) ArmCapturedThread(ctx, hThread, tid);
                 return;
             }
             IntPtr h = NativeMethods.OpenThread(THREAD_ACCESS, false, tid);
@@ -247,24 +263,38 @@ namespace Cda.Core.Engine
             try
             {
                 using var ctx = ThreadContextX64.Capture(h);
-                if (ctx != null) { ctx.SetBreakpoints(_addrs); ctx.Apply(h); }
+                if (ctx != null) ArmCapturedThread(ctx, h, tid);
             }
             finally { NativeMethods.CloseHandle(h); }
+        }
+
+        private bool ArmCapturedThread(ThreadContextX64 ctx, IntPtr hThread, uint tid)
+        {
+            DebugRegisterState prior = ctx.CaptureDebugRegisters();
+            if (prior.HasEnabledBreakpoints) return false;
+            ctx.SetBreakpoints(_addrs);
+            if (!ctx.Apply(hThread)) return false;
+            _priorDebugState[tid] = prior;
+            return true;
         }
 
         // Clear our breakpoints on every thread. Runs on stop, when the target's
         // threads are live, so each is briefly suspended for the context swap.
         private void DisarmAllThreads()
         {
-            ForEachThread(h =>
+            ForEachThread((h, tid) =>
             {
-                NativeMethods.SuspendThread(h);
+                if (!_priorDebugState.TryGetValue(tid, out DebugRegisterState prior)) return false;
+                uint suspendCount = NativeMethods.SuspendThread(h);
+                if (suspendCount == uint.MaxValue) return false;
                 try
                 {
                     using var ctx = ThreadContextX64.Capture(h);
                     if (ctx == null) return false;
-                    ctx.ClearBreakpoints();
-                    return ctx.Apply(h);
+                    ctx.RestoreDebugRegisters(prior);
+                    bool applied = ctx.Apply(h);
+                    if (applied) _priorDebugState.Remove(tid);
+                    return applied;
                 }
                 finally { NativeMethods.ResumeThread(h); }
             });
@@ -272,7 +302,7 @@ namespace Cda.Core.Engine
 
         // Enumerate the target's threads and run an action on a handle to each;
         // returns how many the action reported success for.
-        private int ForEachThread(Func<IntPtr, bool> action)
+        private int ForEachThread(Func<IntPtr, uint, bool> action)
         {
             IntPtr snap = NativeMethods.CreateToolhelp32Snapshot(NativeMethods.TH32CS_SNAPTHREAD, 0);
             if (snap == NativeMethods.INVALID_HANDLE_VALUE) return 0;
@@ -286,7 +316,7 @@ namespace Cda.Core.Engine
                     if (te.th32OwnerProcessID != (uint)_pid) continue;
                     IntPtr h = NativeMethods.OpenThread(THREAD_ACCESS, false, te.th32ThreadID);
                     if (h == IntPtr.Zero) continue;
-                    try { if (action(h)) count++; }
+                    try { if (action(h, te.th32ThreadID)) count++; }
                     catch { /* one bad thread shouldn't abort the sweep */ }
                     finally { NativeMethods.CloseHandle(h); }
                 }
@@ -313,12 +343,13 @@ namespace Cda.Core.Engine
                 // DR6 bits 0–3 say which DR0–DR3 matched; is any of ours set?
                 if ((ctx.Dr6 & _ourMask) == 0) return false;
 
-                pending.Add(BuildRecord(ctx));
-                if (!_firstHit) { _firstHit = true; Log?.Invoke("hardware bp: first hit recorded — capturing."); }
+                CallRecord record = BuildRecord(ctx);
 
                 ctx.Dr6 = 0;                          // acknowledge
                 ctx.EFlags |= ThreadContextX64.ResumeFlag; // step over the entry once
-                ctx.Apply(h);
+                if (!ctx.Apply(h)) return false;
+                pending.Add(record);
+                if (!_firstHit) { _firstHit = true; Log?.Invoke("hardware bp: first hit recorded — capturing."); }
                 return true;
             }
             finally { NativeMethods.CloseHandle(h); }

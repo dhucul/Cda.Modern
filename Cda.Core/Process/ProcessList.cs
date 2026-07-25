@@ -33,11 +33,17 @@ namespace Cda.Core.Process
             var result = new List<ProcessEntry>();
             foreach (var p in System.Diagnostics.Process.GetProcesses())
             {
-                var entry = new ProcessEntry { Pid = p.Id, Name = p.ProcessName };
-                try { entry.FilePath = p.MainModule?.FileName; } catch { /* access denied */ }
-                entry.Machine = ProbeMachine(p.Id);
-                result.Add(entry);
-                p.Dispose();
+                try
+                {
+                    int pid = p.Id;
+                    var entry = new ProcessEntry { Pid = pid, Name = p.ProcessName };
+                    try { entry.FilePath = p.MainModule?.FileName; } catch { /* access denied / exited */ }
+                    entry.Machine = ProbeMachine(pid);
+                    result.Add(entry);
+                }
+                catch (InvalidOperationException) { /* process exited during enumeration */ }
+                catch (System.ComponentModel.Win32Exception) { /* access changed / process exited */ }
+                finally { p.Dispose(); }
             }
             result.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
             return result;

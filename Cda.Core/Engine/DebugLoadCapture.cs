@@ -64,6 +64,7 @@ namespace Cda.Core.Engine
         private bool _hooked;
         private bool _loaderBpSeen; // the loader breakpoint has been consumed
         private bool _attached;
+        private CaptureSession? _unclaimedSession;
 
         public DebugLoadCapture(string hostPath, string commandLine, string dllPath,
             int maxFunctions, int candidatePool, int bufferRecords, bool disableAslr = false)
@@ -97,7 +98,8 @@ namespace Cda.Core.Engine
         public void Dispose()
         {
             Stop();
-            WaitForExit(1000);
+            WaitForExit(Timeout.Infinite);
+            DisposeUnclaimedSession();
         }
 
         private void Run()
@@ -157,8 +159,9 @@ namespace Cda.Core.Engine
                     switch (code)
                     {
                         case NativeMethods.CREATE_PROCESS_DEBUG_EVENT:
-                            // CREATE_PROCESS_DEBUG_INFO.hFile is the first field.
-                            CloseEventFile(Marshal.ReadIntPtr(evt, U));
+                            // The debugger owns only hFile. Windows retains the debug
+                            // hProcess/hThread handles until their EXIT_* event is continued.
+                            CloseEventHandle(Marshal.ReadIntPtr(evt, U));
                             break;
 
                         case NativeMethods.LOAD_DLL_DEBUG_EVENT:
@@ -171,15 +174,14 @@ namespace Cda.Core.Engine
                                 {
                                     string loaded = ResolvePath(hFile);
                                     if (loaded.Length > 0 &&
-                                        string.Equals(Path.GetFileName(loaded), _dllName, StringComparison.OrdinalIgnoreCase))
+                                        PathClassifier.SameFile(loaded, _dllPath))
                                     {
                                         HookTargetDll(NativeMethods.ToUInt64(baseOfDll));
-                                        _hooked = true;
                                     }
                                 }
                             }
                             catch (Exception ex) { Log?.Invoke("hook-on-load failed: " + ex.Message); }
-                            finally { CloseEventFile(hFile); }
+                            finally { CloseEventHandle(hFile); }
                             break;
                         }
 
@@ -239,7 +241,9 @@ namespace Cda.Core.Engine
                     try { NativeMethods.ContinueDebugEvent(pendingPid, pendingTid, pendingStatus); } catch { }
                 }
                 Detach();
-                Marshal.FreeHGlobal(evt);
+                try { DisposeUnclaimedSession(); }
+                catch (Exception ex) { Log?.Invoke("unclaimed DLL session cleanup failed: " + ex.Message); }
+                finally { Marshal.FreeHGlobal(evt); }
             }
         }
 
@@ -257,7 +261,7 @@ namespace Cda.Core.Engine
             catch { /* best effort; a later finally/Dispose may retry */ }
         }
 
-        private static void CloseEventFile(IntPtr h)
+        private static void CloseEventHandle(IntPtr h)
         {
             if (h != IntPtr.Zero && h != NativeMethods.INVALID_HANDLE_VALUE)
                 NativeMethods.CloseHandle(h);
@@ -311,7 +315,7 @@ namespace Cda.Core.Engine
             for (int i = 0; i < edges.Count; i++)
                 ds.Records.Add(new CallRecord((double)i / en, edges[i].Site, edges[i].Target));
 
-            DllHooked?.Invoke(new HookedDll
+            var payload = new HookedDll
             {
                 Pid = _pid,
                 Is64Bit = pe.Is64Bit,
@@ -321,7 +325,33 @@ namespace Cda.Core.Engine
                 Instrumented = instrumented,
                 Skipped = skipped,
                 FirstError = firstError,
-            });
+            };
+            Action<HookedDll>? receiver = DllHooked;
+            _unclaimedSession = session;
+            if (receiver == null)
+            {
+                DisposeUnclaimedSession();
+                throw new InvalidOperationException("No owner accepted the active DLL capture session.");
+            }
+            try
+            {
+                receiver(payload);
+                _unclaimedSession = null;
+                _hooked = true;
+            }
+            catch
+            {
+                DisposeUnclaimedSession();
+                throw;
+            }
+        }
+
+        private void DisposeUnclaimedSession()
+        {
+            CaptureSession? session = _unclaimedSession;
+            if (session == null) return;
+            session.Dispose();
+            if (ReferenceEquals(_unclaimedSession, session)) _unclaimedSession = null;
         }
     }
 }

@@ -249,7 +249,7 @@ namespace Cda.Core.Engine
         private static bool IsSystemModule(ModuleInfo m, string winDir)
         {
             if (winDir.Length == 0 || string.IsNullOrEmpty(m.Path)) return false;
-            return m.Path!.StartsWith(winDir, StringComparison.OrdinalIgnoreCase);
+            return PathClassifier.IsUnderDirectory(m.Path, winDir);
         }
 
         // Read a module's mapped image into a managed buffer, chunked so an

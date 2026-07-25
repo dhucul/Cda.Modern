@@ -30,6 +30,7 @@ namespace Cda.Core.Engine
         private const int MaxDereferences = 256;
         private const int MaxDereferenceBytes = 4_096;
         private const int MaxStringBytes = 1_048_576;
+        private const long MaxArchiveBytes = 512L * 1024 * 1024;
 
         public static void Save(string path, TraceDataset ds)
         {
@@ -122,7 +123,10 @@ namespace Cda.Core.Engine
         public static TraceDataset Load(string path)
         {
             using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            if (fs.Length > MaxArchiveBytes)
+                throw new InvalidDataException("Trace exceeds the supported size.");
             using var r = new BinaryReader(fs, System.Text.Encoding.UTF8, leaveOpen: false);
+            var budget = new AllocationBudget(MaxArchiveBytes);
 
             if (r.ReadUInt32() != Magic) throw new InvalidDataException("Not a CDA trace file.");
             int version = r.ReadInt32();
@@ -138,12 +142,13 @@ namespace Cda.Core.Engine
 
             int modCount = ReadCount(r, "module", MaxModules,
                 minimumBytesPerItem: version >= 2 ? 26 : 18);
+            budget.Reserve((long)modCount * 128, "modules");
             for (int i = 0; i < modCount; i++)
             {
-                string name = ReadString(r);
+                string name = ReadString(r, budget);
                 ulong baseAddr = r.ReadUInt64();
                 ulong size = r.ReadUInt64();
-                string? p = ReadOpt(r);
+                string? p = ReadOpt(r, budget);
                 ulong preferredBase = version >= 2 ? r.ReadUInt64() : 0;
                 ds.Modules.Add(new ModuleInfo(name, baseAddr, size, p,
                     preferredBaseAddress: preferredBase));
@@ -151,12 +156,13 @@ namespace Cda.Core.Engine
 
             int fnCount = ReadCount(r, "function", MaxFunctions,
                 minimumBytesPerItem: version >= 2 ? 33 : 25);
+            budget.Reserve((long)fnCount * 96, "functions");
             for (int i = 0; i < fnCount; i++)
             {
                 ulong addr = r.ReadUInt64();
                 ulong mbase = r.ReadUInt64();
                 ulong displayAddress = version >= 2 ? r.ReadUInt64() : addr;
-                string? nm = ReadOpt(r);
+                string? nm = ReadOpt(r, budget);
                 long cc = r.ReadInt64();
                 ds.Functions.Add(new TracedFunction(addr, mbase, nm, displayAddress)
                     { CallCount = cc });
@@ -164,6 +170,7 @@ namespace Cda.Core.Engine
 
             int recCount = ReadCount(r, "record", MaxRecords,
                 minimumBytesPerItem: version >= 3 ? 59 : 44);
+            budget.Reserve((long)recCount * 160, "records");
             if (recCount > 0) ds.Records.Capacity = recCount;
             for (int i = 0; i < recCount; i++)
             {
@@ -179,21 +186,24 @@ namespace Cda.Core.Engine
 
                 int snapN = ReadCount(r, "stack snapshot word", MaxSnapshotWords,
                     minimumBytesPerItem: sizeof(ulong));
+                budget.Reserve(24L + (long)snapN * sizeof(ulong), "stack snapshots");
                 var snap = new ulong[snapN];
                 for (int s = 0; s < snapN; s++) snap[s] = r.ReadUInt64();
                 rec.StackSnapshot = snap;
 
                 int argN = ReadCount(r, "argument", MaxArguments,
                     minimumBytesPerItem: sizeof(ulong));
+                budget.Reserve(24L + (long)argN * sizeof(ulong), "arguments");
                 var args = new ulong[argN];
                 for (int a = 0; a < argN; a++) args[a] = r.ReadUInt64();
                 rec.IntegerArgs = args;
 
                 int derefN = ReadCount(r, "dereference", MaxDereferences,
                     minimumBytesPerItem: 17);
+                budget.Reserve(24L + (long)derefN * 64, "dereferences");
                 var derefs = new Dereference[derefN];
                 for (int d = 0; d < derefN; d++)
-                    derefs[d] = ReadDereference(r);
+                    derefs[d] = ReadDereference(r, budget);
                 rec.Dereferences = derefs;
 
                 if (version >= 3)
@@ -202,7 +212,11 @@ namespace Cda.Core.Engine
                     rec.IsReturn = r.ReadBoolean();
                     rec.HasReturned = r.ReadBoolean();
                     rec.ReturnValue = r.ReadUInt64();
-                    if (r.ReadBoolean()) rec.ReturnDereference = ReadDereference(r);
+                    if (r.ReadBoolean())
+                    {
+                        budget.Reserve(64, "return dereference");
+                        rec.ReturnDereference = ReadDereference(r, budget);
+                    }
                 }
                 ds.Records.Add(rec);
             }
@@ -226,13 +240,14 @@ namespace Cda.Core.Engine
             w.Write(data);
         }
 
-        private static Dereference ReadDereference(BinaryReader r)
+        private static Dereference ReadDereference(BinaryReader r, AllocationBudget budget)
         {
             int ai = r.ReadInt32();
             byte kind = r.ReadByte();
             ulong ptr = r.ReadUInt64();
             int dataN = ReadCount(r, "dereference payload byte", MaxDereferenceBytes,
                 minimumBytesPerItem: 1);
+            budget.Reserve(24L + dataN, "dereference payload");
             byte[] data = ReadBytesExact(r, dataN, "dereference payload");
             return new Dereference
             {
@@ -301,7 +316,8 @@ namespace Cda.Core.Engine
                 throw new InvalidDataException("The trace has an invalid time range.");
         }
 
-        private static string? ReadOpt(BinaryReader r) => r.ReadBoolean() ? ReadString(r) : null;
+        private static string? ReadOpt(BinaryReader r, AllocationBudget budget) =>
+            r.ReadBoolean() ? ReadString(r, budget) : null;
 
         private static int ReadCount(BinaryReader r, string field, int hardMaximum,
             int minimumBytesPerItem = 0)
@@ -333,7 +349,7 @@ namespace Cda.Core.Engine
             return data;
         }
 
-        private static string ReadString(BinaryReader r)
+        private static string ReadString(BinaryReader r, AllocationBudget budget)
         {
             int byteCount;
             try { byteCount = r.Read7BitEncodedInt(); }
@@ -343,8 +359,24 @@ namespace Cda.Core.Engine
             }
             if (byteCount < 0 || byteCount > MaxStringBytes)
                 throw new InvalidDataException($"Invalid trace string length: {byteCount}.");
+            budget.Reserve(32L + (long)byteCount * 3, "trace strings");
             return System.Text.Encoding.UTF8.GetString(
                 ReadBytesExact(r, byteCount, "trace string"));
+        }
+
+        private sealed class AllocationBudget
+        {
+            private long _remaining;
+
+            public AllocationBudget(long bytes) => _remaining = bytes;
+
+            public void Reserve(long bytes, string field)
+            {
+                if (bytes < 0 || bytes > _remaining)
+                    throw new InvalidDataException(
+                        $"Trace exceeds the allocation budget while reading {field}.");
+                _remaining -= bytes;
+            }
         }
     }
 }

@@ -208,8 +208,14 @@ namespace Cda.Core.Process
         }
 
         /// <summary>Flush the CPU instruction cache after writing code (mandatory on patches).</summary>
-        public void FlushCode(ulong address, int size) =>
-            NativeMethods.FlushInstructionCache(_process.Handle, NativeMethods.ToIntPtr(address), (IntPtr)size);
+        public void FlushCode(ulong address, int size)
+        {
+            if (!NativeMethods.FlushInstructionCache(_process.Handle,
+                    NativeMethods.ToIntPtr(address), (IntPtr)size))
+                throw new System.ComponentModel.Win32Exception(
+                    System.Runtime.InteropServices.Marshal.GetLastWin32Error(),
+                    $"FlushInstructionCache failed at 0x{address:X}.");
+        }
 
         public void Dispose()
         {

@@ -1,4 +1,5 @@
 using System;
+using System.ComponentModel;
 using System.Runtime.InteropServices;
 using Cda.Core.Process;
 
@@ -64,13 +65,19 @@ namespace Cda.Core.Engine
 
         public uint Protect(ulong address, int size, uint protect)
         {
-            NativeMethods.VirtualProtect(NativeMethods.ToIntPtr(address), (IntPtr)size, protect, out uint old);
+            if (!NativeMethods.VirtualProtect(NativeMethods.ToIntPtr(address), (IntPtr)size, protect, out uint old))
+                throw new Win32Exception(Marshal.GetLastWin32Error(),
+                    $"VirtualProtect failed at 0x{address:X}.");
             return old;
         }
 
-        public void Flush(ulong address, int size) =>
-            NativeMethods.FlushInstructionCache(NativeMethods.GetCurrentProcess(),
-                NativeMethods.ToIntPtr(address), (IntPtr)size);
+        public void Flush(ulong address, int size)
+        {
+            if (!NativeMethods.FlushInstructionCache(NativeMethods.GetCurrentProcess(),
+                    NativeMethods.ToIntPtr(address), (IntPtr)size))
+                throw new Win32Exception(Marshal.GetLastWin32Error(),
+                    $"FlushInstructionCache failed at 0x{address:X}.");
+        }
     }
 
     /// <summary>Operates on a remote target via <see cref="RemoteMemory"/>.</summary>

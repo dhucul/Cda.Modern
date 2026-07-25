@@ -71,8 +71,13 @@ namespace Cda.Core.Engine
             IReadOnlyList<TracedFunction> functions,
             int minLength = 4, int maxStrings = 200000)
         {
+            ArgumentNullException.ThrowIfNull(file);
+            ArgumentNullException.ThrowIfNull(pe);
+            ArgumentNullException.ThrowIfNull(functions);
+            if (minLength <= 0) throw new ArgumentOutOfRangeException(nameof(minLength));
             ulong baseVa = pe.PreferredImageBase;
             var strings = new List<ExtractedString>();
+            if (maxStrings <= 0) return strings;
 
             bool capped = false;
             foreach (var sec in pe.Sections)
@@ -120,7 +125,12 @@ namespace Cda.Core.Engine
             IReadOnlyList<TracedFunction> functions,
             int minLength = 4, int maxStrings = 200000)
         {
+            ArgumentNullException.ThrowIfNull(memory);
+            ArgumentNullException.ThrowIfNull(module);
+            ArgumentNullException.ThrowIfNull(functions);
+            if (minLength <= 0) throw new ArgumentOutOfRangeException(nameof(minLength));
             var strings = new List<ExtractedString>();
+            if (maxStrings <= 0) return strings;
 
             // The first page carries the headers + section table; parse the mapped
             // image (RVA == offset) to find the sections.
@@ -196,15 +206,43 @@ namespace Cda.Core.Engine
                 return !onChunk(whole, len, secVa);
 
             byte[] buf = new byte[Chunk];
+            int runStart = -1;
+            int runEnd = 0;
+
+            bool FlushRun()
+            {
+                if (runStart < 0 || runEnd <= runStart) return false;
+                int runLength = runEnd - runStart;
+                var run = new byte[runLength];
+                Array.Copy(whole, runStart, run, 0, runLength);
+                bool stop = onChunk(run, runLength, secVa + (ulong)runStart);
+                runStart = -1;
+                runEnd = 0;
+                return stop;
+            }
+
             for (int off = 0; off < len; off += Chunk)
             {
                 int clen = Math.Min(Chunk, len - off);
                 ulong chunkVa = secVa + (ulong)off;
                 if (chunkVa >= moduleEnd) break;
                 int read = memory.ReadMemory(chunkVa, buf.AsSpan(0, clen));
-                if (read <= 0) continue; // unreadable page — skip just this chunk
-                if (onChunk(buf, read, chunkVa)) return false;
+                if (read <= 0)
+                {
+                    if (FlushRun()) return false;
+                    continue;
+                }
+
+                if (runStart >= 0 && off != runEnd && FlushRun()) return false;
+                if (runStart < 0) runStart = off;
+                Array.Copy(buf, 0, whole, off, read);
+                runEnd = off + read;
+
+                // A partial read establishes an actual unreadable gap. Emit the
+                // readable prefix now; the next chunk starts a new decode/string run.
+                if (read < clen && FlushRun()) return false;
             }
+            if (FlushRun()) return false;
             return true;
         }
 
@@ -222,7 +260,10 @@ namespace Cda.Core.Engine
             for (int i = 0; i < n; i++)
             {
                 starts[i] = strings[i].Address;
-                ends[i] = strings[i].Address + (ulong)Math.Max(1, strings[i].ByteLength);
+                ulong length = (ulong)Math.Max(1, strings[i].ByteLength);
+                ends[i] = strings[i].Address > ulong.MaxValue - length
+                    ? ulong.MaxValue
+                    : strings[i].Address + length;
             }
             var entries = new ulong[functions.Count];
             for (int i = 0; i < functions.Count; i++) entries[i] = functions[i].Address;
@@ -278,7 +319,8 @@ namespace Cda.Core.Engine
                 if (!(IsPrintable(data[i]) && data[i + 1] == 0)) { i++; continue; }
                 int j = i; int chars = 0;
                 while (j + 1 < end && IsPrintable(data[j]) && data[j + 1] == 0) { j += 2; chars++; }
-                if (chars >= minLength)
+                bool terminated = j + 1 < end && data[j] == 0 && data[j + 1] == 0;
+                if (terminated && chars >= minLength)
                 {
                     var sb = new StringBuilder(chars);
                     for (int k = i; k < i + chars * 2; k += 2) sb.Append((char)data[k]);

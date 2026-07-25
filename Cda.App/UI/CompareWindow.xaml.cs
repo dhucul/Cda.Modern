@@ -540,7 +540,7 @@ namespace Cda.App.UI
             string t = (MinPctBox.Text ?? "").Trim().TrimEnd('%', ' ');
             if (t.Length == 0 ||
                 !double.TryParse(t, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.CurrentCulture, out double p) ||
-                p < 0)
+                !double.IsFinite(p) || p < 0)
                 p = 0;
             _minPct = p;
             _view.Refresh();

@@ -92,7 +92,7 @@ namespace Cda.Core.Engine
         public void Dispose()
         {
             Stop();
-            WaitForExit(1000);
+            WaitForExit(Timeout.Infinite);
         }
 
         private void Run()
@@ -151,6 +151,17 @@ namespace Cda.Core.Engine
                     pendingTid = evtTid;
                     pendingStatus = cont;
 
+                    if (code == NativeMethods.CREATE_PROCESS_DEBUG_EVENT)
+                    {
+                        // Only hFile is debugger-owned. ContinueDebugEvent closes the
+                        // process/thread debug handles at the corresponding EXIT event.
+                        CloseEventHandle(Marshal.ReadIntPtr(evt, U));
+                    }
+                    else if (code == NativeMethods.LOAD_DLL_DEBUG_EVENT)
+                    {
+                        CloseEventHandle(Marshal.ReadIntPtr(evt, U));
+                    }
+
                     if (code == NativeMethods.EXIT_PROCESS_DEBUG_EVENT)
                     {
                         uint exit = (uint)Marshal.ReadInt32(evt, U); // EXIT_PROCESS_DEBUG_INFO.dwExitCode
@@ -192,7 +203,7 @@ namespace Cda.Core.Engine
                                 Log?.Invoke($"debug breakpoint (int3) at 0x{faultIp:X} (first-chance) — continued (debugger rendezvous / integrity check, not a CDA fault).");
                                 bpNotes++;
                             }
-                            cont = NativeMethods.DBG_CONTINUE;
+                            cont = NativeMethods.DBG_EXCEPTION_NOT_HANDLED;
                         }
                         else if (DebugExceptionInfo.IsCrash(exCode) || isBp)
                         {
@@ -261,6 +272,12 @@ namespace Cda.Core.Engine
                 Marshal.FreeHGlobal(evt);
                 _ready.Set(); // unblock any WaitUntilAttached even on an early failure
             }
+        }
+
+        private static void CloseEventHandle(IntPtr handle)
+        {
+            if (handle != IntPtr.Zero && handle != NativeMethods.INVALID_HANDLE_VALUE)
+                NativeMethods.CloseHandle(handle);
         }
 
         // Snapshot the crashing thread's stack (words from RSP upward) so the caller

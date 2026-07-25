@@ -63,7 +63,7 @@ namespace Cda.Core.Engine
                                   Func<ulong, bool>? validate = null, int maxFrames = 64)
         {
             var ras = new List<ulong>();
-            if (snapshot == null || snapshot.Length == 0) return ras;
+            if (snapshot == null || snapshot.Length == 0 || maxFrames <= 0) return ras;
 
             _entryRsp = entryRsp;
             _snapshot = snapshot;

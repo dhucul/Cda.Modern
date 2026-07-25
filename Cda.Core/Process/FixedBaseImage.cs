@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.IO;
 using Cda.Core.Pe;
 
@@ -15,14 +16,17 @@ namespace Cda.Core.Process
     /// The copy is written NEXT TO the original (same directory) so the target's
     /// implicitly-linked sibling DLLs still resolve from the application directory.
     /// Copies are uniquely named so relaunching while a previous (detached) capture
-    /// is still running won't collide on a locked file; stale, unlocked copies are
-    /// swept on the next call. For the preferred base to actually be honored,
-    /// system-wide mandatory ASLR (force-relocate) must be off.
+    /// is still running won't collide on a locked file. Cleanup is restricted to
+    /// paths this process created and recorded as owned. For the preferred base to
+    /// actually be honored, system-wide mandatory ASLR (force-relocate) must be off.
     /// </summary>
     public static class FixedBaseImage
     {
         // <name>.cdafb.<token><ext> — e.g. app.cdafb.1a2b3c.exe
         private const string Mid = ".cdafb.";
+        private static readonly ConcurrentDictionary<string, string> OwnedCopies =
+            new(StringComparer.OrdinalIgnoreCase);
+        private static readonly object Gate = new();
 
         /// <summary>
         /// Write a fixed-base (ASLR-stripped) copy of <paramref name="originalPath"/>
@@ -35,15 +39,19 @@ namespace Cda.Core.Process
             byte[] bytes = File.ReadAllBytes(originalPath);
             if (!PeImage.TryStripAslr(bytes)) return originalPath; // already non-ASLR / not a PE
 
-            CleanupNear(originalPath); // sweep stale, unlocked copies before writing a fresh one
+            lock (Gate)
+            {
+                CleanupOwnedCopies(originalPath);
 
-            string dir = Path.GetDirectoryName(originalPath) ?? ".";
-            string name = Path.GetFileNameWithoutExtension(originalPath);
-            string ext = Path.GetExtension(originalPath);
-            string token = Environment.TickCount64.ToString("x");
-            string copy = Path.Combine(dir, name + Mid + token + ext);
-            File.WriteAllBytes(copy, bytes);
-            return copy;
+                string dir = Path.GetDirectoryName(originalPath) ?? ".";
+                string name = Path.GetFileNameWithoutExtension(originalPath);
+                string ext = Path.GetExtension(originalPath);
+                string token = Guid.NewGuid().ToString("N");
+                string copy = Path.Combine(dir, name + Mid + token + ext);
+                File.WriteAllBytes(copy, bytes);
+                OwnedCopies[Path.GetFullPath(copy)] = Path.GetFullPath(originalPath);
+                return copy;
+            }
         }
 
         /// <summary>True if <paramref name="path"/> names one of our fixed-base copies.</summary>
@@ -51,23 +59,34 @@ namespace Cda.Core.Process
             Path.GetFileName(path).Contains(Mid, StringComparison.OrdinalIgnoreCase);
 
         /// <summary>
-        /// Best-effort removal of fixed-base copies previously written next to
-        /// <paramref name="originalPath"/>. A copy still locked by a running capture
-        /// is left in place (it'll be swept on a later call).
+        /// Best-effort removal of fixed-base copies this process previously wrote
+        /// for <paramref name="originalPath"/>. A copy still locked by a running
+        /// capture remains owned and can be retried later in this process.
         /// </summary>
         public static void CleanupNear(string originalPath)
         {
-            try
+            lock (Gate)
             {
-                string dir = Path.GetDirectoryName(originalPath) ?? ".";
-                string name = Path.GetFileNameWithoutExtension(originalPath);
-                string ext = Path.GetExtension(originalPath);
-                foreach (var f in Directory.GetFiles(dir, name + Mid + "*" + ext))
-                {
-                    try { File.Delete(f); } catch { /* locked by a live capture — leave it */ }
-                }
+                CleanupOwnedCopies(originalPath);
             }
-            catch { /* directory not enumerable — ignore */ }
+        }
+
+        private static void CleanupOwnedCopies(string originalPath)
+        {
+            string fullOriginal;
+            try { fullOriginal = Path.GetFullPath(originalPath); }
+            catch { return; }
+
+            foreach (var entry in OwnedCopies)
+            {
+                if (!PathClassifier.SameFile(entry.Value, fullOriginal)) continue;
+                try
+                {
+                    if (File.Exists(entry.Key)) File.Delete(entry.Key);
+                    OwnedCopies.TryRemove(entry.Key, out _);
+                }
+                catch { /* locked by a live capture — retain ownership and retry later */ }
+            }
         }
     }
 }

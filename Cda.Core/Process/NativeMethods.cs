@@ -35,10 +35,20 @@ namespace Cda.Core.Process
             VmRead = 0x0010,
             VmWrite = 0x0020,
             VmOperation = 0x0008,
+            SuspendResume = 0x0800,
         }
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern IntPtr OpenProcess(ProcessAccess access, bool inherit, int pid);
+
+        [DllImport("ntdll.dll")]
+        public static extern int NtSuspendProcess(IntPtr process);
+
+        [DllImport("ntdll.dll")]
+        public static extern int NtResumeProcess(IntPtr process);
+
+        [DllImport("ntdll.dll")]
+        public static extern uint RtlNtStatusToDosError(int status);
 
         // --- Remote thread + symbol resolution (used to register the return-capture VEH
         //     in the target: a one-shot remote thread runs a bootstrap stub that calls

@@ -92,9 +92,14 @@ namespace Cda.Core.Engine
                         Thread.Sleep(sleep);
                         Collect(capture.Poll(), records, filter);
                     }
-                    Collect(capture.Poll(), records, filter); // final drain
+                    Collect(capture.StopAndDrain(), records, filter);
                 }
-                finally { capture.Dispose(); }
+                finally
+                {
+                    // StopAndDrain already closes on success; Dispose is an
+                    // idempotent retry if capture ended through an exception.
+                    capture.Dispose();
+                }
             }
             return BuildDataset(modules, functions, records);
         }

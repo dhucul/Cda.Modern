@@ -1,5 +1,6 @@
 using System;
 using System.Runtime.InteropServices;
+using System.Threading;
 using Cda.Core.Process;
 
 namespace Cda.Core.Engine
@@ -72,13 +73,37 @@ namespace Cda.Core.Engine
                 if (svc == IntPtr.Zero) { reason = "IPT service absent (no Intel PT support)"; return false; }
                 try
                 {
-                    if (NativeMethods.QueryServiceStatus(svc, out var st) &&
-                        (st.dwCurrentState == NativeMethods.SERVICE_RUNNING || st.dwCurrentState == NativeMethods.SERVICE_START_PENDING))
-                        return true;
-                    if (NativeMethods.StartServiceW(svc, 0, IntPtr.Zero)) return true;
-                    int err = Marshal.GetLastWin32Error();
-                    if (err == NativeMethods.ERROR_SERVICE_ALREADY_RUNNING) return true;
-                    reason = $"StartService(Ipt) failed ({err})";
+                    if (!NativeMethods.QueryServiceStatus(svc, out var st))
+                    {
+                        reason = $"QueryServiceStatus(Ipt) failed ({Marshal.GetLastWin32Error()})";
+                        return false;
+                    }
+                    if (st.dwCurrentState != NativeMethods.SERVICE_RUNNING &&
+                        st.dwCurrentState != NativeMethods.SERVICE_START_PENDING &&
+                        !NativeMethods.StartServiceW(svc, 0, IntPtr.Zero))
+                    {
+                        int err = Marshal.GetLastWin32Error();
+                        if (err != NativeMethods.ERROR_SERVICE_ALREADY_RUNNING)
+                        {
+                            reason = $"StartService(Ipt) failed ({err})";
+                            return false;
+                        }
+                    }
+
+                    long deadline = Environment.TickCount64 + 10_000;
+                    do
+                    {
+                        if (!NativeMethods.QueryServiceStatus(svc, out st))
+                        {
+                            reason = $"QueryServiceStatus(Ipt) failed ({Marshal.GetLastWin32Error()})";
+                            return false;
+                        }
+                        if (st.dwCurrentState == NativeMethods.SERVICE_RUNNING) return true;
+                        Thread.Sleep(50);
+                    }
+                    while (Environment.TickCount64 < deadline);
+
+                    reason = $"IPT service did not reach the running state (state {st.dwCurrentState}).";
                     return false;
                 }
                 finally { NativeMethods.CloseServiceHandle(svc); }
@@ -110,6 +135,7 @@ namespace Cda.Core.Engine
         /// <summary>Begin per-process tracing (all threads, new threads inherit). False on failure.</summary>
         public bool Start(int pid)
         {
+            Stop();
             _hProcess = NativeMethods.OpenProcess((NativeMethods.ProcessAccess)0x1FFFFF, false, pid);
             if (_hProcess == IntPtr.Zero) return false;
             _tracing = Request(Input(TypeStartProcessTrace, b =>
@@ -117,6 +143,11 @@ namespace Cda.Core.Engine
                 BitConverter.GetBytes((ulong)_hProcess).CopyTo(b, 0x10);
                 BitConverter.GetBytes(Options).CopyTo(b, 0x18);
             }), new byte[0x18]);
+            if (!_tracing)
+            {
+                NativeMethods.CloseHandle(_hProcess);
+                _hProcess = IntPtr.Zero;
+            }
             return _tracing;
         }
 
@@ -132,7 +163,9 @@ namespace Cda.Core.Engine
             ulong size = BitConverter.ToUInt64(szOut, 8); // IPT_OUTPUT_BUFFER GetTraceSize.TraceSize @ 0x08
             if (size < 16 || size > 512UL * 1024 * 1024) return null;
 
-            var trace = new byte[size];
+            byte[] trace;
+            try { trace = GC.AllocateUninitializedArray<byte>(checked((int)size)); }
+            catch (OutOfMemoryException) { return null; }
             bool ok = NativeMethods.DeviceIoControl(_device, IOCTL_IPT_READ_TRACE,
                 Input(TypeGetProcessTrace, FillSizeTrace), 0x30, trace, (uint)size, out _, IntPtr.Zero);
             return ok ? trace : null;
@@ -143,6 +176,11 @@ namespace Cda.Core.Engine
             if (_tracing && _hProcess != IntPtr.Zero)
                 Request(Input(TypeStopProcessTrace, b => BitConverter.GetBytes((ulong)_hProcess).CopyTo(b, 0x10)), null);
             _tracing = false;
+            if (_hProcess != IntPtr.Zero)
+            {
+                NativeMethods.CloseHandle(_hProcess);
+                _hProcess = IntPtr.Zero;
+            }
         }
 
         /// <summary>Read up to <c>buf.Length</c> bytes of the traced process's memory at
@@ -151,8 +189,10 @@ namespace Cda.Core.Engine
         public int ReadMemory(ulong addr, byte[] buf)
         {
             if (_hProcess == IntPtr.Zero) return 0;
-            return NativeMethods.ReadProcessMemory(_hProcess, (IntPtr)(long)addr, buf, (IntPtr)buf.Length, out IntPtr read)
-                ? (int)(long)read : 0;
+            NativeMethods.ReadProcessMemory(
+                _hProcess, (IntPtr)(long)addr, buf, (IntPtr)buf.Length, out IntPtr read);
+            long count = read.ToInt64();
+            return count <= 0 ? 0 : (int)Math.Min(count, buf.Length);
         }
 
         public void Dispose()

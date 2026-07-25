@@ -91,6 +91,7 @@ namespace Cda.Core.Pe
 
         public static PeImage FromFile(byte[] fileBytes)
         {
+            ArgumentNullException.ThrowIfNull(fileBytes);
             var img = new PeImage(fileBytes, mapped: false, actualBase: 0);
             img.Parse();
             img.ActualBase = img.PreferredImageBase;
@@ -100,6 +101,7 @@ namespace Cda.Core.Pe
         /// <summary>Parse an image already mapped into memory at <paramref name="baseAddress"/>.</summary>
         public static PeImage FromMappedImage(byte[] mappedBytes, ulong baseAddress)
         {
+            ArgumentNullException.ThrowIfNull(mappedBytes);
             var img = new PeImage(mappedBytes, mapped: true, actualBase: baseAddress);
             img.Parse();
             return img;
@@ -197,6 +199,8 @@ namespace Cda.Core.Pe
         private ushort U16(int off) => BinaryPrimitives.ReadUInt16LittleEndian(_data.AsSpan(off));
         private uint U32(int off) => BinaryPrimitives.ReadUInt32LittleEndian(_data.AsSpan(off));
         private ulong U64(int off) => BinaryPrimitives.ReadUInt64LittleEndian(_data.AsSpan(off));
+        private bool HasRange(long offset, long count) =>
+            offset >= 0 && count >= 0 && offset <= _data.LongLength - count;
 
         private void Parse()
         {
@@ -252,8 +256,9 @@ namespace Cda.Core.Pe
             int secOff = _optionalHeaderOffset + optSize;
             for (int i = 0; i < numSections; i++)
             {
-                int o = secOff + i * 40;
-                if (o + 40 > _data.Length) break;
+                long sectionOffset = (long)secOff + (long)i * 40;
+                if (!HasRange(sectionOffset, 40)) break;
+                int o = (int)sectionOffset;
                 var s = new PeSection
                 {
                     Name = ReadFixedAscii(o, 8),
@@ -296,7 +301,7 @@ namespace Cda.Core.Pe
             if (expRva == 0 || expSize == 0) return result;
 
             int dir = RvaToOffset(expRva);
-            if (dir < 0) return result;
+            if (!HasRange(dir, 40)) return result;
 
             uint ordinalBase = U32(dir + 16);
             uint numFunctions = U32(dir + 20);
@@ -309,35 +314,44 @@ namespace Cda.Core.Pe
             int namesOff = addrNames != 0 ? RvaToOffset(addrNames) : -1;
             int ordsOff = addrOrdinals != 0 ? RvaToOffset(addrOrdinals) : -1;
             if (funcsOff < 0) return result;
+            int maxFunctions = HasRange(funcsOff, 0) ? (_data.Length - funcsOff) / 4 : 0;
+            numFunctions = Math.Min(numFunctions, (uint)maxFunctions);
 
             // Map ordinal-index -> name (only some functions are named).
             var nameByIndex = new Dictionary<int, string>();
             if (namesOff >= 0 && ordsOff >= 0)
             {
-                for (int i = 0; i < numNames; i++)
+                int maxNames = Math.Min(
+                    HasRange(namesOff, 0) ? (_data.Length - namesOff) / 4 : 0,
+                    HasRange(ordsOff, 0) ? (_data.Length - ordsOff) / 2 : 0);
+                numNames = Math.Min(numNames, (uint)maxNames);
+                for (int i = 0; i < (int)numNames; i++)
                 {
                     uint nameRva = U32(namesOff + i * 4);
                     ushort ord = U16(ordsOff + i * 2);
-                    nameByIndex[ord] = ReadCString(nameRva);
+                    if (ord < numFunctions)
+                        nameByIndex[ord] = ReadCString(nameRva);
                 }
             }
 
-            uint expEnd = expRva + expSize;
-            for (int i = 0; i < numFunctions; i++)
+            ulong expEnd = (ulong)expRva + expSize;
+            for (int i = 0; i < (int)numFunctions; i++)
             {
                 uint funcRva = U32(funcsOff + i * 4);
                 if (funcRva == 0) continue;
+                ulong ordinalValue = (ulong)ordinalBase + (uint)i;
+                if (ordinalValue > ushort.MaxValue) continue;
 
                 var ex = new PeExport
                 {
-                    Ordinal = (ushort)(ordinalBase + i),
+                    Ordinal = (ushort)ordinalValue,
                     Rva = funcRva,
                 };
                 if (nameByIndex.TryGetValue(i, out var nm)) ex.Name = nm;
 
                 // A forwarder's "RVA" points inside the export directory to a
                 // "Dll.Func" string instead of code.
-                if (funcRva >= expRva && funcRva < expEnd)
+                if (funcRva >= expRva && (ulong)funcRva < expEnd)
                     ex.ForwarderTo = ReadCString(funcRva);
 
                 result.Add(ex);
@@ -369,19 +383,20 @@ namespace Cda.Core.Pe
             var (resRva, resSize) = _dirs[(int)DataDirectory.Resource];
             if (resRva == 0 || resSize == 0) return null;
             int baseOff = RvaToOffset(resRva);
-            if (baseOff < 0) return null;
+            if (baseOff < 0 || !HasRange(baseOff, resSize)) return null;
+            int resEnd = checked(baseOff + (int)resSize);
 
             // Level 1: type (an integer id, e.g. RT_DIALOG). Level 2: the requested
             // name/id. Both must be sub-directories.
-            int typeDir = FindResourceDir(baseOff, baseOff, type, null);
+            int typeDir = FindResourceDir(baseOff, resEnd, baseOff, type, null);
             if (typeDir < 0) return null;
-            int nameDir = FindResourceDir(baseOff, typeDir, id, name);
+            int nameDir = FindResourceDir(baseOff, resEnd, typeDir, id, name);
             if (nameDir < 0) return null;
 
             // Level 3: language — take the first entry, whose OffsetToData points at an
             // IMAGE_RESOURCE_DATA_ENTRY (leaf; high bit clear).
-            int leaf = FirstResourceLeaf(baseOff, nameDir);
-            if (leaf < 0 || leaf + 8 > _data.Length) return null;
+            int leaf = FirstResourceLeaf(baseOff, resEnd, nameDir);
+            if (!HasRange(leaf, 8) || leaf + 8 > resEnd) return null;
 
             uint dataRva = U32(leaf);        // an RVA, even in a file image
             uint size = U32(leaf + 4);
@@ -398,13 +413,14 @@ namespace Cda.Core.Pe
         // an integer <id> (when <name> is null) or a string <name>. Entry offsets are
         // relative to the resource-directory base <resBase>. Returns the matched
         // sub-directory's offset, or -1.
-        private int FindResourceDir(int resBase, int dirOff, uint id, string? name)
+        private int FindResourceDir(int resBase, int resEnd, int dirOff, uint id, string? name)
         {
-            if (dirOff + 16 > _data.Length) return -1;
+            if (!HasRange(dirOff, 16) || dirOff + 16 > resEnd) return -1;
             int numNamed = U16(dirOff + 12);
             int numId = U16(dirOff + 14);
             int total = numNamed + numId;
             int entries = dirOff + 16;
+            if ((long)entries + (long)total * 8 > resEnd) return -1;
             for (int i = 0; i < total; i++)
             {
                 int e = entries + i * 8;
@@ -415,38 +431,51 @@ namespace Cda.Core.Pe
 
                 bool match;
                 if (name != null)
-                    match = isNamed && ResourceNameEquals(resBase + (int)(nameField & 0x7FFFFFFF), name);
+                    match = isNamed && TryResourceOffset(resBase, resEnd, nameField, out int nameOff) &&
+                            ResourceNameEquals(nameOff, resEnd, name);
                 else
                     match = !isNamed && nameField == id;
                 if (!match) continue;
 
                 if ((offField & 0x80000000) == 0) return -1; // expected a sub-directory here
-                return resBase + (int)(offField & 0x7FFFFFFF);
+                return TryResourceOffset(resBase, resEnd, offField, out int child) ? child : -1;
             }
             return -1;
         }
 
         // The first entry of a resource sub-directory as a leaf (data-entry) offset. Used
         // for the language level, where any language's data serves for a caption.
-        private int FirstResourceLeaf(int resBase, int dirOff)
+        private int FirstResourceLeaf(int resBase, int resEnd, int dirOff)
         {
-            if (dirOff + 16 > _data.Length) return -1;
+            if (!HasRange(dirOff, 16) || dirOff + 16 > resEnd) return -1;
             int total = U16(dirOff + 12) + U16(dirOff + 14);
             if (total <= 0) return -1;
             int e = dirOff + 16;
-            if (e + 8 > _data.Length) return -1;
+            if (!HasRange(e, 8) || e + 8 > resEnd) return -1;
             uint offField = U32(e + 4);
             if ((offField & 0x80000000) != 0) return -1; // still a sub-directory, not a leaf
-            return resBase + (int)(offField & 0x7FFFFFFF);
+            return TryResourceOffset(resBase, resEnd, offField, out int leaf) ? leaf : -1;
         }
 
         // Compare a resource-directory name entry (a WORD length-prefixed, non-terminated
         // UTF-16 run at <off>, relative to the image) against <name>, case-insensitively.
-        private bool ResourceNameEquals(int off, string name)
+        private static bool TryResourceOffset(int resBase, int resEnd, uint field, out int offset)
         {
-            if (off + 2 > _data.Length) return false;
+            long candidate = (long)resBase + (field & 0x7FFFFFFF);
+            if (candidate < resBase || candidate >= resEnd || candidate > int.MaxValue)
+            {
+                offset = -1;
+                return false;
+            }
+            offset = (int)candidate;
+            return true;
+        }
+
+        private bool ResourceNameEquals(int off, int resEnd, string name)
+        {
+            if (!HasRange(off, 2) || off + 2 > resEnd) return false;
             int len = U16(off);
-            if (len == 0 || off + 2 + len * 2 > _data.Length) return false;
+            if (len == 0 || (long)off + 2L + (long)len * 2 > resEnd) return false;
             var chars = new char[len];
             for (int i = 0; i < len; i++) chars[i] = (char)U16(off + 2 + i * 2);
             return string.Equals(new string(chars), name, StringComparison.OrdinalIgnoreCase);
@@ -457,18 +486,18 @@ namespace Cda.Core.Pe
         {
             var result = new List<PeImport>();
             var (impRva, impSize) = _dirs[(int)DataDirectory.Import];
-            if (impRva == 0) return result;
+            if (impRva == 0 || impSize < 20) return result;
 
             int descOff = RvaToOffset(impRva);
             if (descOff < 0) return result;
+            long importEnd = Math.Min(_data.LongLength, (long)descOff + impSize);
 
             int ptr = Is64Bit ? 8 : 4;
             ulong ordinalFlag = Is64Bit ? 0x8000000000000000UL : 0x80000000UL;
 
-            for (int d = 0; ; d++)
+            for (long o64 = descOff; o64 <= importEnd - 20; o64 += 20)
             {
-                int o = descOff + d * 20;
-                if (o + 20 > _data.Length) break;
+                int o = (int)o64;
 
                 uint origThunk = U32(o);
                 uint nameRva = U32(o + 12);
@@ -479,17 +508,21 @@ namespace Cda.Core.Pe
                 uint lookupRva = origThunk != 0 ? origThunk : firstThunk;
                 int lookupOff = RvaToOffset(lookupRva);
                 int iatOff = RvaToOffset(firstThunk);
-                if (lookupOff < 0) continue;
+                if (lookupOff < 0 || iatOff < 0) continue;
 
-                for (int t = 0; ; t++)
+                int maxThunks = (_data.Length - lookupOff) / ptr;
+                for (int t = 0; t < maxThunks; t++)
                 {
-                    ulong thunk = Is64Bit ? U64(lookupOff + t * ptr) : U32(lookupOff + t * ptr);
+                    int thunkOff = lookupOff + t * ptr;
+                    ulong thunk = Is64Bit ? U64(thunkOff) : U32(thunkOff);
                     if (thunk == 0) break;
+                    ulong iatRva64 = (ulong)firstThunk + (ulong)t * (uint)ptr;
+                    if (iatRva64 > uint.MaxValue) break;
 
                     var imp = new PeImport
                     {
                         ModuleName = dll,
-                        IatRva = (uint)(firstThunk + t * ptr),
+                        IatRva = (uint)iatRva64,
                     };
                     if ((thunk & ordinalFlag) != 0)
                     {
@@ -497,9 +530,11 @@ namespace Cda.Core.Pe
                     }
                     else
                     {
-                        uint byNameRva = (uint)(thunk & 0x7FFFFFFF);
+                        ulong byNameValue = thunk & ~ordinalFlag;
+                        if (byNameValue > uint.MaxValue) continue;
+                        uint byNameRva = (uint)byNameValue;
                         int byNameOff = RvaToOffset(byNameRva);
-                        if (byNameOff >= 0)
+                        if (HasRange(byNameOff, 2))
                             imp.Name = ReadCString((uint)byNameRva + 2); // skip 2-byte Hint
                     }
                     result.Add(imp);

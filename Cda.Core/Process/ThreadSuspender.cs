@@ -1,94 +1,78 @@
 using System;
-using System.Collections.Generic;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 
 namespace Cda.Core.Process
 {
     /// <summary>
-    /// Suspends every thread of a target process for the duration of a delicate
-    /// operation — installing or removing entry detours — then resumes them all
-    /// on dispose. This removes the race where a target thread is executing the
-    /// exact bytes being patched, which is a classic cause of crashes in inline
-    /// hooking.
-    ///
-    /// Threads suspend at instruction boundaries, so after this returns no target
-    /// thread is mid-instruction inside a patch site. New threads created during
-    /// the (brief) window aren't covered; that residual risk is small and is the
-    /// trade-off for not walking the loader's structures.
+    /// Suspends a target process for a short code-patching critical section.
+    /// Process suspension is used instead of a one-time thread snapshot so a
+    /// concurrently-created thread cannot run through a partially written detour.
     /// </summary>
     public sealed class ThreadSuspender : IDisposable
     {
-        private readonly List<IntPtr> _suspended = new();
+        private IntPtr _process;
+        private bool _suspended;
 
         public ThreadSuspender(int pid)
         {
-            IntPtr snap = NativeMethods.CreateToolhelp32Snapshot(NativeMethods.TH32CS_SNAPTHREAD, 0);
-            if (snap == NativeMethods.INVALID_HANDLE_VALUE)
+            _process = NativeMethods.OpenProcess(
+                NativeMethods.ProcessAccess.SuspendResume |
+                NativeMethods.ProcessAccess.QueryLimitedInformation,
+                false, pid);
+            if (_process == IntPtr.Zero)
                 throw new Win32Exception(Marshal.GetLastWin32Error(),
-                    "Could not enumerate target threads.");
-            try
-            {
-                var te = new NativeMethods.THREADENTRY32
-                {
-                    dwSize = (uint)Marshal.SizeOf<NativeMethods.THREADENTRY32>(),
-                };
-                if (!NativeMethods.Thread32First(snap, ref te))
-                    throw new Win32Exception(Marshal.GetLastWin32Error(),
-                        "Could not enumerate target threads.");
+                    $"Could not open target process {pid} for suspension.");
 
-                int matched = 0;
-                while (true)
-                {
-                    if (te.th32OwnerProcessID == (uint)pid)
-                    {
-                        matched++;
-                        IntPtr h = NativeMethods.OpenThread(NativeMethods.THREAD_SUSPEND_RESUME, false, te.th32ThreadID);
-                        if (h == IntPtr.Zero)
-                            throw new Win32Exception(Marshal.GetLastWin32Error(),
-                                $"Could not open target thread {te.th32ThreadID}.");
-                        if (NativeMethods.SuspendThread(h) == unchecked((uint)-1))
-                        {
-                            NativeMethods.CloseHandle(h);
-                            throw new Win32Exception(Marshal.GetLastWin32Error(),
-                                $"Could not suspend target thread {te.th32ThreadID}.");
-                        }
-                        _suspended.Add(h);
-                    }
-
-                    if (NativeMethods.Thread32Next(snap, ref te)) continue;
-                    int error = Marshal.GetLastWin32Error();
-                    if (error != NativeMethods.ERROR_NO_MORE_FILES)
-                        throw new Win32Exception(error, "Target thread enumeration was incomplete.");
-                    break;
-                }
-
-                if (matched == 0)
-                    throw new InvalidOperationException("The target has no enumerable threads.");
-            }
-            catch
+            int status = NativeMethods.NtSuspendProcess(_process);
+            if (status != 0)
             {
-                // Construction did not establish the all-threads-frozen invariant.
-                // Undo every suspension already acquired before propagating failure.
-                Dispose();
-                throw;
+                uint error = NativeMethods.RtlNtStatusToDosError(status);
+                NativeMethods.CloseHandle(_process);
+                _process = IntPtr.Zero;
+                throw new Win32Exception(unchecked((int)error),
+                    $"Could not suspend target process {pid} (NTSTATUS 0x{status:X8}).");
             }
-            finally
-            {
-                NativeMethods.CloseHandle(snap);
-            }
+            _suspended = true;
         }
 
-        public int Count => _suspended.Count;
+        // Kept for diagnostic compatibility with the former per-thread
+        // implementation. A process-level suspension is one owned operation.
+        public int Count => _suspended ? 1 : 0;
 
         public void Dispose()
         {
-            foreach (IntPtr h in _suspended)
+            if (_process == IntPtr.Zero) return;
+            if (_suspended)
             {
-                NativeMethods.ResumeThread(h);
-                NativeMethods.CloseHandle(h);
+                int status = NativeMethods.NtResumeProcess(_process);
+                if (status != 0)
+                {
+                    uint error = NativeMethods.RtlNtStatusToDosError(status);
+                    // Keep the process handle and the finalizer armed so a later
+                    // retry can still resume the target.
+                    throw new Win32Exception(unchecked((int)error),
+                        $"Could not resume target process (NTSTATUS 0x{status:X8}).");
+                }
+                _suspended = false;
             }
-            _suspended.Clear();
+
+            NativeMethods.CloseHandle(_process);
+            _process = IntPtr.Zero;
+            GC.SuppressFinalize(this);
+        }
+
+        ~ThreadSuspender()
+        {
+            IntPtr process = _process;
+            if (process == IntPtr.Zero) return;
+            if (_suspended)
+            {
+                try { NativeMethods.NtResumeProcess(process); } catch { }
+            }
+            try { NativeMethods.CloseHandle(process); } catch { }
+            _process = IntPtr.Zero;
+            _suspended = false;
         }
     }
 }

@@ -205,7 +205,7 @@ namespace Cda.App.Visualization
         {
             double w = ActualWidth, h = ActualHeight;
             dc.DrawRectangle(Bg, null, new Rect(0, 0, w, h));
-            if (w <= 0) return;
+            if (w <= 0 || h < 16) return;
 
             DrawDensity(dc, w, h);
             DrawSelection(dc, h);

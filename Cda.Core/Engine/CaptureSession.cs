@@ -38,7 +38,9 @@ namespace Cda.Core.Engine
         private readonly List<IatHook> _iatHooks = new();
         private readonly object _hookGate = new();
         private bool _disposed;
+        private bool _stopping;
         private ulong _tscBase;
+        private readonly double _tscFrequency;
         private bool _haveBase;
         private uint _readSeq;
         private readonly object _drainGate = new();
@@ -120,6 +122,7 @@ namespace Cda.Core.Engine
             _buffer = buffer;
             ArgCount = argCount;
             _captureReturns = captureReturns;
+            _tscFrequency = TscClock.FrequencyHz;
         }
 
         // Candidate locations for the bisection range file, checked in this order.
@@ -323,43 +326,51 @@ namespace Cda.Core.Engine
                 skipped = 0;
                 firstError = null;
 
-                // No thread suspension: each hook is a single atomic, pointer-aligned
-                // write, and the stub is fully built before the slot points at it.
-                foreach (var (slotVa, target) in imports)
+                // WriteProcessMemory does not guarantee an atomic cross-process
+                // pointer exchange. Freeze the process for all slot swaps and keep
+                // one unambiguous owner per aligned IAT slot.
+                var seenSlots = new HashSet<ulong>();
+                using (new ThreadSuspender(proc.Pid))
                 {
-                    if (instrumented >= maxFunctions) break;
-                    IatHook? pendingHook = null;
-                    try
+                    foreach (var (slotVa, target) in imports)
                     {
-                        ulong stub = memory.Allocate(StubBytesMax, executable: true);
-
-                        // The stub records the call then jumps straight to the real
-                        // function — an IAT hook has no stolen bytes, so destination
-                        // == chain-back target == the real function.
-                        byte[] stubBytes = CaptureStub.Build(proc.Is64Bit, stub, target,
-                            buffer.ControlAddress, buffer.DataAddress, target, argCount, buffer.SlotCount);
-                        if (stubBytes.Length > StubBytesMax) { skipped++; continue; }
-                        code.Write(stub, stubBytes);
-                        code.Flush(stub, stubBytes.Length);
-
-                        // Point the slot at the stub (saving the original for teardown).
-                        if (!IatHook.TryInstall(code, slotVa, stub, proc.Is64Bit,
-                                out pendingHook, out string? skipReason))
+                        if (instrumented >= maxFunctions) break;
+                        int ptr = proc.Is64Bit ? 8 : 4;
+                        if (!seenSlots.Add(slotVa) || (slotVa & (ulong)(ptr - 1)) != 0)
                         {
                             skipped++;
-                            firstError ??= skipReason;
+                            firstError ??= "Duplicate or unaligned IAT slot.";
                             continue;
                         }
-                        session._iatHooks.Add(pendingHook!);
-                        pendingHook = null;
-                        instrumented++;
-                    }
-                    catch (Exception ex)
-                    {
-                        if (pendingHook?.NeedsCleanup == true)
-                            session._iatHooks.Add(pendingHook);
-                        skipped++;
-                        firstError ??= ex.Message;
+
+                        IatHook? pendingHook = null;
+                        try
+                        {
+                            ulong stub = memory.Allocate(StubBytesMax, executable: true);
+                            byte[] stubBytes = CaptureStub.Build(proc.Is64Bit, stub, target,
+                                buffer.ControlAddress, buffer.DataAddress, target, argCount, buffer.SlotCount);
+                            if (stubBytes.Length > StubBytesMax) { skipped++; continue; }
+                            code.Write(stub, stubBytes);
+                            code.Flush(stub, stubBytes.Length);
+
+                            if (!IatHook.TryInstall(code, slotVa, stub, proc.Is64Bit,
+                                    out pendingHook, out string? skipReason))
+                            {
+                                skipped++;
+                                firstError ??= skipReason;
+                                continue;
+                            }
+                            session._iatHooks.Add(pendingHook!);
+                            pendingHook = null;
+                            instrumented++;
+                        }
+                        catch (Exception ex)
+                        {
+                            if (pendingHook?.NeedsCleanup == true)
+                                session._iatHooks.Add(pendingHook);
+                            skipped++;
+                            firstError ??= ex.Message;
+                        }
                     }
                 }
 
@@ -586,7 +597,7 @@ namespace Cda.Core.Engine
                 {
                     using (new ThreadSuspender(_process.Pid))
                     {
-                        try { _hooks[idx].Remove(); } catch { /* best effort */ }
+                        _hooks[idx].Remove();
                     }
                     _hooks.RemoveAt(idx);
                     removed = true;
@@ -597,7 +608,8 @@ namespace Cda.Core.Engine
                 for (int i = _iatHooks.Count - 1; i >= 0; i--)
                 {
                     if (_iatHooks[i].Target != functionAddress) continue;
-                    try { _iatHooks[i].Remove(); } catch { /* best effort */ }
+                    using (new ThreadSuspender(_process.Pid))
+                        _iatHooks[i].Remove();
                     _iatHooks.RemoveAt(i);
                     removed = true;
                 }
@@ -657,9 +669,7 @@ namespace Cda.Core.Engine
                 _haveBase = true;
             }
 
-            // TSC frequency is unknown/variable; a nominal 1 GHz scale keeps the
-            // timeline monotonic and roughly seconds-shaped. Exact timing later.
-            return RingBufferReader.Decode(data, _buffer.RecordSize, _tscBase, 1_000_000_000.0);
+            return RingBufferReader.Decode(data, _buffer.RecordSize, _tscBase, _tscFrequency);
         }
 
         /// <summary>
@@ -858,7 +868,8 @@ namespace Cda.Core.Engine
             {
                 int len = 0;
                 while (len + 1 < n && !(b[len] == 0 && b[len + 1] == 0)) len += 2;
-                if (len >= 4)
+                bool terminated = len + 1 < n && b[len] == 0 && b[len + 1] == 0;
+                if (terminated && len >= 4)
                 {
                     var data = new byte[len];
                     Array.Copy(b, data, len);
@@ -889,41 +900,112 @@ namespace Cda.Core.Engine
         // format strings — excluding them truncated such strings at the first newline.
         private static bool IsStrChar(byte c) => IsPrint(c) || c == 0x09 || c == 0x0A || c == 0x0D;
 
+        /// <summary>
+        /// Stop admitting new calls, allow writers that were already inside a stub
+        /// to publish, and return every committed tail record before closing the
+        /// session. Must not run concurrently with <see cref="Poll"/>.
+        /// </summary>
+        public List<CallRecord> StopAndDrain()
+        {
+            lock (_hookGate)
+            {
+                if (_disposed) return new List<CallRecord>();
+                if (_stopping) throw new InvalidOperationException("Capture stop is already in progress.");
+                _stopping = true;
+                try { RestoreAllHooks(); }
+                catch { _stopping = false; throw; }
+            }
+
+            var tail = new List<CallRecord>();
+            try
+            {
+                int emptyPasses = 0;
+                uint priorClaim = _buffer.ReadClaimSeq(_code);
+                for (int pass = 0; pass < 200 && emptyPasses < 2; pass++)
+                {
+                    var batch = Poll();
+                    uint claim = _buffer.ReadClaimSeq(_code);
+                    bool fullyDrained = _readSeq == claim;
+                    if (batch.Count == 0 && fullyDrained && claim == priorClaim)
+                    {
+                        emptyPasses++;
+                        if (emptyPasses < 2) System.Threading.Thread.Sleep(5);
+                    }
+                    else
+                    {
+                        emptyPasses = 0;
+                        tail.AddRange(batch);
+                        System.Threading.Thread.Sleep(5);
+                    }
+                    priorClaim = claim;
+                    if (!_process.IsAlive) break;
+                }
+                if (_process.IsAlive && emptyPasses < 2)
+                    throw new TimeoutException(
+                        "Capture writers did not quiesce after hooks were restored.");
+
+                lock (_hookGate)
+                {
+                    _disposed = true;
+                    _stopping = false;
+                    _process.Dispose();
+                }
+                return tail;
+            }
+            catch
+            {
+                lock (_hookGate) _stopping = false;
+                throw;
+            }
+        }
+
+        private void RestoreAllHooks()
+        {
+            if (!_process.IsAlive)
+            {
+                _hooks.Clear();
+                _iatHooks.Clear();
+                return;
+            }
+
+            var failures = new List<Exception>();
+            if (_hooks.Count > 0 || _iatHooks.Count > 0)
+            {
+                try
+                {
+                    using var suspended = new ThreadSuspender(_process.Pid);
+                    for (int i = _hooks.Count - 1; i >= 0; i--)
+                    {
+                        try { _hooks[i].Remove(); _hooks.RemoveAt(i); }
+                        catch (Exception ex) { failures.Add(ex); }
+                    }
+                    for (int i = _iatHooks.Count - 1; i >= 0; i--)
+                    {
+                        try { _iatHooks[i].Remove(); _iatHooks.RemoveAt(i); }
+                        catch (Exception ex) { failures.Add(ex); }
+                    }
+                }
+                catch (Exception ex) { failures.Add(ex); }
+            }
+
+            if (failures.Count != 0)
+                throw new AggregateException(
+                    "One or more target hooks could not be restored.", failures);
+        }
+
         public void Dispose()
         {
             lock (_hookGate)
             {
-            if (_disposed) return;
-            _disposed = true;
-            // Inline hooks rewrite .text, so restore them with the target frozen (no
-            // thread mid-instruction in a site we're rewriting). Skip the freeze
-            // entirely for an IAT-only session.
-            if (_hooks.Count > 0)
-            {
-                using (new ThreadSuspender(_process.Pid))
-                {
-                    foreach (var hook in _hooks)
-                    {
-                        try { hook.Remove(); } catch { /* best effort */ }
-                    }
-                }
-            }
-            _hooks.Clear();
-
-            // IAT hooks are atomic pointer restores — no suspend needed. A thread may
-            // still be inside a stub, but the stub chains to the real function, so
-            // restoring the slot only affects future calls.
-            foreach (var h in _iatHooks)
-            {
-                try { h.Remove(); } catch { /* best effort */ }
-            }
-            _iatHooks.Clear();
-
-            // Deliberately DO NOT free the stubs/trampolines/buffer. A thread may
-            // still be executing inside a stub or trampoline, or be poised to
-            // return into one; freeing would crash the target. These regions are
-            // reclaimed when the target exits. (Bounded leak per capture session.)
-            _process.Dispose();
+                if (_disposed) return;
+                if (_stopping) throw new InvalidOperationException("Capture stop is already in progress.");
+                RestoreAllHooks();
+                _disposed = true;
+                // Deliberately DO NOT free the stubs/trampolines/buffer. A thread may
+                // still be executing inside a stub or trampoline, or be poised to
+                // return into one; freeing would crash the target. These regions are
+                // reclaimed when the target exits. (Bounded leak per capture session.)
+                _process.Dispose();
             }
         }
     }

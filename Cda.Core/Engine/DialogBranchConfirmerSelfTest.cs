@@ -156,7 +156,8 @@ namespace Cda.Core.Engine
             public ulong InstructionPointer { get; set; }
             public ulong StackPointer { get; set; }
             public void SetBreakpoints(ulong[] addrs) { }
-            public void ClearBreakpoints() { }
+            public DebugRegisterState CaptureDebugRegisters() => default;
+            public void RestoreDebugRegisters(DebugRegisterState state) { }
             public bool Apply(IntPtr hThread) => true;
             public void Dispose() { }
         }

@@ -77,14 +77,15 @@ namespace Cda.Core.Engine
         private static string? ReadTitle(ReadOnlySpan<byte> t, int pos)
         {
             var sb = new StringBuilder();
+            bool terminated = false;
             while (pos + 2 <= t.Length)
             {
                 ushort c = BinaryPrimitives.ReadUInt16LittleEndian(t.Slice(pos));
                 pos += 2;
-                if (c == 0) break;
+                if (c == 0) { terminated = true; break; }
                 sb.Append((char)c);
             }
-            return sb.Length > 0 ? sb.ToString() : null;
+            return terminated && sb.Length > 0 ? sb.ToString() : null;
         }
     }
 }

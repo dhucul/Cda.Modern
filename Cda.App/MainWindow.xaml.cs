@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Security.Cryptography;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Media;
@@ -36,6 +37,10 @@ namespace Cda.App
         private bool _captureBursting; // true while polls are draining a heavy startup flood
         private bool _polling;         // true while a background Poll() is in flight (re-entrancy guard)
         private TaskCompletionSource<bool>? _pollCompletion; // lets shutdown wait without closing handles under Poll()
+        private CaptureSession? _stoppingCapture; // explicit Stop waiting for an in-flight poll to yield
+        private bool _stoppingCaptureWasDialog;
+        private bool _discardStoppingTail;
+        private readonly List<CaptureSession> _cleanupRetries = new();
         private bool _closeAfterPoll;  // a close request is waiting for the active poll to yield
         private int _captureClearGen;  // bumped by "Clear calls"; a poll batch decoded across a clear is dropped
         private CaptureChainResolver? _chainResolver;  // worker-thread caller-chain resolver for live polls
@@ -346,10 +351,10 @@ namespace Cda.App
             StringsPanel.FunctionActivated += OnStringFunctionActivated;
             StringsPanel.Shown += (_, _) => RunStringScan(); // lazy: scan when the tab is opened
             ChildTargetBox.ItemsSource = _childItems;
-            Loaded += (_, _) =>
+            Loaded += async (_, _) =>
             {
                 UpdateDpiText();
-                LoadDemo();
+                await LoadDemo();
             };
         }
 
@@ -367,7 +372,7 @@ namespace Cda.App
 
         // --- demo trace ------------------------------------------------------
 
-        private void OnLoadDemo(object sender, RoutedEventArgs e) => LoadDemo();
+        private async void OnLoadDemo(object sender, RoutedEventArgs e) => await LoadDemo();
 
         private void OnFit(object sender, RoutedEventArgs e) => GraphView.FitToContent();
 
@@ -388,8 +393,21 @@ namespace Cda.App
             StatusText.Text = $"Self-test · hook: {hook} · capture: {capture} · returns: {returns} · veh: {veh} · branch: {branch} · pt: {pt} · discovery: {discovery}";
         }
 
-        private void LoadDemo()
+        private async Task LoadDemo()
         {
+            // Demo is a complete mode switch. Tear down every live owner before
+            // replacing the views, otherwise an old poll/debug callback can append
+            // target records into the synthetic dataset.
+            StopDllCapture();
+            StopApiLaunch();
+            StopChildFollow();
+            StopHwbp();
+            if (!await StopCaptureQuietly()) return;
+            _session?.Dispose();
+            _session = null;
+            DisposeAttachPt();
+            SetManaged(null);
+
             TraceDataset data = DemoDataSource.Generate();
             SetCallersTarget(0);
             _offlineTrace = false;
@@ -397,11 +415,17 @@ namespace Cda.App
             _is64 = true;
             _currentPe = null;
             _moduleMap = new ModuleMap(data.Modules);
+            _liveDataset = data;
+            _captured.Clear();
+            _captured.AddRange(data.Records);
 
             _model.Load(data);
             GraphView.SetModel(_model);
             PlayBar.SetData(data);
             FunctionList.LoadFromDataset(data);
+            CallList.Configure(_moduleMap);
+            CallList.Clear();
+            CallList.AddRecords(data.Records);
             DisposeFileMap();
             Hex.SetSource(null);
             Disasm.SetSource(null);
@@ -427,7 +451,7 @@ namespace Cda.App
             StopDllCapture();
             StopApiLaunch();
             StopChildFollow();
-            StopCaptureQuietly(); // defers disposal if a background poll is in flight
+            if (!await StopCaptureQuietly()) return;
             int targetGeneration = unchecked(++_targetGeneration);
 
             // A static file view doesn't use the live session; release it so we
@@ -1404,7 +1428,7 @@ namespace Cda.App
         // Switch a running trace (the broad startup trace, or another focused one)
         // onto just this function: restore the current hooks, then instrument only
         // it. The prior calls are cleared — Stop capture first to keep them.
-        private void RefocusCaptureOn(ulong address)
+        private async void RefocusCaptureOn(ulong address)
         {
             if (_session == null || _liveDataset == null) return;
             if (!_liveDataset.Functions.Exists(f => f.Address == address))
@@ -1412,7 +1436,7 @@ namespace Cda.App
                 StatusText.Text = "That entry isn't in the live module — can't refocus on it.";
                 return;
             }
-            StopCaptureQuietly();
+            if (!await StopCaptureQuietly()) return;
             _diag.Add($"refocus live trace on {DescribeAddr(address)}");
             StartCaptureOn(new List<ulong> { address }, DescribeAddr(address), preserveLog: true);
         }
@@ -1440,8 +1464,15 @@ namespace Cda.App
 
         // Tear down a running capture (restores the hooked bytes) without freezing
         // the recording into the view — used when switching to another function.
-        private void StopCaptureQuietly()
+        private async Task<bool> StopCaptureQuietly()
         {
+            RetryFailedCaptureCleanup();
+            if (_cleanupRetries.Count > 0)
+            {
+                StatusText.Text =
+                    "Previous capture cleanup is still incomplete; no new mode was started.";
+                return false;
+            }
             unchecked { _targetGeneration++; }
             CancelTargetBusyCursor();
             _startupActive = false;
@@ -1454,9 +1485,22 @@ namespace Cda.App
             // If a background poll is in flight, its continuation disposes cap (it
             // sees _capture != cap); closing the handle here would pull it out from
             // under an in-progress ReadProcessMemory.
-            if (cap != null && !_polling) { try { cap.Dispose(); } catch { } }
+            if (cap != null && !_polling)
+            {
+                try { cap.Dispose(); }
+                catch (Exception ex) { RetainFailedCleanup(cap, ex); }
+            }
+            else if (cap != null)
+            {
+                _stoppingCapture = cap;
+                _stoppingCaptureWasDialog = false;
+                _discardStoppingTail = true;
+                Task? pending = _pollCompletion?.Task;
+                if (pending != null) await pending;
+            }
             DisposeAttachPt();
             UpdateClearCallsState();
+            return _cleanupRetries.Count == 0;
         }
 
         // --- attach to a live process (read-only discovery) ------------------
@@ -1469,7 +1513,7 @@ namespace Cda.App
             // Switching targets: stop any capture running on the OLD process first (as every
             // other mode-switch does) — otherwise its hooks, poll timer and Intel PT trace leak
             // and its dialog rows/confirmations get misattributed to the new target.
-            StopCaptureQuietly();
+            if (!await StopCaptureQuietly()) return;
             StopDllCapture();
             StopApiLaunch();
             StopChildFollow();
@@ -1574,7 +1618,7 @@ namespace Cda.App
 
             if (_startupStop) return; // user hit Stop before this (relaunched) attempt got going
 
-            StopCaptureQuietly();
+            if (!await StopCaptureQuietly()) return;
             StopDllCapture();
             StopApiLaunch();
             StopChildFollow();
@@ -1697,7 +1741,7 @@ namespace Cda.App
                         // flood. Ensure the canonical file exists so it's always findable.
                         string skipFile = EnsureSkipListExists();
                         _diag.Add($"skip-list file: {skipFile}");
-                        var (skipRvas, skipProbe) = ReadStartupSkipRvas();
+                        var (skipRvas, skipProbe) = ReadStartupSkipRvas(path);
                         _diag.Add(skipProbe);
                         if (skipRvas.Count > 0)
                         {
@@ -1798,8 +1842,7 @@ namespace Cda.App
                             bool attached = await Task.Run(() => crashWatch.WaitUntilAttached(3000));
                             if (gen != _startupGeneration || targetGeneration != _targetGeneration || _startupStop)
                             {
-                                crashWatch.Stop();
-                                crashWatch.WaitForExit(1000);
+                                crashWatch.Dispose();
                                 try { TargetProcess.Kill(pid); } catch { }
                                 proc.Dispose();
                                 EndTargetBusyCursor(targetGeneration);
@@ -2168,7 +2211,7 @@ namespace Cda.App
 
         // --- launch a host & capture a DLL from the moment it loads ----------
 
-        private void OnLaunchDllCapture(object sender, RoutedEventArgs e)
+        private async void OnLaunchDllCapture(object sender, RoutedEventArgs e)
         {
             var dlg = new Microsoft.Win32.OpenFileDialog
             {
@@ -2234,7 +2277,7 @@ namespace Cda.App
                 commandLine = "\"" + hostPath + "\" \"" + targetDll + "\",#1";
             }
 
-            StopCaptureQuietly();
+            if (!await StopCaptureQuietly()) return;
             StopDllCapture();
             StopApiLaunch();
             StopChildFollow();
@@ -2352,11 +2395,10 @@ namespace Cda.App
         private void StopDllCapture()
         {
             var worker = _dllCapture;
-            _dllCapture = null;
             if (worker != null)
             {
-                worker.Stop();
-                worker.WaitForExit(1000);
+                worker.Dispose();
+                if (ReferenceEquals(_dllCapture, worker)) _dllCapture = null;
             }
             UpdateClearCallsState();
         }
@@ -2370,7 +2412,7 @@ namespace Cda.App
         // diagnostics; the records themselves aren't routed into the single-target
         // graph/calls views yet (that's the next stage). Stop capture removes the
         // hooks and detaches, leaving the tree running.
-        private void OnFollowChildren(object sender, RoutedEventArgs e)
+        private async void OnFollowChildren(object sender, RoutedEventArgs e)
         {
             var dlg = new Microsoft.Win32.OpenFileDialog
             {
@@ -2380,7 +2422,7 @@ namespace Cda.App
             if (dlg.ShowDialog(this) != true) return;
 
             // Don't run alongside another capture/observer.
-            StopCaptureQuietly();
+            if (!await StopCaptureQuietly()) return;
             StopDllCapture();
             StopApiLaunch();
             StopChildFollow();
@@ -2459,11 +2501,10 @@ namespace Cda.App
         private void StopChildFollow()
         {
             var worker = _childFollow;
-            _childFollow = null;
             if (worker != null)
             {
-                worker.Stop();
-                worker.WaitForExit(1000);
+                worker.Dispose();
+                if (ReferenceEquals(_childFollow, worker)) _childFollow = null;
             }
             UpdateClearCallsState();
         }
@@ -2561,8 +2602,10 @@ namespace Cda.App
             _childSelectedPid = pid;
             _childView = true;
 
-            // No _capture/_pollTimer for child-follow; the engine owns the polling.
-            StopCaptureQuietly();
+            // The follow engine owns polling and was established only after every
+            // single-target capture was stopped. Do not call StopCaptureQuietly here:
+            // it advances _targetGeneration and would invalidate this follow run's
+            // own callbacks merely because the user selected one of its targets.
             _session?.Dispose();
             _session = null;
             _currentPe = null;
@@ -2706,19 +2749,24 @@ namespace Cda.App
         // an RVA auto-appended to the canonical write file (below) is always honoured no
         // matter which other files exist. Returns the RVAs and a human-readable probe
         // (mirrors the range probe, so a run shows the skip-list took effect).
-        private static (HashSet<ulong> Rvas, string Probe) ReadStartupSkipRvas()
+        private static (HashSet<ulong> Rvas, string Probe) ReadStartupSkipRvas(string imagePath)
         {
             var rvas = new HashSet<ulong>();
             var probed = new List<string>();
+            string? imageId = ComputeImageIdentity(imagePath);
+            int legacyEntries = 0;
             foreach (var p in HookSkipFilePaths())
             {
                 bool exists = false; string content = "";
                 try { exists = System.IO.File.Exists(p); if (exists) content = System.IO.File.ReadAllText(p); }
                 catch { }
-                if (exists && content.Trim().Length > 0) ParseSkipRvas(content, rvas);
+                if (exists && content.Trim().Length > 0)
+                    legacyEntries += ParseSkipRvas(content, imageId, rvas);
                 probed.Add($"{p} [{(exists ? (content.Trim().Length == 0 ? "blank" : "found") : "absent")}]");
             }
-            string probe = "hook-skip probe — " + string.Join(" | ", probed) + $" ; {rvas.Count} RVA(s) total";
+            string probe = "hook-skip probe — " + string.Join(" | ", probed) +
+                           $" ; {rvas.Count} RVA(s) for this image" +
+                           (legacyEntries > 0 ? $" ; ignored {legacyEntries} unscoped legacy entr{(legacyEntries == 1 ? "y" : "ies")}" : "");
             return (rvas, probe);
         }
 
@@ -2738,8 +2786,7 @@ namespace Cda.App
                 if (!System.IO.File.Exists(path))
                     System.IO.File.WriteAllText(path,
                         "# CDA startup-trace hook skip-list.\n" +
-                        "# RVAs (offsets from the main image base) the \"Launch & capture\" startup\n" +
-                        "# trace must NOT inline-hook. One hex RVA per line (0x / +0x optional).\n" +
+                        "# Schema: v2|SHA256-of-image|0xRVA. Entries apply only to that exact image.\n" +
                         "# '#' or '//' starts a comment. Read fresh on every launch — edit freely.\n" +
                         "# Crashes that CDA can pin to a hook are auto-appended here.\n\n");
             }
@@ -2755,32 +2802,64 @@ namespace Cda.App
         {
             try
             {
-                if (ReadStartupSkipRvas().Rvas.Contains(rva)) return null; // already covered
+                if (string.IsNullOrEmpty(_startupPath))
+                    throw new InvalidOperationException("The startup image path is unavailable.");
+                string imageId = ComputeImageIdentity(_startupPath)
+                    ?? throw new IOException("Could not hash the startup image.");
+                if (ReadStartupSkipRvas(_startupPath).Rvas.Contains(rva)) return null; // already covered
                 string path = SkipListWritePath();
                 if (!System.IO.File.Exists(path) || new System.IO.FileInfo(path).Length == 0)
                     System.IO.File.WriteAllText(path,
-                        "# CDA startup-trace hook skip-list — RVAs (from the image base) NOT to inline-hook.\n" +
-                        "# Auto-appended on crashes; edit freely. One hex RVA per line.\n\n");
+                        "# CDA startup-trace hook skip-list.\n" +
+                        "# Schema: v2|SHA256-of-image|0xRVA. Auto-appended on crashes; edit freely.\n\n");
                 string note = name.Replace('\n', ' ').Replace('\r', ' ');
-                System.IO.File.AppendAllText(path, $"0x{rva:X}   # {note} — auto-added after a crash\n");
+                System.IO.File.AppendAllText(path,
+                    $"v2|{imageId}|0x{rva:X}   # {note} — auto-added after a crash\n");
                 return path;
             }
             catch (Exception ex) { _diag.Add("skip-list: couldn't write — " + ex.Message); return null; }
         }
 
-        private static void ParseSkipRvas(string content, HashSet<ulong> rvas)
+        private static int ParseSkipRvas(string content, string? imageId, HashSet<ulong> rvas)
         {
+            int legacyEntries = 0;
             foreach (var rawLine in content.Replace("\r", "").Split('\n'))
             {
                 string line = rawLine.Trim();
                 int comment = line.IndexOf('#'); if (comment >= 0) line = line.Substring(0, comment);
                 comment = line.IndexOf("//", StringComparison.Ordinal); if (comment >= 0) line = line.Substring(0, comment);
-                line = line.Trim().TrimStart('+');
+                line = line.Trim();
                 if (line.Length == 0) continue;
+                string[] fields = line.Split('|');
+                if (fields.Length != 3 ||
+                    !string.Equals(fields[0].Trim(), "v2", StringComparison.OrdinalIgnoreCase))
+                {
+                    legacyEntries++;
+                    continue;
+                }
+                if (imageId == null ||
+                    !string.Equals(fields[1].Trim(), imageId, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                line = fields[2].Trim().TrimStart('+');
                 if (line.StartsWith("0x", StringComparison.OrdinalIgnoreCase)) line = line.Substring(2);
                 if (ulong.TryParse(line, System.Globalization.NumberStyles.HexNumber,
                         System.Globalization.CultureInfo.InvariantCulture, out ulong rva))
                     rvas.Add(rva);
+            }
+            return legacyEntries;
+        }
+
+        private static string? ComputeImageIdentity(string path)
+        {
+            try
+            {
+                using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+                    FileShare.Read | FileShare.Delete);
+                return Convert.ToHexString(SHA256.HashData(stream));
+            }
+            catch
+            {
+                return null;
             }
         }
 
@@ -3208,7 +3287,7 @@ namespace Cda.App
             _ => "exports",
         };
 
-        private void LaunchSurfaceCapture(LaunchApiCapture.HookMode mode, string modeLabel)
+        private async void LaunchSurfaceCapture(LaunchApiCapture.HookMode mode, string modeLabel)
         {
             if (_capture != null || _dllCapture != null || _apiLaunch != null ||
                 _childFollow != null || _hwbp != null)
@@ -3258,7 +3337,7 @@ namespace Cda.App
             }
             string commandLine = "\"" + launchPath + "\"";
 
-            StopCaptureQuietly();
+            if (!await StopCaptureQuietly()) return;
             StopDllCapture();
             StopApiLaunch();
             StopChildFollow();
@@ -3400,6 +3479,13 @@ namespace Cda.App
                 }
                 _session?.Dispose();
                 _session = session;
+                // The first startup-dialog poll can build the caller index before
+                // this asynchronous attach finishes. Rebuild it now that app
+                // function entries are available; otherwise later dialogs keep
+                // using the permanently empty startup index.
+                _callerIndexFor = null;
+                _idxAddr = Array.Empty<ulong>();
+                _idxName = Array.Empty<string>();
                 _moduleMap = session.Modules;
                 CallList.Configure(_moduleMap);
                 DisposeFileMap();
@@ -3522,11 +3608,10 @@ namespace Cda.App
         private void StopApiLaunch()
         {
             var worker = _apiLaunch;
-            _apiLaunch = null;
             if (worker != null)
             {
-                worker.Stop();
-                worker.WaitForExit(1000);
+                worker.Dispose();
+                if (ReferenceEquals(_apiLaunch, worker)) _apiLaunch = null;
             }
             UpdateClearCallsState();
         }
@@ -3686,11 +3771,10 @@ namespace Cda.App
         private void StopHwbp()
         {
             var worker = _hwbp;
-            _hwbp = null;
             if (worker != null)
             {
-                worker.Stop();
-                worker.WaitForExit(1000);
+                worker.Dispose();
+                if (ReferenceEquals(_hwbp, worker)) _hwbp = null;
             }
             UpdateClearCallsState();
         }
@@ -4003,7 +4087,7 @@ namespace Cda.App
                 if (m == null) return false;
                 if (_appModuleCache.TryGetValue(m.BaseAddress, out bool app)) return app;
                 app = _winDir.Length == 0 || string.IsNullOrEmpty(m.Path) ||
-                      !m.Path!.StartsWith(_winDir, StringComparison.OrdinalIgnoreCase);
+                      !PathClassifier.IsUnderDirectory(m.Path, _winDir);
                 _appModuleCache[m.BaseAddress] = app;
                 return app;
             }
@@ -4313,7 +4397,8 @@ namespace Cda.App
                     }
 
                     var bi = DialogBranchAnalyzer.Analyze(rec.Source, parentAddrs, _is64,
-                        (addr, buf) => DialogRead(addr, buf));
+                        (addr, buf) => DialogRead(addr, buf),
+                        resolveFunctionStart: ResolveFunctionStart);
                     if (bi != null)
                     {
                         branchAddr = bi.Address;
@@ -4333,7 +4418,8 @@ namespace Cda.App
                     // nearest candidate branches and ask the debug loop to observe which one
                     // the CPU actually takes — confirmed on the caller's next run.
                     var candidates = DialogBranchAnalyzer.CollectCandidates(rec.Source, parentAddrs, _is64,
-                        (addr, buf) => DialogRead(addr, buf), maxCandidates: 6);
+                        (addr, buf) => DialogRead(addr, buf), maxCandidates: 6,
+                        resolveFunctionStart: ResolveFunctionStart);
                     callSiteKey = candidates.Count > 0 ? candidates[0].CallSite
                                 : bi?.Address ?? rec.Source;
 
@@ -4989,7 +5075,7 @@ namespace Cda.App
             if (_appModuleCache.TryGetValue(m.BaseAddress, out bool app)) return app;
             string wd = WinDir();
             app = wd.Length == 0 || string.IsNullOrEmpty(m.Path) ||
-                  !m.Path!.StartsWith(wd, StringComparison.OrdinalIgnoreCase);
+                  !PathClassifier.IsUnderDirectory(m.Path, wd);
             _appModuleCache[m.BaseAddress] = app;
             return app;
         }
@@ -5434,8 +5520,20 @@ namespace Cda.App
                 // resolver; disposal was deliberately handed off to this continuation.
                 if (!ReferenceEquals(_capture, cap))
                 {
-                    FinishPoll();
-                    try { cap.Dispose(); } catch { }
+                    if (ReferenceEquals(_stoppingCapture, cap))
+                    {
+                        var stopped = await Task.Run(() => cap.CompleteDecodedPoll(decoded));
+                        var tail = await Task.Run(cap.StopAndDrain);
+                        stopped.AddRange(tail);
+                        FinishPoll();
+                        CompleteExplicitStop(cap, stopped, _stoppingCaptureWasDialog);
+                    }
+                    else
+                    {
+                        FinishPoll();
+                        try { cap.Dispose(); }
+                        catch (Exception ex) { RetainFailedCleanup(cap, ex); }
+                    }
                     return;
                 }
 
@@ -5456,18 +5554,54 @@ namespace Cda.App
             }
             catch (Exception ex)
             {
-                FinishPoll();
-                if (ReferenceEquals(_capture, cap)) { StatusText.Text = "Capture poll error: " + ex.Message; StopCapture(); }
-                else { try { cap.Dispose(); } catch { } } // stopped mid-poll: dispose the orphan
+                if (ReferenceEquals(_capture, cap))
+                {
+                    FinishPoll();
+                    StatusText.Text = "Capture poll error: " + ex.Message;
+                    StopCapture();
+                }
+                else
+                {
+                    try
+                    {
+                        cap.Dispose();
+                        if (ReferenceEquals(_stoppingCapture, cap)) _stoppingCapture = null;
+                    }
+                    catch (Exception cleanupError) { RetainFailedCleanup(cap, cleanupError); }
+                    FinishPoll();
+                }
                 return;
             }
-            FinishPoll();
-
             // Capture was stopped or refocused while we were off the UI thread:
             // discard this batch and dispose the session that StopCapture /
             // StopCaptureQuietly handed off to us (they couldn't close its handle
             // while Poll was still reading through it).
-            if (!ReferenceEquals(_capture, cap)) { try { cap.Dispose(); } catch { } return; }
+            if (!ReferenceEquals(_capture, cap))
+            {
+                if (ReferenceEquals(_stoppingCapture, cap))
+                {
+                    try
+                    {
+                        var tail = await Task.Run(cap.StopAndDrain);
+                        batch.Records.AddRange(tail);
+                        CompleteExplicitStop(cap, batch.Records, _stoppingCaptureWasDialog);
+                    }
+                    catch (Exception ex)
+                    {
+                        RetainFailedCleanup(cap, ex);
+                        StatusText.Text =
+                            "Capture cleanup failed — target hooks may still be active; stop will retry.";
+                    }
+                }
+                else
+                {
+                    try { cap.Dispose(); }
+                    catch (Exception ex) { RetainFailedCleanup(cap, ex); }
+                }
+                FinishPoll();
+                return;
+            }
+            FinishPoll();
 
             // "Clear calls" ran while this batch was decoding off the UI thread. The
             // records were drained from the ring before the clear, so showing them now
@@ -5597,6 +5731,12 @@ namespace Cda.App
             return true;
         }
 
+        private ulong ResolveFunctionStart(ulong address)
+        {
+            EnsureCallerIndex();
+            return FloorToFunction(address, out ulong function, out _) ? function : 0;
+        }
+
         private void OnStopCapture(object sender, RoutedEventArgs e)
         {
             // The user explicitly stopped: latch it so any pending relaunch (or one
@@ -5610,6 +5750,7 @@ namespace Cda.App
         }
         private void StopCapture()
         {
+            RetryFailedCaptureCleanup();
             unchecked { _targetGeneration++; }
             CancelTargetBusyCursor();
             _startupActive = false;
@@ -5633,7 +5774,7 @@ namespace Cda.App
                 // No poll in flight — safe to drain the tail and dispose here.
                 try
                 {
-                    var tail = cap.Poll();
+                    var tail = cap.StopAndDrain();
                     CallList.RefreshCompletedReturns();
                     ApplyCaptureCondition(tail);
                     AppendCapturedTimeOrdered(tail);
@@ -5644,14 +5785,24 @@ namespace Cda.App
                     // this final drain (the 100 ms poll never fired) — surface it too.
                     if (wasDialogMode) CheckDialogCalls(tail, null);
                 }
-                catch { /* ignore final drain errors */ }
-                try { cap.Dispose(); } catch { }
+                catch (Exception ex)
+                {
+                    RetainFailedCleanup(cap, ex);
+                    StatusText.Text = "Capture cleanup failed — target hooks may still be active; stop will retry.";
+                    UpdateClearCallsState();
+                    return;
+                }
+                // StopAndDrain closes the session after the ring is quiescent.
             }
-            // If a poll IS in flight we leave cap for the poll continuation to
-            // dispose (it sees _capture != cap): closing its handle here would pull
-            // it out from under an in-progress ReadProcessMemory. The last in-flight
-            // batch isn't shown, but everything applied up to the previous poll is
-            // kept.
+            else if (cap != null)
+            {
+                // The poll continuation owns this handle until its ReadProcessMemory
+                // work yields. It will finish that batch, unhook, quiesce the ring,
+                // append the final tail, and refresh the stopped dataset.
+                _stoppingCapture = cap;
+                _stoppingCaptureWasDialog = wasDialogMode;
+                _discardStoppingTail = false;
+            }
 
             if (_callersFor != 0) RefreshCallersView(); // final, complete tree
 
@@ -5681,6 +5832,74 @@ namespace Cda.App
             }
 
             UpdateClearCallsState();
+        }
+
+        private void CompleteExplicitStop(
+            CaptureSession cap, List<CallRecord> tail, bool wasDialogMode)
+        {
+            if (!ReferenceEquals(_stoppingCapture, cap)) return;
+            _stoppingCapture = null;
+            if (_discardStoppingTail)
+            {
+                _discardStoppingTail = false;
+                UpdateClearCallsState();
+                return;
+            }
+            CallList.RefreshCompletedReturns();
+            ApplyCaptureCondition(tail);
+            AppendCapturedTimeOrdered(tail);
+            CallList.AddRecords(tail);
+            FunctionList.AddCounts(tail);
+            FoldCallers(tail);
+            if (wasDialogMode) CheckDialogCalls(tail, null);
+            if (_callersFor != 0) RefreshCallersView();
+
+            if (_captured.Count > 0 && _liveDataset != null)
+            {
+                var ds = new TraceDataset
+                {
+                    Modules = _liveDataset.Modules,
+                    Functions = _liveDataset.Functions,
+                    Records = new List<CallRecord>(_captured),
+                };
+                ds.Records.Sort((a, b) => a.Time.CompareTo(b.Time));
+                ds.TimeStart = ds.Records[0].Time;
+                ds.TimeEnd = ds.Records[^1].Time;
+                _model.Load(ds);
+                GraphView.SetModel(_model);
+                PlayBar.SetData(ds);
+                if (_selectedFunctionAddr != 0) GraphView.SetSelected(_selectedFunctionAddr);
+                StatusText.Text =
+                    $"Capture stopped · {ds.Records.Count} calls recorded — scrub the timeline to review.";
+            }
+            UpdateClearCallsState();
+        }
+
+        private void RetainFailedCleanup(CaptureSession capture, Exception error)
+        {
+            if (!_cleanupRetries.Contains(capture)) _cleanupRetries.Add(capture);
+            if (ReferenceEquals(_stoppingCapture, capture))
+            {
+                _stoppingCapture = null;
+                _discardStoppingTail = false;
+            }
+            Diag("capture cleanup failed; retained for retry: " + error.Message);
+        }
+
+        private void RetryFailedCaptureCleanup()
+        {
+            for (int i = _cleanupRetries.Count - 1; i >= 0; i--)
+            {
+                try
+                {
+                    _cleanupRetries[i].Dispose();
+                    _cleanupRetries.RemoveAt(i);
+                }
+                catch (Exception ex)
+                {
+                    Diag("capture cleanup retry failed: " + ex.Message);
+                }
+            }
         }
 
         // --- clear captured calls, keep capturing ---------------------------
@@ -5912,7 +6131,7 @@ namespace Cda.App
             }
         }
 
-        private void OnOpenTrace(object sender, RoutedEventArgs e)
+        private async void OnOpenTrace(object sender, RoutedEventArgs e)
         {
             var dlg = new Microsoft.Win32.OpenFileDialog
             {
@@ -5925,18 +6144,18 @@ namespace Cda.App
             try { ds = TraceArchive.Load(dlg.FileName); }
             catch (Exception ex) { StatusText.Text = $"Couldn't open trace: {ex.Message}"; return; }
 
-            ApplyLoadedTrace(ds, dlg.FileName);
+            await ApplyLoadedTrace(ds, dlg.FileName);
         }
 
         // Make a loaded trace the active (offline-review) dataset, driving every view
         // from it. Shared by Open trace and by Compare trace (when picking trace A from
         // a file). Caller has already loaded <paramref name="ds"/>.
-        private void ApplyLoadedTrace(TraceDataset ds, string fileName)
+        private async Task ApplyLoadedTrace(TraceDataset ds, string fileName)
         {
             ExitCompareMode(); // a freshly loaded trace invalidates any open comparison
 
             // Switching to an offline view: stop anything live and release the target.
-            StopCaptureQuietly();
+            if (!await StopCaptureQuietly()) return;
             StopDllCapture();
             StopApiLaunch();
             StopChildFollow();
@@ -5986,7 +6205,7 @@ namespace Cda.App
 
         // --- compare two traces ---------------------------------------------
 
-        private void OnCompareTrace(object sender, RoutedEventArgs e)
+        private async void OnCompareTrace(object sender, RoutedEventArgs e)
         {
             // Trace A is the current trace if there is one; otherwise let the user open a
             // saved trace as A, so two saved traces can be compared with no live session.
@@ -6005,7 +6224,8 @@ namespace Cda.App
                 try { loadedA = TraceArchive.Load(dlgA.FileName); }
                 catch (Exception ex) { StatusText.Text = $"Couldn't open trace A: {ex.Message}"; return; }
 
-                ApplyLoadedTrace(loadedA, dlgA.FileName); // make A the active offline trace
+                await ApplyLoadedTrace(loadedA, dlgA.FileName); // make A the active offline trace
+                if (!ReferenceEquals(_liveDataset, loadedA)) return;
                 a = CurrentTraceDataset();
                 if (a == null || a.Records.Count == 0)
                 {
@@ -6284,10 +6504,9 @@ namespace Cda.App
         private void StopDebugWatch()
         {
             var worker = _debugWatch;
-            _debugWatch = null;
             if (worker == null) return;
-            worker.Stop();
-            worker.WaitForExit(1000);
+            worker.Dispose();
+            if (ReferenceEquals(_debugWatch, worker)) _debugWatch = null;
         }
 
         protected override void OnClosed(EventArgs e)
@@ -6299,7 +6518,9 @@ namespace Cda.App
             StopHwbp();
             DisposeAttachPt(); // stop attach-mode Intel PT tracing (no-op if inactive)
             if (_pollTimer != null) { _pollTimer.Stop(); _pollTimer = null; }
-            try { _capture?.Dispose(); } catch { }
+            try { _capture?.Dispose(); }
+            catch (Exception ex) { RetainFailedCleanup(_capture!, ex); }
+            RetryFailedCaptureCleanup();
             _session?.Dispose();
             DisposeFileMap();
 

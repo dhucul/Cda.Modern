@@ -127,7 +127,8 @@ namespace Cda.Core.Engine
             IReadOnlyList<ulong>? callerChain,
             bool is64Bit,
             Func<ulong, byte[], int> readMemory,
-            int maxFrames = 8)
+            int maxFrames = 8,
+            Func<ulong, ulong>? resolveFunctionStart = null)
         {
             // Build the ordered list of return addresses: the immediate dialog
             // call site first (rec.Source), then each parent frame from the
@@ -145,7 +146,8 @@ namespace Cda.Core.Engine
 
             for (int fi = 0; fi < addrs.Count; fi++)
             {
-                BranchInfo? result = AnalyzeFrame(addrs[fi], fi, is64Bit, readMemory);
+                BranchInfo? result = AnalyzeFrame(
+                    addrs[fi], fi, is64Bit, readMemory, resolveFunctionStart);
                 if (result != null) return result;
             }
 
@@ -163,10 +165,12 @@ namespace Cda.Core.Engine
         /// </summary>
         private static BranchInfo? AnalyzeFrame(
             ulong ra, int frameIndex, bool is64Bit,
-            Func<ulong, byte[], int> readMemory)
+            Func<ulong, byte[], int> readMemory,
+            Func<ulong, ulong>? resolveFunctionStart)
         {
             int bitness = is64Bit ? 64 : 32;
-            var branches = DecodeFrameBranches(ra, bitness, readMemory, out ulong callSite);
+            var branches = DecodeFrameBranches(
+                ra, bitness, readMemory, resolveFunctionStart, out ulong callSite);
             if (branches == null || branches.Count == 0) return null;
 
             // (1) short-circuit ENTRY GATE — a branch that jumps FORWARD, past a later
@@ -219,8 +223,12 @@ namespace Cda.Core.Engine
             bool is64Bit,
             Func<ulong, byte[], int> readMemory,
             int maxCandidates = 4,
-            int maxFrames = 8)
+            int maxFrames = 8,
+            Func<ulong, ulong>? resolveFunctionStart = null)
         {
+            if (maxCandidates < 0) throw new ArgumentOutOfRangeException(nameof(maxCandidates));
+            if (maxFrames < 0) throw new ArgumentOutOfRangeException(nameof(maxFrames));
+            if (maxCandidates == 0) return Array.Empty<BranchInfo>();
             var addrs = new List<ulong> { returnAddress };
             if (callerChain != null)
             {
@@ -234,7 +242,8 @@ namespace Cda.Core.Engine
             int bitness = is64Bit ? 64 : 32;
             for (int fi = 0; fi < addrs.Count; fi++)
             {
-                var branches = DecodeFrameBranches(addrs[fi], bitness, readMemory, out ulong callSite);
+                var branches = DecodeFrameBranches(
+                    addrs[fi], bitness, readMemory, resolveFunctionStart, out ulong callSite);
                 if (branches == null || branches.Count == 0) continue;
 
                 // branches are in forward code order → the last entries are nearest the call.
@@ -254,87 +263,144 @@ namespace Cda.Core.Engine
         // null if the site/code can't be read. Shared by AnalyzeFrame and CollectCandidates
         // so both see exactly the same branch set.
         private static List<(Instruction Instr, int Offset)>? DecodeFrameBranches(
-            ulong ra, int bitness, Func<ulong, byte[], int> readMemory, out ulong callSite)
+            ulong ra, int bitness, Func<ulong, byte[], int> readMemory,
+            Func<ulong, ulong>? resolveFunctionStart, out ulong callSite)
         {
             callSite = 0;
-            if (ra < 10) return null;
+            if (ra == 0) return null;
 
-            // --- locate the call instruction whose NextIP == ra ---
-            int callLen;
-            callSite = ra - 5;
-            byte[] probe = new byte[5];
-            if (readMemory(callSite, probe) < 5) return null;
-            if (probe[0] != 0xE8)
+            // A return address proves that some call ended at `ra`, but not where
+            // that variable-length instruction began. Decode one instruction from
+            // every possible x86/x64 start in the preceding 15 bytes and accept
+            // only a single unambiguous call.
+            int searchLength = (int)Math.Min(15UL, ra);
+            ulong searchStart = ra - (ulong)searchLength;
+            byte[] search = new byte[searchLength];
+            int searchRead = readMemory(searchStart, search);
+            if (searchRead < searchLength) return null;
+            int callLen = 0;
+            int matches = 0;
+            for (int offset = 0; offset < searchLength; offset++)
             {
-                // Not an E8 call rel32. Search a 32-byte window for a call whose NextIP == ra.
-                const int searchLen = 32;
-                ulong searchStart = ra > (ulong)searchLen ? ra - (ulong)searchLen : 0;
-                byte[] searchBuf = new byte[searchLen + 15];
-                int searchRead = readMemory(searchStart, searchBuf);
-                if (searchRead <= 0) return null;
+                var searchReader = new ByteArrayCodeReader(search, offset, searchLength - offset);
+                var searchDecoder = Decoder.Create(
+                    bitness, searchReader, searchStart + (ulong)offset, DecoderOptions.None);
+                searchDecoder.Decode(out Instruction instruction);
+                if (instruction.Code == Code.INVALID ||
+                    (instruction.FlowControl != FlowControl.Call &&
+                     instruction.FlowControl != FlowControl.IndirectCall) ||
+                    instruction.NextIP != ra)
+                    continue;
 
-                var sreader = new ByteArrayCodeReader(searchBuf, 0, searchRead);
-                var sdecoder = Decoder.Create(bitness, sreader, searchStart, DecoderOptions.None);
-                bool found = false;
-                callLen = 5;
-                while (sreader.CanReadByte)
-                {
-                    sdecoder.Decode(out Instruction si);
-                    if (si.Code == Code.INVALID) break;
-                    // Match a direct `call rel32` AND an indirect IAT call (call [rip+x]/[reg]/reg),
-                    // which is how Windows-API calls routed through the IAT appear.
-                    if ((si.FlowControl == FlowControl.Call || si.FlowControl == FlowControl.IndirectCall)
-                        && si.NextIP == ra)
-                    {
-                        callSite = si.IP;
-                        callLen = si.Length;
-                        found = true;
-                        break;
-                    }
-                    if (si.IP >= ra) break;
-                }
-                if (!found) return null;
+                matches++;
+                callSite = instruction.IP;
+                callLen = instruction.Length;
             }
-            else
-            {
-                callLen = 5;
-            }
+            if (matches != 1) return null;
 
-            // --- read code backwards from callSite (up to MaxScan bytes) ---
-            int back = Math.Min(MaxScan, (int)Math.Min(callSite, (ulong)int.MaxValue));
-            if (back < 4) return null;
+            // Prefer a verified discovered-function entry. During a startup dialog,
+            // however, the call can arrive before the UI's read-only function index
+            // has attached. In that window the resolver is legitimately unavailable;
+            // use the branch-rooted fallback below rather than hiding the Branch cell.
+            ulong functionStart = resolveFunctionStart?.Invoke(callSite) ?? 0;
+            if (functionStart == 0 || functionStart >= callSite ||
+                callSite - functionStart > MaxScan)
+                return DecodeBranchesWithoutFunctionStart(
+                    callSite, callLen, bitness, readMemory);
 
-            ulong scanStart = callSite - (ulong)back;
+            int back = checked((int)(callSite - functionStart));
             byte[] code = new byte[back + callLen];
-            int read = readMemory(scanStart, code);
-            if (read <= 4) return null;
+            int read = readMemory(functionStart, code);
+            if (read <= 4)
+                return DecodeBranchesWithoutFunctionStart(
+                    callSite, callLen, bitness, readMemory);
 
             // --- decode forward, collect conditional branches ---
             var branches = new List<(Instruction Instr, int Offset)>();
             var reader = new ByteArrayCodeReader(code, 0, read);
-            var decoder = Decoder.Create(bitness, reader, scanStart, DecoderOptions.None);
+            var decoder = Decoder.Create(bitness, reader, functionStart, DecoderOptions.None);
+            bool aligned = true;
 
             while (reader.CanReadByte)
             {
                 if (decoder.IP >= callSite) break;
                 decoder.Decode(out Instruction instr);
-                if (instr.Code == Code.INVALID) break;
+                if (instr.Code == Code.INVALID) { aligned = false; break; }
                 if (instr.IP >= callSite) break;
 
                 if (IsConditionalBranch(instr))
                     branches.Add((instr, (int)(callSite - instr.IP)));
 
-                // A ret / int3 before the call ends a PRIOR block (or is misaligned garbage
-                // from the fixed-offset backward start): discard what we've gathered and keep
-                // scanning toward the call. An unconditional jmp is left intact — it can be
-                // the fall-through exit of a conditional chain that leads into the call.
-                if (IsFunctionBoundary(instr) && instr.IP < callSite - 1 &&
-                    instr.FlowControl != FlowControl.UnconditionalBranch)
+                if (IsFunctionBoundary(instr) && instr.IP < callSite - 1)
                 {
-                    branches.Clear();
+                    aligned = false;
+                    break;
                 }
             }
 
+            return aligned && decoder.IP == callSite
+                ? branches
+                : DecodeBranchesWithoutFunctionStart(
+                    callSite, callLen, bitness, readMemory);
+        }
+
+        // Metadata-free startup fallback. Do not decode from one arbitrary byte
+        // offset (which can manufacture instructions on x86/x64). Instead, treat
+        // every possible conditional-branch opcode as a candidate instruction root
+        // and retain it only if decoding forward from that exact root lands on the
+        // already-validated call site without crossing a return/int3 boundary.
+        private static List<(Instruction Instr, int Offset)>? DecodeBranchesWithoutFunctionStart(
+            ulong callSite, int callLen, int bitness,
+            Func<ulong, byte[], int> readMemory)
+        {
+            int back = Math.Min(MaxScan, (int)Math.Min(callSite, (ulong)int.MaxValue));
+            byte[]? code = null;
+            ulong scanStart = 0;
+
+            // A large request can straddle an unreadable page or precede the mapped
+            // image. Shrink until the live reader can supply a complete window.
+            while (back >= 16)
+            {
+                scanStart = callSite - (ulong)back;
+                var candidate = new byte[back + callLen];
+                if (readMemory(scanStart, candidate) == candidate.Length)
+                {
+                    code = candidate;
+                    break;
+                }
+                back /= 2;
+            }
+            if (code == null) return null;
+
+            var branches = new List<(Instruction Instr, int Offset)>();
+            for (int offset = 0; offset < back; offset++)
+            {
+                var reader = new ByteArrayCodeReader(code, offset, code.Length - offset);
+                var decoder = Decoder.Create(
+                    bitness, reader, scanStart + (ulong)offset, DecoderOptions.None);
+                decoder.Decode(out Instruction branch);
+                if (branch.Code == Code.INVALID || !IsConditionalBranch(branch))
+                    continue;
+
+                bool validPath = true;
+                while (decoder.IP < callSite)
+                {
+                    decoder.Decode(out Instruction instruction);
+                    if (instruction.Code == Code.INVALID ||
+                        instruction.IP >= callSite ||
+                        (IsFunctionBoundary(instruction) &&
+                         instruction.FlowControl != FlowControl.UnconditionalBranch))
+                    {
+                        validPath = false;
+                        break;
+                    }
+                }
+                if (!validPath || decoder.IP != callSite) continue;
+
+                branches.Add((branch, checked((int)(callSite - branch.IP))));
+            }
+
+            branches.Sort(static (a, b) => a.Instr.IP.CompareTo(b.Instr.IP));
             return branches;
         }
 

@@ -114,6 +114,7 @@ namespace Cda.Core.Engine
         private bool _attached;
         private bool _loaderBpSeen;   // the initial loader breakpoint has been consumed
         private bool _dialogHostSeen; // (Dialogs mode) a dialog-host LOAD_DLL (user32/comctl32/comdlg32/credui) has arrived post-loader-BP
+        private CaptureSession? _unclaimedSession;
 
         // (Dialogs mode) the live session, once the first dialog host is armed, and the
         // set of dialog entries already hooked — so a later host is hooked additively
@@ -136,6 +137,7 @@ namespace Cda.Core.Engine
         private readonly Queue<(ulong Key, DialogBranchConfirmer.Candidate[] Candidates)> _drPending = new(); // PT-missed, awaiting a DR probe (loop thread only)
         private ulong[] _armedProbeAddrs = Array.Empty<ulong>(); // DR0..DR(n-1) contents (loop thread only)
         private ulong _armedProbeMask;                           // DR6 bits we own
+        private readonly Dictionary<uint, DebugRegisterState> _priorProbeState = new();
         private ulong _armedCallSiteKey;                         // the call site currently probed
         private bool _targetIsWow64;                             // set once at first attach
         private IntelPt? _pt;                                    // Intel PT, if available (first-occurrence path)
@@ -219,7 +221,8 @@ namespace Cda.Core.Engine
         public void Dispose()
         {
             Stop();
-            WaitForExit(1000);
+            WaitForExit(Timeout.Infinite);
+            DisposeUnclaimedSession();
         }
 
         private void Run()
@@ -317,7 +320,9 @@ namespace Cda.Core.Engine
                     switch (code)
                     {
                         case NativeMethods.CREATE_PROCESS_DEBUG_EVENT:
-                            CloseEventFile(Marshal.ReadIntPtr(evt, U)); // CREATE_PROCESS_DEBUG_INFO.hFile
+                            // The debugger closes hFile only. Windows closes the event's
+                            // hProcess/hThread handles when their EXIT events are continued.
+                            CloseEventHandle(Marshal.ReadIntPtr(evt, U));
                             break;
 
                         case NativeMethods.CREATE_THREAD_DEBUG_EVENT:
@@ -326,6 +331,10 @@ namespace Cda.Core.Engine
                             // field; the thread is frozen for this event (no suspend needed).
                             if (_armedProbeAddrs.Length > 0)
                                 ArmProbeThread(Marshal.ReadIntPtr(evt, U), evtTid);
+                            break;
+
+                        case NativeMethods.EXIT_THREAD_DEBUG_EVENT:
+                            _priorProbeState.Remove(evtTid);
                             break;
 
                         case NativeMethods.LOAD_DLL_DEBUG_EVENT:
@@ -357,7 +366,7 @@ namespace Cda.Core.Engine
                                 }
                                 catch (Exception ex) { Log?.Invoke("dialog hook-on-load failed: " + ex.Message); }
                             }
-                            CloseEventFile(hFile);
+                            CloseEventHandle(hFile);
                             break;
                         }
 
@@ -457,7 +466,7 @@ namespace Cda.Core.Engine
                 Log?.Invoke("API launch loop error: " + ex.Message);
                 // Clear any armed debug registers so the target doesn't fault on the next
                 // candidate execution after we're gone (they survive a lost debugger).
-                try { if (_armedProbeAddrs.Length > 0) DisarmProbeAllThreads(); } catch { }
+                try { if (_priorProbeState.Count > 0) DisarmProbeAllThreads(); } catch { }
                 try { _pt?.Dispose(); _pt = null; } catch { }
             }
             finally
@@ -467,7 +476,9 @@ namespace Cda.Core.Engine
                     try { NativeMethods.ContinueDebugEvent(pendingPid, pendingTid, pendingStatus); } catch { }
                 }
                 Detach();
-                Marshal.FreeHGlobal(evt);
+                try { DisposeUnclaimedSession(); }
+                catch (Exception ex) { Log?.Invoke("unclaimed API session cleanup failed: " + ex.Message); }
+                finally { Marshal.FreeHGlobal(evt); }
             }
         }
 
@@ -481,7 +492,7 @@ namespace Cda.Core.Engine
             // The debug registers we set are part of each thread's context and are NOT
             // cleared by detaching — leave them armed and the next candidate hit raises an
             // unhandled #DB in the target. Clear them on every thread first.
-            try { if (_armedProbeAddrs.Length > 0) DisarmProbeAllThreads(); } catch { /* best effort */ }
+            try { if (_priorProbeState.Count > 0) DisarmProbeAllThreads(); } catch { /* best effort */ }
             try { _pt?.Dispose(); _pt = null; } catch { /* best effort — stops PT tracing */ }
             try
             {
@@ -722,8 +733,7 @@ namespace Cda.Core.Engine
 
                 ctx.Dr6 = 0;                              // acknowledge
                 ctx.EFlags |= ThreadContext.ResumeFlag;   // step over the instruction once
-                ctx.Apply(h);
-                return true;
+                return ctx.Apply(h);
             }
             finally { NativeMethods.CloseHandle(h); }
         }
@@ -732,15 +742,28 @@ namespace Cda.Core.Engine
         // (between debug events), so each thread is briefly suspended for the context swap.
         private void ArmProbeAllThreads()
         {
-            ForEachThread(h =>
+            ForEachThread((h, tid) =>
             {
-                NativeMethods.SuspendThread(h);
+                uint suspendCount = NativeMethods.SuspendThread(h);
+                if (suspendCount == uint.MaxValue) return false;
                 try
                 {
                     using var ctx = ThreadContext.Capture(h, _targetIsWow64);
                     if (ctx == null) return false;
+                    bool added = false;
+                    if (_priorProbeState.TryGetValue(tid, out DebugRegisterState prior))
+                        ctx.RestoreDebugRegisters(prior);
+                    else
+                    {
+                        prior = ctx.CaptureDebugRegisters();
+                        if (prior.HasEnabledBreakpoints) return false;
+                        _priorProbeState[tid] = prior;
+                        added = true;
+                    }
                     ctx.SetBreakpoints(_armedProbeAddrs);
-                    return ctx.Apply(h);
+                    bool applied = ctx.Apply(h);
+                    if (!applied && added) _priorProbeState.Remove(tid);
+                    return applied;
                 }
                 finally { NativeMethods.ResumeThread(h); }
             });
@@ -748,15 +771,19 @@ namespace Cda.Core.Engine
 
         private void DisarmProbeAllThreads()
         {
-            ForEachThread(h =>
+            ForEachThread((h, tid) =>
             {
-                NativeMethods.SuspendThread(h);
+                if (!_priorProbeState.TryGetValue(tid, out DebugRegisterState prior)) return false;
+                uint suspendCount = NativeMethods.SuspendThread(h);
+                if (suspendCount == uint.MaxValue) return false;
                 try
                 {
                     using var ctx = ThreadContext.Capture(h, _targetIsWow64);
                     if (ctx == null) return false;
-                    ctx.ClearBreakpoints();
-                    return ctx.Apply(h);
+                    ctx.RestoreDebugRegisters(prior);
+                    bool applied = ctx.Apply(h);
+                    if (applied) _priorProbeState.Remove(tid);
+                    return applied;
                 }
                 finally { NativeMethods.ResumeThread(h); }
             });
@@ -769,7 +796,7 @@ namespace Cda.Core.Engine
             if (hThread != IntPtr.Zero && hThread != NativeMethods.INVALID_HANDLE_VALUE)
             {
                 using var ctx = ThreadContext.Capture(hThread, _targetIsWow64);
-                if (ctx != null) { ctx.SetBreakpoints(_armedProbeAddrs); ctx.Apply(hThread); }
+                if (ctx != null) ArmCapturedProbeThread(ctx, hThread, tid);
                 return;
             }
             IntPtr h = NativeMethods.OpenThread(THREAD_ACCESS, false, tid);
@@ -777,13 +804,23 @@ namespace Cda.Core.Engine
             try
             {
                 using var ctx = ThreadContext.Capture(h, _targetIsWow64);
-                if (ctx != null) { ctx.SetBreakpoints(_armedProbeAddrs); ctx.Apply(h); }
+                if (ctx != null) ArmCapturedProbeThread(ctx, h, tid);
             }
             finally { NativeMethods.CloseHandle(h); }
         }
 
+        private bool ArmCapturedProbeThread(IThreadContext ctx, IntPtr hThread, uint tid)
+        {
+            DebugRegisterState prior = ctx.CaptureDebugRegisters();
+            if (prior.HasEnabledBreakpoints) return false;
+            ctx.SetBreakpoints(_armedProbeAddrs);
+            if (!ctx.Apply(hThread)) return false;
+            _priorProbeState[tid] = prior;
+            return true;
+        }
+
         // Enumerate the target's threads and run an action on a handle to each.
-        private int ForEachThread(Func<IntPtr, bool> action)
+        private int ForEachThread(Func<IntPtr, uint, bool> action)
         {
             IntPtr snap = NativeMethods.CreateToolhelp32Snapshot(NativeMethods.TH32CS_SNAPTHREAD, 0);
             if (snap == NativeMethods.INVALID_HANDLE_VALUE) return 0;
@@ -797,7 +834,7 @@ namespace Cda.Core.Engine
                     if (te.th32OwnerProcessID != (uint)_pid) continue;
                     IntPtr h = NativeMethods.OpenThread(THREAD_ACCESS, false, te.th32ThreadID);
                     if (h == IntPtr.Zero) continue;
-                    try { if (action(h)) count++; }
+                    try { if (action(h, te.th32ThreadID)) count++; }
                     catch { /* one bad thread shouldn't abort the sweep */ }
                     finally { NativeMethods.CloseHandle(h); }
                 }
@@ -807,7 +844,7 @@ namespace Cda.Core.Engine
             return count;
         }
 
-        private static void CloseEventFile(IntPtr h)
+        private static void CloseEventHandle(IntPtr h)
         {
             if (h != IntPtr.Zero && h != NativeMethods.INVALID_HANDLE_VALUE)
                 NativeMethods.CloseHandle(h);
@@ -871,27 +908,45 @@ namespace Cda.Core.Engine
                     Log?.Invoke($"found {fresh.Count} dialog API(s) but none could be hooked ({firstError ?? "?"}); will retry.");
                     return;
                 }
-                _dialogSession = session;
                 var hooked = new HashSet<ulong>(session.HookedTargets);
                 var installed = fresh.FindAll(f => hooked.Contains(f.Address));
-                foreach (var f in installed) _dialogHookedAddrs.Add(f.Address);
-                foreach (var m in dlg.Modules)
-                    if (!_dialogModules.Exists(x => x.BaseAddress == m.BaseAddress)) _dialogModules.Add(m);
 
                 var ds = new TraceDataset { TimeStart = 0, TimeEnd = 1 };
-                ds.Modules.AddRange(_dialogModules);
+                ds.Modules.AddRange(dlg.Modules);
                 ds.Functions.AddRange(installed);
                 ds.PruneUnreferencedModules();
 
-                _hooked = true;
-                Log?.Invoke($"dialog capture: hooked {instrumented} dialog function(s) — a dialog from here on " +
-                            "is attributed to the app function that raised it.");
-                Hooked?.Invoke(new HookedApis
+                var payload = new HookedApis
                 {
                     Pid = _pid, Is64Bit = is64, Mode = _mode, Session = session, Dataset = ds,
                     ModuleMap = map, Instrumented = instrumented, Skipped = skipped, FirstError = firstError,
                     DistinctApis = installed.Count, ApiModules = ds.Modules.Count,
-                });
+                };
+                Action<HookedApis>? receiver = Hooked;
+                _unclaimedSession = session;
+                if (receiver == null)
+                {
+                    DisposeUnclaimedSession();
+                    throw new InvalidOperationException("No owner accepted the active dialog capture session.");
+                }
+                try
+                {
+                    receiver(payload);
+                    _unclaimedSession = null;
+                }
+                catch
+                {
+                    DisposeUnclaimedSession();
+                    throw;
+                }
+
+                _dialogSession = session;
+                foreach (var f in installed) _dialogHookedAddrs.Add(f.Address);
+                foreach (var m in dlg.Modules)
+                    if (!_dialogModules.Exists(x => x.BaseAddress == m.BaseAddress)) _dialogModules.Add(m);
+                _hooked = true;
+                Log?.Invoke($"dialog capture: hooked {instrumented} dialog function(s) — a dialog from here on " +
+                            "is attributed to the app function that raised it.");
             }
             else
             {
@@ -1075,8 +1130,32 @@ namespace Cda.Core.Engine
             result.FirstError = firstError;
 
             Log?.Invoke(DescribeDiscovery(result, instrumented, skipped, firstError));
-            Hooked?.Invoke(result);
+            Action<HookedApis>? receiver = Hooked;
+            _unclaimedSession = session;
+            if (receiver == null)
+            {
+                DisposeUnclaimedSession();
+                throw new InvalidOperationException("No owner accepted the active API capture session.");
+            }
+            try
+            {
+                receiver(result);
+                _unclaimedSession = null;
+            }
+            catch
+            {
+                DisposeUnclaimedSession();
+                throw;
+            }
             return true;
+        }
+
+        private void DisposeUnclaimedSession()
+        {
+            CaptureSession? session = _unclaimedSession;
+            if (session == null) return;
+            session.Dispose();
+            if (ReferenceEquals(_unclaimedSession, session)) _unclaimedSession = null;
         }
 
         private static string DescribeDiscovery(HookedApis r, int instrumented, int skipped, string? firstError)

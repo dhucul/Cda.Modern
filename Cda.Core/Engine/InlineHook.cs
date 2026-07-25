@@ -222,13 +222,13 @@ namespace Cda.Core.Engine
             {
                 _mem.Write(Target, _original);
                 _mem.Flush(Target, PatchLength);
-                _activated = false;
-                _removed = true;
             }
             finally
             {
                 _mem.Protect(Target, PatchLength, old);
             }
+            _activated = false;
+            _removed = true;
         }
 
         /// <summary>

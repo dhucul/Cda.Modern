@@ -143,7 +143,7 @@ namespace Cda.Core.Engine
         public void Dispose()
         {
             Stop();
-            WaitForExit(1000);
+            WaitForExit(Timeout.Infinite);
         }
 
         private void Run()
@@ -209,13 +209,14 @@ namespace Cda.Core.Engine
                     {
                         case NativeMethods.CREATE_PROCESS_DEBUG_EVENT:
                         {
-                            // CREATE_PROCESS_DEBUG_INFO: hFile @U, hProcess @U+ptr,
-                            // hThread @U+2*ptr, lpBaseOfImage @U+3*ptr.
+                            // CREATE_PROCESS_DEBUG_INFO: hFile @U and
+                            // lpBaseOfImage @U+3*ptr. Windows owns the lifetime of
+                            // the hProcess/hThread debug handles.
                             IntPtr hFile = Marshal.ReadIntPtr(evt, U);
                             ulong imageBase = NativeMethods.ToUInt64(
                                 Marshal.ReadIntPtr(evt, U + 3 * IntPtr.Size));
                             string path = Clean(ResolvePath(hFile));
-                            CloseEventFile(hFile);
+                            CloseEventHandle(hFile);
 
                             bool isRoot = (int)evtPid == _rootPid;
                             _live.Add((int)evtPid);
@@ -236,7 +237,7 @@ namespace Cda.Core.Engine
                         }
 
                         case NativeMethods.LOAD_DLL_DEBUG_EVENT:
-                            CloseEventFile(Marshal.ReadIntPtr(evt, U)); // release the image file handle
+                            CloseEventHandle(Marshal.ReadIntPtr(evt, U)); // release the image file handle
                             break;
 
                         case NativeMethods.EXCEPTION_DEBUG_EVENT:
@@ -511,7 +512,7 @@ namespace Cda.Core.Engine
         private bool IsSystemImage(string path)
         {
             if (_winDir.Length == 0 || string.IsNullOrEmpty(path)) return false;
-            return path.StartsWith(_winDir, StringComparison.OrdinalIgnoreCase);
+            return PathClassifier.IsUnderDirectory(path, _winDir);
         }
 
         private string SummaryString()
@@ -525,7 +526,7 @@ namespace Cda.Core.Engine
             return sb.Length == 0 ? "(no calls yet)" : sb.ToString();
         }
 
-        private static void CloseEventFile(IntPtr h)
+        private static void CloseEventHandle(IntPtr h)
         {
             if (h != IntPtr.Zero && h != NativeMethods.INVALID_HANDLE_VALUE)
                 NativeMethods.CloseHandle(h);

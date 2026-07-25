@@ -53,28 +53,36 @@ namespace Cda.Core.Engine
                 rest.Sort((a, b) => b.Size.CompareTo(a.Size));
                 candidates.AddRange(rest);
 
-                if (extraModuleNames != null)
-                {
-                    var wanted = new HashSet<string>(extraModuleNames, StringComparer.OrdinalIgnoreCase);
-                    // Float explicitly-requested modules to the front.
-                    candidates.Sort((a, b) =>
-                        (wanted.Contains(b.Name) ? 1 : 0) - (wanted.Contains(a.Name) ? 1 : 0));
-                }
+                var wanted = new HashSet<string>(
+                    extraModuleNames ?? Array.Empty<string>(),
+                    StringComparer.OrdinalIgnoreCase);
 
                 var functions = new List<TracedFunction>();
                 var edges = new List<(ulong Site, ulong Target)>();
                 var scanned = new List<ModuleInfo>();
 
                 const int maxModulesToScan = 8;
-                int tried = 0;
+                int fallbackTried = 0;
                 foreach (var m in candidates)
                 {
-                    if (tried >= maxModulesToScan) break;
-                    tried++;
+                    bool primary = allModules.Count > 0 &&
+                                   m.BaseAddress == allModules[0].BaseAddress;
+                    bool explicitlyRequested = wanted.Contains(m.Name);
+                    bool required = primary || explicitlyRequested;
+
+                    // Requested modules are outside the fallback budget and are
+                    // always scanned. Once any required/fallback module yields a
+                    // graph, unrelated fallback modules no longer add noise.
+                    if (!required)
+                    {
+                        if (functions.Count > 0 || fallbackTried >= maxModulesToScan)
+                            continue;
+                        fallbackTried++;
+                    }
+
                     int before = functions.Count;
                     CallSiteScanner.ScanModule(proc, m, arch, functions, edges);
                     if (functions.Count > before) scanned.Add(m);
-                    if (functions.Count > 0) break; // got a graph; keep it focused
                 }
 
                 var fallbackModules = allModules.Count > 0

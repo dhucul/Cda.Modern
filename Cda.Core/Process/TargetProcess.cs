@@ -94,8 +94,16 @@ namespace Cda.Core.Process
                     "Elevation may be required.");
 
             var tp = new TargetProcess(pid, h);
-            tp.DetectBitness();
-            return tp;
+            try
+            {
+                tp.DetectBitness();
+                return tp;
+            }
+            catch
+            {
+                tp.Dispose();
+                throw;
+            }
         }
 
         private void DetectBitness()
@@ -124,9 +132,10 @@ namespace Cda.Core.Process
         {
             if (_handle == IntPtr.Zero || buffer.Length == 0) return 0;
             byte[] tmp = new byte[buffer.Length];
-            bool ok = NativeMethods.ReadProcessMemory(
+            NativeMethods.ReadProcessMemory(
                 _handle, NativeMethods.ToIntPtr(address), tmp, (IntPtr)tmp.Length, out IntPtr read);
-            int n = ok ? (int)read : 0;
+            long got = read.ToInt64();
+            int n = got > 0 ? (int)Math.Min(got, buffer.Length) : 0;
             if (n > 0) tmp.AsSpan(0, n).CopyTo(buffer);
             return n;
         }

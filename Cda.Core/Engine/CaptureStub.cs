@@ -171,21 +171,50 @@ namespace Cda.Core.Engine
             a.mov(__dword_ptr[edi + OffArgCount], argCount);
             a.mov(__dword_ptr[edi + OffCorrelation], ecx);
 
-            // stack args: arg_i at [esp + 40 + i*4]; stored as u64 (hi = 0)
+            // NT_TIB.StackBase bounds every read above the entry SP. A hook can run
+            // with ESP close to the top of the final committed stack page, and an
+            // unconditional fixed-depth read there would fault inside the target.
+            a.mov(ebp, __dword_ptr.fs[4]);
+
+            // stack args: arg_i at [esp + 40 + i*4]; stored as u64 (hi = 0).
+            // A function may have fewer arguments than our generic capture width,
+            // so zero-fill an argument whose word would reach StackBase.
             for (int i = 0; i < argCount; i++)
             {
+                var unavailable = a.CreateLabel();
+                var stored = a.CreateLabel();
+                a.lea(esi, __[esp + 40 + i * 4]);
+                a.cmp(esi, ebp);
+                a.jae(unavailable);
                 a.mov(eax, __dword_ptr[esp + 40 + i * 4]);
+                a.jmp(stored);
+                a.Label(ref unavailable);
+                a.xor(eax, eax);
+                a.Label(ref stored);
                 a.mov(__dword_ptr[edi + OffArgs + i * 8], eax);
                 a.mov(__dword_ptr[edi + OffArgs + i * 8 + 4], 0);
             }
 
-            // stack snapshot: copy StackSlots words from the entry stack upward.
+            // Stack snapshot: copy only the words that fit below StackBase.
             // esi/edx/eax/ecx are all preserved by pushad; edi (the record base)
             // is kept for the derefCount write and the redirect after the loop.
-            a.mov(__dword_ptr[edi + stackCountOff], StackSlots);
             a.lea(esi, __[esp + 36]);              // source = entry esp
+            a.cmp(ebp, esi);
+            var noStack = a.CreateLabel();
+            var countReady = a.CreateLabel();
+            var copyDone = a.CreateLabel();
+            a.jbe(noStack);
+            a.sub(ebp, esi);
+            a.shr(ebp, 2);
+            a.cmp(ebp, StackSlots);
+            a.jbe(countReady);
+            a.mov(ebp, StackSlots);
+            a.Label(ref countReady);
+            a.mov(__dword_ptr[edi + stackCountOff], ebp);
             a.lea(edx, __[edi + snapshotOff]);     // dest = snapshot region
-            a.mov(ecx, StackSlots);
+            a.mov(ecx, ebp);
+            a.test(ecx, ecx);
+            a.jz(copyDone);
             var copy = a.CreateLabel();
             a.Label(ref copy);
             a.mov(eax, __dword_ptr[esi]);
@@ -195,6 +224,10 @@ namespace Cda.Core.Engine
             a.add(edx, 8);
             a.dec(ecx);
             a.jnz(copy);
+            a.jmp(copyDone);
+            a.Label(ref noStack);
+            a.mov(__dword_ptr[edi + stackCountOff], 0);
+            a.Label(ref copyDone);
 
             // derefCount = 0 (no in-target pointer-following in this version)
             a.mov(__dword_ptr[edi + derefCountOff], 0);
@@ -310,6 +343,10 @@ namespace Cda.Core.Engine
             a.mov(__dword_ptr[rdi + OffArgCount], argCount); // kind = call (high bit clear)
             a.mov(__dword_ptr[rdi + OffCorrelation], ecx);   // correlation id
 
+            // NT_TIB.StackBase is at gs:[8] in a native x64 thread. It bounds
+            // both optional stack arguments and the snapshot copy below.
+            a.mov(r11, __qword_ptr.gs[8]);
+
             // First four args from the saved register slots, then stack args.
             int[] regSlots = { 40, 32, 24, 16 }; // saved rcx, rdx, r8, r9
             for (int i = 0; i < argCount; i++)
@@ -317,17 +354,41 @@ namespace Cda.Core.Engine
                 if (i < 4)
                     a.mov(rax, __qword_ptr[rsp + regSlots[i]]);
                 else
+                {
+                    var unavailable = a.CreateLabel();
+                    var stored = a.CreateLabel();
+                    a.lea(rbx, __[rsp + 104 + (i - 4) * 8]);
+                    a.cmp(rbx, r11);
+                    a.jae(unavailable);
                     a.mov(rax, __qword_ptr[rsp + 104 + (i - 4) * 8]);
+                    a.jmp(stored);
+                    a.Label(ref unavailable);
+                    a.xor(eax, eax);
+                    a.Label(ref stored);
+                }
                 a.mov(__qword_ptr[rdi + OffArgs + i * 8], rax);
             }
 
-            // stack snapshot: copy StackSlots words from the entry stack upward.
+            // Stack snapshot: copy only the words below StackBase.
             // rbx/rdx/rcx/rax are all saved and restored by the pops below; rdi
             // (the record base) is kept for the derefCount write and the redirect.
-            a.mov(__dword_ptr[rdi + stackCountOff], StackSlots);
             a.lea(rbx, __[rsp + 64]);                 // source = entry rsp
+            a.cmp(r11, rbx);
+            var noStack = a.CreateLabel();
+            var countReady = a.CreateLabel();
+            var copyDone = a.CreateLabel();
+            a.jbe(noStack);
+            a.sub(r11, rbx);
+            a.shr(r11, 3);
+            a.cmp(r11, StackSlots);
+            a.jbe(countReady);
+            a.mov(r11, StackSlots);
+            a.Label(ref countReady);
+            a.mov(__dword_ptr[rdi + stackCountOff], r11d);
             a.lea(rdx, __[rdi + snapshotOff]);        // dest = snapshot region
-            a.mov(ecx, StackSlots);
+            a.mov(ecx, r11d);
+            a.test(ecx, ecx);
+            a.jz(copyDone);
             var copy = a.CreateLabel();
             a.Label(ref copy);
             a.mov(rax, __qword_ptr[rbx]);
@@ -336,6 +397,10 @@ namespace Cda.Core.Engine
             a.add(rdx, 8);
             a.dec(ecx);
             a.jnz(copy);
+            a.jmp(copyDone);
+            a.Label(ref noStack);
+            a.mov(__dword_ptr[rdi + stackCountOff], 0);
+            a.Label(ref copyDone);
 
             a.mov(__dword_ptr[rdi + derefCountOff], 0); // derefCount = 0
 

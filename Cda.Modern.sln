@@ -9,6 +9,8 @@ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Cda.Core", "Cda.Core\Cda.Co
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Cda.Managed", "Cda.Managed\Cda.Managed.csproj", "{CA697873-853D-414A-913A-26F28BC516C2}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Cda.Core.Tests", "Cda.Core.Tests\Cda.Core.Tests.csproj", "{7B59A6DD-47F2-4A19-9D60-A1786D612E58}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -27,6 +29,10 @@ Global
 		{CA697873-853D-414A-913A-26F28BC516C2}.Debug|x64.Build.0 = Debug|x64
 		{CA697873-853D-414A-913A-26F28BC516C2}.Release|x64.ActiveCfg = Release|x64
 		{CA697873-853D-414A-913A-26F28BC516C2}.Release|x64.Build.0 = Release|x64
+		{7B59A6DD-47F2-4A19-9D60-A1786D612E58}.Debug|x64.ActiveCfg = Debug|x64
+		{7B59A6DD-47F2-4A19-9D60-A1786D612E58}.Debug|x64.Build.0 = Debug|x64
+		{7B59A6DD-47F2-4A19-9D60-A1786D612E58}.Release|x64.ActiveCfg = Release|x64
+		{7B59A6DD-47F2-4A19-9D60-A1786D612E58}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

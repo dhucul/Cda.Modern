@@ -99,7 +99,7 @@ namespace Cda.Core.Engine
             Marshal.WriteInt32(_ctx, OFF_Dr2, addrs.Length > 2 ? unchecked((int)(uint)addrs[2]) : 0);
             Marshal.WriteInt32(_ctx, OFF_Dr3, addrs.Length > 3 ? unchecked((int)(uint)addrs[3]) : 0);
 
-            uint dr7 = 0;
+            uint dr7 = (uint)Marshal.ReadInt32(_ctx, OFF_Dr7) & 0x0000FF00U;
             int n = Math.Min(addrs.Length, 4);
             for (int i = 0; i < n; i++)
                 dr7 |= (1U << (i * 2)) | (1U << (i * 2 + 1)); // Ln + Gn; R/W=00 (exec), LEN=00 (1 byte)
@@ -107,14 +107,22 @@ namespace Cda.Core.Engine
             Marshal.WriteInt32(_ctx, OFF_Dr6, 0);
         }
 
-        public void ClearBreakpoints()
+        public DebugRegisterState CaptureDebugRegisters() => new(
+            (uint)Marshal.ReadInt32(_ctx, OFF_Dr0),
+            (uint)Marshal.ReadInt32(_ctx, OFF_Dr1),
+            (uint)Marshal.ReadInt32(_ctx, OFF_Dr2),
+            (uint)Marshal.ReadInt32(_ctx, OFF_Dr3),
+            (uint)Marshal.ReadInt32(_ctx, OFF_Dr6),
+            (uint)Marshal.ReadInt32(_ctx, OFF_Dr7));
+
+        public void RestoreDebugRegisters(DebugRegisterState state)
         {
-            Marshal.WriteInt32(_ctx, OFF_Dr0, 0);
-            Marshal.WriteInt32(_ctx, OFF_Dr1, 0);
-            Marshal.WriteInt32(_ctx, OFF_Dr2, 0);
-            Marshal.WriteInt32(_ctx, OFF_Dr3, 0);
-            Marshal.WriteInt32(_ctx, OFF_Dr7, 0);
-            Marshal.WriteInt32(_ctx, OFF_Dr6, 0);
+            Marshal.WriteInt32(_ctx, OFF_Dr0, unchecked((int)(uint)state.Dr0));
+            Marshal.WriteInt32(_ctx, OFF_Dr1, unchecked((int)(uint)state.Dr1));
+            Marshal.WriteInt32(_ctx, OFF_Dr2, unchecked((int)(uint)state.Dr2));
+            Marshal.WriteInt32(_ctx, OFF_Dr3, unchecked((int)(uint)state.Dr3));
+            Marshal.WriteInt32(_ctx, OFF_Dr6, unchecked((int)(uint)state.Dr6));
+            Marshal.WriteInt32(_ctx, OFF_Dr7, unchecked((int)(uint)state.Dr7));
         }
 
         public void Dispose()

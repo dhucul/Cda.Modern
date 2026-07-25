@@ -2,6 +2,12 @@ using System;
 
 namespace Cda.Core.Engine
 {
+    internal readonly record struct DebugRegisterState(
+        ulong Dr0, ulong Dr1, ulong Dr2, ulong Dr3, ulong Dr6, ulong Dr7)
+    {
+        public bool HasEnabledBreakpoints => (Dr7 & 0xFF) != 0;
+    }
+
     /// <summary>
     /// The slice of a thread's CPU context a hardware branch probe needs, independent of
     /// target bitness: read EFLAGS (to evaluate a Jcc's real taken/not-taken) and the
@@ -31,7 +37,8 @@ namespace Cda.Core.Engine
         ulong StackPointer { get; }
 
         void SetBreakpoints(ulong[] addrs);
-        void ClearBreakpoints();
+        DebugRegisterState CaptureDebugRegisters();
+        void RestoreDebugRegisters(DebugRegisterState state);
         bool Apply(IntPtr hThread);
     }
 

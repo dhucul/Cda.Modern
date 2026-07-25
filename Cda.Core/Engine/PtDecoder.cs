@@ -45,8 +45,12 @@ namespace Cda.Core.Engine
             bool is64, Func<ulong, byte[], int> readCode, Action<string>? diag = null,
             bool keyByCallSite = false)
         {
-            if (trace == null || trace.Length < 8 || candidates.Count == 0 || dialogApiAddr == 0 || readCode == null)
-            { diag?.Invoke($"reject: trace={(trace?.Length ?? 0)}B cand={candidates.Count} api=0x{dialogApiAddr:X}"); return null; }
+            if (trace == null || trace.Length < 8 || candidates == null || candidates.Count == 0 ||
+                dialogApiAddr == 0 || readCode == null)
+            {
+                diag?.Invoke($"reject: trace={(trace?.Length ?? 0)}B cand={(candidates?.Count ?? 0)} api=0x{dialogApiAddr:X}");
+                return null;
+            }
 
             var candAddrs = new HashSet<ulong>();
             ulong lo = ulong.MaxValue, hi = 0;
@@ -57,7 +61,7 @@ namespace Cda.Core.Engine
             // anchor is never a system TIP.
             const ulong Win = 0x10000000;
             ulong appLo = lo > Win ? lo - Win : 0;
-            ulong appHi = hi + Win;
+            ulong appHi = hi > ulong.MaxValue - Win ? ulong.MaxValue : hi + Win;
             int bitness = is64 ? 64 : 32;
             diag?.Invoke($"api=0x{dialogApiAddr:X} cand=[{string.Join(",", CandHex(candidates))}] app=[0x{appLo:X}..0x{appHi:X}] trace={trace.Length}B");
 
@@ -390,7 +394,10 @@ namespace Cda.Core.Engine
 
         private static Pk NextPacket(byte[] b, int pos, ref ulong lastIp, out int len, out ulong ip, out ulong tnt, out int tc)
         {
-            ip = 0; tnt = 0; tc = 0; byte c = b[pos];
+            ip = 0; tnt = 0; tc = 0;
+            bool Has(int count) => count >= 0 && pos >= 0 && pos <= b.Length - count;
+            if (!Has(1)) { len = 0; return Pk.Unknown; }
+            byte c = b[pos];
             if (c == 0x00) { len = 1; return Pk.Pad; }
             if (c == 0x02 && pos + 4 <= b.Length && b[pos + 1] == 0x82 && b[pos + 2] == 0x02 && b[pos + 3] == 0x82) { len = 16; return Pk.Psb; }
             if (c == 0x02)
@@ -402,7 +409,11 @@ namespace Cda.Core.Engine
                     case 0x03: len = 4; return Pk.Cbr;
                     case 0x43: len = 8; return Pk.Pip;
                     case 0x73: len = 7; return Pk.Tma;
-                    case 0xA3: len = 8; { ulong pl = 0; for (int k = 0; k < 6; k++) pl |= (ulong)b[pos + 2 + k] << (8 * k); tc = LongTnt(pl, out tnt); } return Pk.LongTnt;
+                    case 0xA3:
+                        if (!Has(8)) { len = 0; return Pk.Unknown; }
+                        len = 8;
+                        { ulong pl = 0; for (int k = 0; k < 6; k++) pl |= (ulong)b[pos + 2 + k] << (8 * k); tc = LongTnt(pl, out tnt); }
+                        return Pk.LongTnt;
                     case 0xC3: len = 11; return Pk.Mnt;
                     case 0xC8: len = 7; return Pk.Vmcs;
                     case 0xF3: len = 2; return Pk.Ovf;
@@ -412,7 +423,10 @@ namespace Cda.Core.Engine
             int low5 = c & 0x1F;
             if (low5 == 0x0D || low5 == 0x11 || low5 == 0x01 || low5 == 0x1D)
             {
-                int form = (c >> 5) & 7; len = 1 + IpBytesTab[form]; DecodeIp(b, pos + 1, form, ref lastIp, out ip);
+                int form = (c >> 5) & 7;
+                len = 1 + IpBytesTab[form];
+                if (!Has(len)) { len = 0; return Pk.Unknown; }
+                DecodeIp(b, pos + 1, form, ref lastIp, out ip);
                 return low5 == 0x0D ? Pk.Tip : low5 == 0x11 ? Pk.TipPge : low5 == 0x01 ? Pk.TipPgd : Pk.Fup;
             }
             if (c == 0x99) { len = 2; return Pk.Mode; }

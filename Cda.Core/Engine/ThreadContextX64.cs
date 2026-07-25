@@ -147,7 +147,10 @@ namespace Cda.Core.Engine
             Marshal.WriteInt64(_ctx, OFF_Dr2, addrs.Length > 2 ? (long)addrs[2] : 0);
             Marshal.WriteInt64(_ctx, OFF_Dr3, addrs.Length > 3 ? (long)addrs[3] : 0);
 
-            ulong dr7 = 0;
+            // All address slots are known free before this method is called.
+            // Preserve DR7's non-slot control bits (8..15), clear stale slot
+            // enable/type/length fields, then install our execute breakpoints.
+            ulong dr7 = (ulong)Marshal.ReadInt64(_ctx, OFF_Dr7) & 0x0000FF00UL;
             int n = Math.Min(addrs.Length, 4);
             for (int i = 0; i < n; i++)
                 dr7 |= (1UL << (i * 2)) | (1UL << (i * 2 + 1)); // Ln + Gn; R/W=00 (exec), LEN=00 (1 byte)
@@ -155,15 +158,22 @@ namespace Cda.Core.Engine
             Dr6 = 0;
         }
 
-        /// <summary>Disable all four breakpoints (clears the addresses, DR7 and DR6).</summary>
-        public void ClearBreakpoints()
+        public DebugRegisterState CaptureDebugRegisters() => new(
+            (ulong)Marshal.ReadInt64(_ctx, OFF_Dr0),
+            (ulong)Marshal.ReadInt64(_ctx, OFF_Dr1),
+            (ulong)Marshal.ReadInt64(_ctx, OFF_Dr2),
+            (ulong)Marshal.ReadInt64(_ctx, OFF_Dr3),
+            Dr6,
+            (ulong)Marshal.ReadInt64(_ctx, OFF_Dr7));
+
+        public void RestoreDebugRegisters(DebugRegisterState state)
         {
-            Marshal.WriteInt64(_ctx, OFF_Dr0, 0);
-            Marshal.WriteInt64(_ctx, OFF_Dr1, 0);
-            Marshal.WriteInt64(_ctx, OFF_Dr2, 0);
-            Marshal.WriteInt64(_ctx, OFF_Dr3, 0);
-            Marshal.WriteInt64(_ctx, OFF_Dr7, 0);
-            Dr6 = 0;
+            Marshal.WriteInt64(_ctx, OFF_Dr0, (long)state.Dr0);
+            Marshal.WriteInt64(_ctx, OFF_Dr1, (long)state.Dr1);
+            Marshal.WriteInt64(_ctx, OFF_Dr2, (long)state.Dr2);
+            Marshal.WriteInt64(_ctx, OFF_Dr3, (long)state.Dr3);
+            Dr6 = state.Dr6;
+            Marshal.WriteInt64(_ctx, OFF_Dr7, (long)state.Dr7);
         }
 
         public void Dispose()

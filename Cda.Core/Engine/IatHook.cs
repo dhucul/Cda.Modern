@@ -19,13 +19,12 @@ namespace Cda.Core.Engine
     /// (ASLR/binding), so it isn't meaningfully checksummed — this captures the
     /// program's calls OUT to the OS without modifying a single byte of its code.
     ///
-    /// The swap is a single pointer-sized, pointer-aligned write, which is atomic:
-    /// a concurrent caller sees either the old (real) or new (stub) pointer, both
-    /// valid. So no thread suspension is needed — only the ordering rule that the
-    /// stub is fully built before the slot is pointed at it (the caller ensures
-    /// that). On <see cref="Remove"/> the original pointer is written back; the
-    /// stub memory is intentionally leaked by the session (a thread may still be
-    /// inside it), exactly as for inline hooks.
+    /// The caller suspends the process around installation/removal because
+    /// cross-process writes do not guarantee an atomic pointer exchange. The stub
+    /// is fully built before the slot is redirected. On <see cref="Remove"/> the
+    /// original pointer is written back only if the slot still points at this
+    /// hook's stub; the stub memory is intentionally retained by the session
+    /// because a thread may still be inside it.
     /// </summary>
     public sealed class IatHook
     {
@@ -101,13 +100,33 @@ namespace Cda.Core.Engine
         public void Remove()
         {
             if (_removed) return;
+            ulong current = ReadSlot(_mem, SlotAddress, _ptr);
+            if (current == Target)
+            {
+                _removed = true;
+                return;
+            }
+            if (current != Stub)
+                throw new InvalidOperationException(
+                    $"IAT slot 0x{SlotAddress:X} no longer belongs to this hook " +
+                    $"(expected stub 0x{Stub:X}, found 0x{current:X}); refusing to overwrite it.");
             WriteSlot(_mem, SlotAddress, Target, _ptr);
             _removed = true;
         }
 
+        private static ulong ReadSlot(ICodeMemory mem, ulong slot, int ptr)
+        {
+            Span<byte> b = stackalloc byte[8];
+            if (mem.Read(slot, b.Slice(0, ptr)) != ptr)
+                throw new InvalidOperationException($"Couldn't read IAT slot 0x{slot:X}.");
+            return ptr == 8
+                ? BinaryPrimitives.ReadUInt64LittleEndian(b)
+                : BinaryPrimitives.ReadUInt32LittleEndian(b);
+        }
+
         // Write a pointer-sized value into the slot, flipping the page to writable
         // for the write if the loader left it read-only and restoring its
-        // protection afterward. The write is aligned and atomic.
+        // protection afterward. The owning session suspends the target around it.
         private static void WriteSlot(ICodeMemory mem, ulong slot, ulong value, int ptr)
         {
             uint old = mem.Protect(slot, ptr, NativeMethods.PAGE_READWRITE);

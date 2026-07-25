@@ -176,6 +176,9 @@ namespace Cda.App.UI
         {
             if (_source == null) return;
             ulong row = (ulong)Math.Max(0, e.NewValue);
+            ulong maxTop = LastRowAddress();
+            ulong maxRows = (maxTop - _source.MinAddress) / BytesPerRow;
+            if (row > maxRows) row = maxRows;
             _topAddress = _source.MinAddress + row * BytesPerRow;
             _surface.InvalidateVisual();
         }
@@ -183,12 +186,24 @@ namespace Cda.App.UI
         private void ScrollByRows(int rows)
         {
             if (_source == null) return;
-            long delta = (long)rows * BytesPerRow;
-            long next = (long)_topAddress + delta;
-            if (next < (long)_source.MinAddress) next = (long)_source.MinAddress;
-            _topAddress = (ulong)next;
+            ulong steps = (ulong)Math.Abs((long)rows) * BytesPerRow;
+            ulong min = _source.MinAddress;
+            ulong max = LastRowAddress();
+            if (rows < 0)
+                _topAddress = steps > _topAddress - min ? min : _topAddress - steps;
+            else
+                _topAddress = steps > max - _topAddress ? max : _topAddress + steps;
             SyncScrollValue();
             _surface.InvalidateVisual();
+        }
+
+        private ulong LastRowAddress()
+        {
+            if (_source == null || _source.MaxAddress <= _source.MinAddress)
+                return _source?.MinAddress ?? 0;
+            ulong last = _source.MaxAddress - 1;
+            return _source.MinAddress +
+                ((last - _source.MinAddress) / BytesPerRow) * BytesPerRow;
         }
 
         // --- geometry -------------------------------------------------------

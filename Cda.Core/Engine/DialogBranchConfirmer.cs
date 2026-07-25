@@ -88,6 +88,7 @@ namespace Cda.Core.Engine
                 arm.Add(c.Address);
                 byIdx.Add(c);
             }
+            if (arm.Count == 0) return arm;
             _byCallSite[callSiteKey] = new State { ByDrIndex = byIdx.ToArray() };
             return arm;
         }

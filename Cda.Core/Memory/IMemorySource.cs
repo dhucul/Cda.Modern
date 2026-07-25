@@ -42,6 +42,10 @@ namespace Cda.Core.Memory
 
         public BufferMemorySource(byte[] data, ulong baseAddress = 0, bool is64Bit = true)
         {
+            ArgumentNullException.ThrowIfNull(data);
+            if ((ulong)data.Length > ulong.MaxValue - baseAddress)
+                throw new ArgumentOutOfRangeException(nameof(baseAddress),
+                    "The buffer range would wrap the address space.");
             _data = data;
             _base = baseAddress;
             Is64Bit = is64Bit;
