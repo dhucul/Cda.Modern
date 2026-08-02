@@ -15,7 +15,8 @@ authorized to analyze.
 
 ## Status
 
-Working and validated on real targets. Implemented and confirmed:
+Current preview release: **1.21.3**. Working and validated on real targets.
+Implemented and confirmed:
 
 - **Static module view** — open any PE (EXE/DLL/SYS), parse headers, list exports
   and statically-discovered functions, browse the raw bytes in the hex view.
@@ -104,8 +105,11 @@ Working and validated on real targets. Implemented and confirmed:
   Disassembly pane; and **capture a live .NET process** — discover its JIT-compiled
   app methods and hook their native entries through the same pipeline as a native
   capture, recording managed calls (and, with return capture on, their return values).
-- **Self-tests** for the inline-hook codegen, the capture stub + ring buffer, and the
-  return trampoline, for the current build's architecture.
+- **Automated regression coverage** — the in-app native self-tests cover inline-hook
+  codegen, the capture stub + ring buffer, return trampolines, dialog branch
+  confirmation, and Intel PT decoding. The `Cda.Core.Tests` xUnit project runs those
+  checks alongside malformed-input, path-classification, unwinding, and startup-capture
+  regressions from Visual Studio or `dotnet test`.
 
 The build compiles and runs in Visual Studio 2022 on .NET 8.
 
@@ -144,8 +148,9 @@ dependency, not to avoid the GPU.)
 
 ## Architecture
 
-Two assemblies, with a strict one-way dependency (`Cda.App` → `Cda.Core`, never
-the reverse):
+Three production assemblies and one test project keep UI, native instrumentation,
+and managed analysis separate: `Cda.App` references `Cda.Core` and `Cda.Managed`,
+while `Cda.Core.Tests` references only `Cda.Core`. Neither library depends on the UI.
 
 - **`Cda.Core`** — the engine. No WPF, no UI. PE parsing, the process/memory
   model, the CPU abstraction, the disassembler integration, inline-hook codegen,
@@ -153,6 +158,11 @@ the reverse):
   sessions.
 - **`Cda.App`** — the WPF UI. Views, the call-graph and timeline visualizations,
   the theme, and `MainWindow`, which orchestrates the engine.
+- **`Cda.Managed`** — the managed-code adapter. ILSpy supplies static IL and
+  decompiled C# views; ClrMD discovers JIT-compiled methods in live 64-bit .NET
+  targets. Keeping it separate leaves the native engine independent of both packages.
+- **`Cda.Core.Tests`** — the xUnit regression suite for the engine and its native
+  self-tests.
 
 Argument values are dereferenced **host-side**: the in-target stub records raw
 register/stack values into the ring buffer with minimal work, and the host reads
@@ -467,10 +477,21 @@ toggle for tailing.
 
 ## Build & run
 
-1. Open `Cda.Modern.sln` in **Visual Studio 2022** (17.8+) with the **.NET 8 SDK**.
-2. Select the **x64** configuration (Debug or Release).
-3. Run **elevated** (instrumenting another process requires administrator /
-   debug privilege). Press **F5**.
+Requirements: Windows, the **.NET 8 SDK**, and either Visual Studio 2022 (17.8+)
+with the .NET desktop workload or the `dotnet` CLI. CDA is built only for x64; that
+single host handles native x64 and WOW64 x86 targets.
+
+From a terminal:
+
+```powershell
+dotnet build Cda.Modern.sln -c Release -p:Platform=x64
+dotnet test Cda.Core.Tests/Cda.Core.Tests.csproj -c Release -p:Platform=x64
+dotnet run --project Cda.App/Cda.App.csproj -c Release -p:Platform=x64
+```
+
+For Visual Studio, open `Cda.Modern.sln`, select the **x64** configuration, and
+press **F5**. Run the terminal or Visual Studio **elevated** when launching CDA:
+instrumenting another process requires administrator rights and debug privilege.
 
 On launch a synthetic demo trace loads so the visualization is immediately
 exercisable. From there:
@@ -573,9 +594,6 @@ are the complete set the tool depends on, grouped by the library they come from.
 
 ```
 Cda.Modern/
-├─ Cda.Managed/              .NET support (ICSharpCode.Decompiler + ClrMD)
-│  ├─ ManagedImage           static: enumerate methods, IL + decompiled C#, resources
-│  └─ ManagedMethodScanner   live: ClrMD JIT-address discovery for hooking managed methods
 ├─ Cda.Core/                 engine (no WPF)
 │  ├─ Cpu/                   ICpuArchitecture, X86/X64Architecture, decoder, conventions
 │  ├─ Engine/                instrumentation: InlineHook + CaptureStub (entry hook + stack
@@ -594,17 +612,22 @@ Cda.Modern/
 │  ├─ Pe/                    PeImage (parse, exports/imports/sections, RVA↔VA↔file-offset)
 │  └─ Process/               TargetProcess, ProcessList, ModuleMap, SuspendedProcess,
 │                            ThreadSuspender, Privileges, RemoteMemory, NativeMethods (P/Invoke)
-└─ Cda.App/                  WPF UI (net8.0-windows, x64, Per-Monitor v2 DPI, requireAdministrator)
-   ├─ App.xaml(.cs)          theme (single source of truth) + global exception handling
-   ├─ MainWindow.xaml(.cs)   toolbar, layout, engine orchestration, poll loop, runaway unhook
-   ├─ UI/                    FunctionListView, CallListView, CallersView (caller tree),
-   │                         CallStackView (per-call chain), HexView, StringsView
-   │                         (strings + xrefs), ProcessPickerWindow, CompareWindow (trace diff)
-   ├─ Visualization/         CallGraphView (butterfly + diff overlay), TraceDiffChart
-   │                         (diverging diff bars), PlaybackBar (timeline), VisualTheme
-   ├─ Model/                 CallGraphModel (+ neighborhood aggregation), GraphDiff (edge-diff
-   │                         butterfly neighborhoods)
-   └─ Demo/                  DemoDataSource (synthetic trace for offline UI work)
+├─ Cda.Managed/              .NET support (ICSharpCode.Decompiler + ClrMD)
+│  ├─ ManagedImage           static: enumerate methods, IL + decompiled C#, resources
+│  └─ ManagedMethodScanner   live: ClrMD JIT-address discovery for hooking managed methods
+├─ Cda.Core.Tests/           xUnit regression suite + native self-test adapters
+├─ Cda.App/                  WPF UI (net8.0-windows, x64, Per-Monitor v2 DPI, requireAdministrator)
+│  ├─ App.xaml(.cs)          theme (single source of truth) + global exception handling
+│  ├─ MainWindow.xaml(.cs)   toolbar, layout, engine orchestration, poll loop, runaway unhook
+│  ├─ UI/                    FunctionListView, CallListView, CallersView (caller tree),
+│  │                         CallStackView (per-call chain), HexView, StringsView
+│  │                         (strings + xrefs), ProcessPickerWindow, CompareWindow (trace diff)
+│  ├─ Visualization/         CallGraphView (butterfly + diff overlay), TraceDiffChart
+│  │                         (diverging diff bars), PlaybackBar (timeline), VisualTheme
+│  ├─ Model/                 CallGraphModel (+ neighborhood aggregation), GraphDiff (edge-diff
+│  │                         butterfly neighborhoods)
+│  └─ Demo/                  DemoDataSource (synthetic trace for offline UI work)
+└─ tools/                    icon generation and Inno Setup installer sources
 ```
 
 See **`ARCHITECTURE.md`** for the deeper design notes (hook/trampoline layout,
