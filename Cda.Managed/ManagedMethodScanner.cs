@@ -63,13 +63,21 @@ namespace Cda.Managed
                 {
                     ulong imgBase = module.ImageBase;
                     string modName = SafeName(module);
-                    foreach (var entry in module.EnumerateTypeDefToMethodTableMap())
+                    IEnumerable<(ulong MethodTable, int Token)> map;
+                    try { map = module.EnumerateTypeDefToMethodTableMap(); }
+                    catch { continue; }
+
+                    foreach (var entry in map)
                     {
                         ClrType? type;
                         try { type = runtime.GetTypeByMethodTable(entry.MethodTable); } catch { continue; }
                         if (type == null) continue;
 
-                        foreach (var method in type.Methods)
+                        IEnumerable<ClrMethod> methods;
+                        try { methods = type.Methods; }
+                        catch { continue; }
+
+                        foreach (var method in methods)
                         {
                             ulong nc = method.NativeCode;
                             // 0 and ulong.MaxValue are both "no native body" sentinels

@@ -141,7 +141,9 @@ namespace Cda.Core.Engine
             catch { return strings; }
 
             int bitness = pe.Is64Bit ? 64 : 32;
-            ulong moduleSpan = Math.Max(module.Size, pe.SizeOfImage);
+            ulong moduleSpan = module.Size != 0
+                ? (pe.SizeOfImage != 0 ? Math.Min(module.Size, pe.SizeOfImage) : module.Size)
+                : pe.SizeOfImage;
             ulong moduleEnd = moduleSpan > ulong.MaxValue - module.BaseAddress
                 ? ulong.MaxValue
                 : module.BaseAddress + moduleSpan;

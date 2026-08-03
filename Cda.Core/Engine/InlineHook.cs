@@ -139,7 +139,8 @@ namespace Cda.Core.Engine
             // the code, so every fall-through reaches it, and BlockEncoder fixes up
             // its reach the same way (rel32, or its own jmp [rip] entry when the
             // resumed body is itself out of rel32 range of the trampoline).
-            ulong trampoline = mem.AllocateNear(patchLen * 2 + 64, target);
+            int trampBudget = patchLen * 2 + 64;
+            ulong trampoline = mem.AllocateNear(trampBudget, target);
             var stolen = Disasm.DecodeRange(bitness, original, target, patchLen);
             stolen.Add(Instruction.CreateBranch(
                 arch.Is64Bit ? Code.Jmp_rel32_64 : Code.Jmp_rel32_32, target + (ulong)patchLen));
@@ -149,9 +150,16 @@ namespace Cda.Core.Engine
             if (!BlockEncoder.TryEncode(bitness, block, out string? error, out _))
             {
                 skipReason = "Trampoline relocation failed: " + error;
+                mem.ReleaseNear(trampoline, trampBudget);
                 return false;
             }
             byte[] trampBytes = writer.Bytes.ToArray();
+            if (trampBytes.Length > trampBudget)
+            {
+                skipReason = $"Relocated trampoline ({trampBytes.Length} B) exceeds its {trampBudget} B block.";
+                mem.ReleaseNear(trampoline, trampBudget);
+                return false;
+            }
             mem.Write(trampoline, trampBytes);
             mem.Flush(trampoline, trampBytes.Length);
 

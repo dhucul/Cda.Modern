@@ -253,7 +253,7 @@ namespace Cda.Core.Engine
             if (hdr[0] != 0x4D || hdr[1] != 0x5A) return null;           // 'MZ'
 
             int e = BitConverter.ToInt32(hdr, 0x3C);                     // e_lfanew
-            if (e <= 0 || e + 24 + 144 > n) return null;
+            if (e <= 0 || e > n - (24 + 144)) return null;
             if (BitConverter.ToUInt32(hdr, e) != 0x00004550) return null; // 'PE\0\0'
             ushort magic = BitConverter.ToUInt16(hdr, e + 24);
             if (magic != 0x20B) return null;                              // not PE32+ (x64)

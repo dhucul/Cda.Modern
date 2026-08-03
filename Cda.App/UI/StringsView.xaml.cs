@@ -125,6 +125,7 @@ namespace Cda.App.UI
         {
             _filter = "";
             if (Filter != null && Filter.Text.Length != 0) Filter.Text = ""; // fires OnFilterChanged
+            if (OnlyReferenced != null) OnlyReferenced.IsChecked = false;
             SetRows(new List<StringRow>());
         }
 

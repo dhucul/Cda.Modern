@@ -1327,6 +1327,10 @@ namespace Cda.App
                 if (added > 0)
                     Diag($"managed rescan: +{added} newly-JIT'd method(s) hooked (total {_managedHooked.Count}).");
             }
+            catch (Exception ex)
+            {
+                Diag("managed rescan failed: " + ex.Message);
+            }
             finally { _managedRescanning = false; }
         }
 
@@ -1437,6 +1441,7 @@ namespace Cda.App
                 return;
             }
             if (!await StopCaptureQuietly()) return;
+            if (_capture != null) return;
             _diag.Add($"refocus live trace on {DescribeAddr(address)}");
             StartCaptureOn(new List<ulong> { address }, DescribeAddr(address), preserveLog: true);
         }
@@ -1861,6 +1866,12 @@ namespace Cda.App
                 {
                     _diag.Add("suspended prep failed: " + ex.Message);
                     StopDebugWatch();
+                    if (_pollTimer != null)
+                    {
+                        _pollTimer.Stop();
+                        _pollTimer.Tick -= OnPollTick;
+                        _pollTimer = null;
+                    }
                     _capture?.Dispose();
                     _capture = null;
                 }
@@ -2045,7 +2056,7 @@ namespace Cda.App
         {
             try
             {
-                Dispatcher.Invoke(() =>
+                Dispatcher.BeginInvoke(new Action(() =>
                 {
                     _diag.Add(info.Line);
                     _faultSeenThisAttempt = true;
@@ -2071,7 +2082,7 @@ namespace Cda.App
                             ? "crash not attributable to a single hook (deferred / cross-module corruption) — auto-bisecting to isolate it…"
                             : "crash not attributable to a single hook (deferred / cross-module corruption) — turn on 'Auto-bisect crashes' to isolate it, or bisect with CDA_HOOK_RANGE.");
                     }
-                });
+                }));
             }
             catch { /* dispatcher gone — app shutting down */ }
         }
@@ -2195,7 +2206,16 @@ namespace Cda.App
             _bisectArmOnly = sub;
             _bisectRelaunches++;
             Diag($"bisecting: testing {sub.Count} suspect hook(s) — indices [{_bisectLo}..{_bisectMid}) of [{_bisectLo}..{_bisectHi}) (hidden)…");
-            _ = LaunchStartupTrace();
+            _ = LaunchStartupTrace().ContinueWith(t =>
+            {
+                _bisecting = false;
+                _bisectArmOnly = null;
+                _bisectDeadline = 0;
+                Diag("auto-bisection aborted: " +
+                     (t.Exception?.GetBaseException().Message ?? "relaunch failed"));
+            }, System.Threading.CancellationToken.None,
+               TaskContinuationOptions.OnlyOnFaulted,
+               TaskScheduler.FromCurrentSynchronizationContext());
         }
 
         // Fold one hidden test's verdict into the search window, then advance.
@@ -2340,6 +2360,17 @@ namespace Cda.App
                 return;
             }
 
+            if (_pollTimer != null)
+            {
+                _pollTimer.Stop();
+                _pollTimer.Tick -= OnPollTick;
+                _pollTimer = null;
+            }
+            if (_capture != null && !ReferenceEquals(_capture, h.Session))
+            {
+                try { _capture.Dispose(); }
+                catch (Exception ex) { RetainFailedCleanup(_capture, ex); }
+            }
             _capture = h.Session;
             _is64 = h.Is64Bit;
             _liveDataset = h.Dataset;
@@ -2359,6 +2390,15 @@ namespace Cda.App
             CallList.Configure(_moduleMap);
             CallList.Clear();
 
+            _session?.Dispose();
+            _session = null;
+            _chainResolver = null;
+            _chainResolverSession = null;
+            _unwinder = null;
+            _unwinderFor = null;
+            _callerIndexFor = null;
+            _idxAddr = Array.Empty<ulong>();
+            _idxName = Array.Empty<string>();
             _pollTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
             _pollTimer.Tick += OnPollTick;
             _pollTimer.Start();
@@ -2505,6 +2545,11 @@ namespace Cda.App
             {
                 worker.Dispose();
                 if (ReferenceEquals(_childFollow, worker)) _childFollow = null;
+            }
+            if (!_childView || worker == null)
+            {
+                ResetChildTargets();
+                ChildTargetPanel.Visibility = Visibility.Collapsed;
             }
             UpdateClearCallsState();
         }
@@ -2938,7 +2983,8 @@ namespace Cda.App
                 StatusText.Text = "Attach to a process first (Attach to process…), then Capture Windows API.";
                 return;
             }
-            if (_capture != null || _dllCapture != null || _apiLaunch != null)
+            if (_capture != null || _dllCapture != null || _apiLaunch != null ||
+                _childFollow != null || _hwbp != null)
             {
                 StatusText.Text = "Capture already running — stop it first.";
                 return;
@@ -3035,7 +3081,8 @@ namespace Cda.App
                 StatusText.Text = "Attach to a process first (Attach to process…), then Detect dialog caller.";
                 return;
             }
-            if (_capture != null || _dllCapture != null || _apiLaunch != null)
+            if (_capture != null || _dllCapture != null || _apiLaunch != null ||
+                _childFollow != null || _hwbp != null)
             {
                 StatusText.Text = "Capture already running — stop it first.";
                 return;
@@ -3173,7 +3220,8 @@ namespace Cda.App
                 StatusText.Text = "Attach to a process first (Attach to process…), then Capture imports (IAT).";
                 return;
             }
-            if (_capture != null || _dllCapture != null || _apiLaunch != null)
+            if (_capture != null || _dllCapture != null || _apiLaunch != null ||
+                _childFollow != null || _hwbp != null)
             {
                 StatusText.Text = "Capture already running — stop it first.";
                 return;
@@ -3453,6 +3501,15 @@ namespace Cda.App
             CallList.Configure(_moduleMap);
             CallList.Clear();
 
+            _session?.Dispose();
+            _session = null;
+            _chainResolver = null;
+            _chainResolverSession = null;
+            _unwinder = null;
+            _unwinderFor = null;
+            _callerIndexFor = null;
+            _idxAddr = Array.Empty<ulong>();
+            _idxName = Array.Empty<string>();
             _pollTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
             _pollTimer.Tick += OnPollTick;
             _pollTimer.Start();
@@ -4997,7 +5054,7 @@ namespace Cda.App
             if (DialogRead(baseAddr, hdr) < hdr.Length) return 0;
             if (hdr[0] != (byte)'M' || hdr[1] != (byte)'Z') return 0;
             int e = BitConverter.ToInt32(hdr, 0x3C);
-            if (e <= 0 || e + 24 + 60 > hdr.Length) return 0;
+            if (e <= 0 || e > hdr.Length - (24 + 60)) return 0;
             if (hdr[e] != (byte)'P' || hdr[e + 1] != (byte)'E') return 0;
             return BitConverter.ToUInt32(hdr, e + 24 + 56); // OptionalHeader.SizeOfImage
         }
@@ -5265,6 +5322,11 @@ namespace Cda.App
         private void StartCaptureOn(List<ulong> candidates, string label, int maxFunctions = 1, int bufferRecords = 2048, bool preserveLog = false)
         {
             if (_session == null || candidates.Count == 0) return;
+            if (_capture != null || _pollTimer != null)
+            {
+                StatusText.Text = "Capture already running — stop it first.";
+                return;
+            }
 
             // The target can exit between launch and a click-to-refocus; instrumenting
             // a gone process fails deep in the engine (VirtualAllocEx -> access
@@ -5362,6 +5424,8 @@ namespace Cda.App
             if (oldCount == 0 || _captured[oldCount - 1].Time.CompareTo(ordered[0].Time) <= 0)
             {
                 _captured.AddRange(ordered);
+                int over = _captured.Count - ChildKeepLast;
+                if (over > 0) _captured.RemoveRange(0, over);
                 return;
             }
 
@@ -5379,6 +5443,8 @@ namespace Cda.App
                     _captured[write--] = ordered[right--];
             }
             while (right >= 0) _captured[write--] = ordered[right--];
+            int excess = _captured.Count - ChildKeepLast;
+            if (excess > 0) _captured.RemoveRange(0, excess);
         }
 
         private void OnCaptureConditionChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
@@ -5461,14 +5527,17 @@ namespace Cda.App
             // Auto-bisection survive check: a hidden test subset still running this long
             // with no fatal fault is clean (the culprit isn't in it). Discard the hidden
             // instance and advance the search.
-            if (_bisecting && _bisectDeadline != 0 && Environment.TickCount64 >= _bisectDeadline
-                && AutoBisectCrashes?.IsChecked == true)
+            if (_bisecting && _bisectDeadline != 0 && Environment.TickCount64 >= _bisectDeadline)
             {
+                bool stillSearching = AutoBisectCrashes?.IsChecked == true && !_startupStop;
                 _bisectDeadline = 0;
                 int pid = cap.Pid;
                 StopCapture();
                 TargetProcess.Kill(pid);
-                BisectStep(crashed: false);
+                if (stillSearching) { BisectStep(crashed: false); return; }
+                _bisecting = false;
+                _bisectArmOnly = null;
+                Diag("auto-bisection stopped.");
                 return;
             }
 
@@ -5557,8 +5626,9 @@ namespace Cda.App
                 if (ReferenceEquals(_capture, cap))
                 {
                     FinishPoll();
-                    StatusText.Text = "Capture poll error: " + ex.Message;
                     StopCapture();
+                    StatusText.Text = "Capture poll error: " + ex.Message;
+                    Diag("capture poll error: " + ex.Message);
                 }
                 else
                 {
@@ -5602,6 +5672,9 @@ namespace Cda.App
                 return;
             }
             FinishPoll();
+
+            try
+            {
 
             // "Clear calls" ran while this batch was decoding off the UI thread. The
             // records were drained from the ring before the clear, so showing them now
@@ -5711,6 +5784,13 @@ namespace Cda.App
             // instead of appearing to capture forever with zero hooks.
             if (cap.HookedCount == 0 && _autoUnhooked.Count > 0)
                 FinishAutoUnhookedCapture(cap);
+            }
+            catch (Exception ex)
+            {
+                StopCapture();
+                StatusText.Text = "Capture display error: " + ex.Message;
+                Diag("capture display error: " + ex.Message);
+            }
         }
 
         private void FinishPoll()
@@ -5814,7 +5894,6 @@ namespace Cda.App
                     Functions = _liveDataset.Functions,
                     Records = new List<CallRecord>(_captured),
                 };
-                ds.Records.Sort((a, b) => a.Time.CompareTo(b.Time));
                 ds.TimeStart = ds.Records[0].Time;
                 ds.TimeEnd = ds.Records[ds.Records.Count - 1].Time;
 
@@ -5862,7 +5941,6 @@ namespace Cda.App
                     Functions = _liveDataset.Functions,
                     Records = new List<CallRecord>(_captured),
                 };
-                ds.Records.Sort((a, b) => a.Time.CompareTo(b.Time));
                 ds.TimeStart = ds.Records[0].Time;
                 ds.TimeEnd = ds.Records[^1].Time;
                 _model.Load(ds);
@@ -6069,7 +6147,6 @@ namespace Cda.App
                 Functions = new List<TracedFunction>(_liveDataset.Functions),
                 Records = new List<CallRecord>(_captured),
             };
-            ds.Records.Sort((a, b) => a.Time.CompareTo(b.Time));
             ds.TimeStart = ds.Records.Count > 0 ? ds.Records[0].Time : 0;
             ds.TimeEnd = ds.Records.Count > 0 ? ds.Records[ds.Records.Count - 1].Time : 1;
             return ds;
@@ -6516,8 +6593,14 @@ namespace Cda.App
             StopApiLaunch();
             StopChildFollow();
             StopHwbp();
+            StopManagedRescan();
             DisposeAttachPt(); // stop attach-mode Intel PT tracing (no-op if inactive)
-            if (_pollTimer != null) { _pollTimer.Stop(); _pollTimer = null; }
+            if (_pollTimer != null)
+            {
+                _pollTimer.Stop();
+                _pollTimer.Tick -= OnPollTick;
+                _pollTimer = null;
+            }
             try { _capture?.Dispose(); }
             catch (Exception ex) { RetainFailedCleanup(_capture!, ex); }
             RetryFailedCaptureCleanup();

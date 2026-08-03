@@ -33,6 +33,7 @@ namespace Cda.Core.Engine
         public const uint STACK_OVERFLOW      = 0xC00000FD;
         public const uint FAIL_FAST           = 0xC0000409;
         public const uint BREAKPOINT          = 0x80000003; // STATUS_BREAKPOINT (an int3)
+        public const uint WX86_BREAKPOINT     = 0x4000001F;
 
         /// <summary>
         /// True for error-severity NTSTATUS exceptions (0xCxxxxxxx) — the hardware
@@ -76,7 +77,8 @@ namespace Cda.Core.Engine
 
             bool fatalEvenFirstChance =
                 code == ILLEGAL_INSTRUCTION || code == PRIV_INSTRUCTION ||
-                code == STACK_OVERFLOW || code == FAIL_FAST || code == BREAKPOINT;
+                code == STACK_OVERFLOW || code == FAIL_FAST ||
+                code == BREAKPOINT || code == WX86_BREAKPOINT;
             if (firstChance != 0 && !fatalEvenFirstChance)
                 return null; // first-chance AV / divide / in-page: wait for last-chance
 
@@ -197,6 +199,7 @@ namespace Cda.Core.Engine
             STACK_OVERFLOW      => "STACK_OVERFLOW",
             FAIL_FAST           => "FAIL_FAST",
             BREAKPOINT          => "BREAKPOINT (int3)",
+            WX86_BREAKPOINT     => "BREAKPOINT (wow64 int3)",
             _                   => "EXCEPTION",
         };
 

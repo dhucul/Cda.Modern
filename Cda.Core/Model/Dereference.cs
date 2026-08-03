@@ -31,7 +31,7 @@ namespace Cda.Core.Model
             if (Data.Length == 0) return null;
             string? s = Kind switch
             {
-                DereferenceKind.AnsiString => System.Text.Encoding.ASCII.GetString(Data),
+                DereferenceKind.AnsiString => System.Text.Encoding.Latin1.GetString(Data),
                 DereferenceKind.WideString => System.Text.Encoding.Unicode.GetString(Data),
                 _ => null
             };

@@ -101,6 +101,7 @@ namespace Cda.Core.Engine
                 {
                     if (exp.IsForwarder) { result.SkippedForwarders++; continue; }
                     if (exp.Rva == 0) continue; // hole in the export-address table
+                    if (module.Size != 0 && exp.Rva >= module.Size) continue;
 
                     ulong target = module.BaseAddress + exp.Rva;
                     if (!seen.Add(target)) continue;

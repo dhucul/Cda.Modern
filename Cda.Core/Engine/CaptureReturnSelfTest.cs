@@ -29,7 +29,7 @@ namespace Cda.Core.Engine
             const int argCount = 4;
             int recordSize = CaptureStub.RecordSize(argCount);
 
-            var mem = new LocalCodeMemory();
+            using var mem = new LocalCodeMemory();
             var arch = CpuArchitectures.For(is64);
 
             var buffer = CaptureBuffer.Create(mem, requestedSlots: 256, recordSize: recordSize);
@@ -50,6 +50,9 @@ namespace Cda.Core.Engine
             try { hook = InlineHook.Install(arch, mem, func, stub); }
             catch (Exception ex) { return "FAIL: hook install — " + ex.Message; }
 
+            bool removed = false;
+            try
+            {
             byte[] retStubBytes, stubBytes;
             try
             {
@@ -73,6 +76,7 @@ namespace Cda.Core.Engine
             GC.KeepAlive(fn);
 
             hook.Remove();
+            removed = true;
 
             uint readSeq = 0;
             byte[] data = buffer.DrainSince(mem, ref readSeq, out _);
@@ -105,6 +109,12 @@ namespace Cda.Core.Engine
 
             return $"PASS ({arch.Name}): {n} calls, {n} returns paired · return value 0x1234 · " +
                    $"{recordSize}-byte records.";
+            }
+            finally
+            {
+                if (!removed)
+                    try { hook.Remove(); } catch { }
+            }
         }
     }
 }

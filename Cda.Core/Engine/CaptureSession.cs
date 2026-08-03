@@ -147,16 +147,18 @@ namespace Cda.Core.Engine
             IReadOnlyList<ModuleInfo>? knownModules = null, bool captureReturns = false)
         {
             var proc = TargetProcess.Attach(pid, forWrite: true);
+            RemoteMemory? memory = null;
+            CaptureSession? session = null;
             try
             {
-                var memory = new RemoteMemory(proc);
+                memory = new RemoteMemory(proc);
                 var code = new RemoteCodeMemory(proc, memory);
                 var arch = CpuArchitectures.For(proc.Is64Bit);
                 int argCount = 4;
                 int recordSize = CaptureStub.RecordSize(argCount);
 
                 var buffer = CaptureBuffer.Create(code, bufferRecords, recordSize);
-                var session = new CaptureSession(proc, code, buffer, argCount, captureReturns);
+                session = new CaptureSession(proc, code, buffer, argCount, captureReturns);
 
                 // Install the exception-safety VEH before any hook is armed, so it is live
                 // before the first return redirect (no-op unless return capture + x64).
@@ -293,6 +295,9 @@ namespace Cda.Core.Engine
             }
             catch
             {
+                bool restored = session == null;
+                try { session?.RestoreAllHooks(); restored = true; } catch { }
+                if (restored) try { memory?.Dispose(); } catch { }
                 proc.Dispose();
                 throw;
             }
@@ -312,15 +317,17 @@ namespace Cda.Core.Engine
             out int instrumented, out int skipped, out string? firstError)
         {
             var proc = TargetProcess.Attach(pid, forWrite: true);
+            RemoteMemory? memory = null;
+            CaptureSession? session = null;
             try
             {
-                var memory = new RemoteMemory(proc);
+                memory = new RemoteMemory(proc);
                 var code = new RemoteCodeMemory(proc, memory);
                 int argCount = 4;
                 int recordSize = CaptureStub.RecordSize(argCount);
 
                 var buffer = CaptureBuffer.Create(code, bufferRecords, recordSize);
-                var session = new CaptureSession(proc, code, buffer, argCount);
+                session = new CaptureSession(proc, code, buffer, argCount);
 
                 instrumented = 0;
                 skipped = 0;
@@ -378,6 +385,9 @@ namespace Cda.Core.Engine
             }
             catch
             {
+                bool restored = session == null;
+                try { session?.RestoreAllHooks(); restored = true; } catch { }
+                if (restored) try { memory?.Dispose(); } catch { }
                 proc.Dispose();
                 throw;
             }
@@ -401,7 +411,10 @@ namespace Cda.Core.Engine
 
             if (!InlineHook.TryInstall(arch, _code, func, stub, activate: false,
                     out var hook, out skipReason, maxPatch))
+            {
+                _code.ReleaseNear(stub, StubBytesMax);
                 return false;
+            }
 
             // Return-value capture (opt-in): a private return context (zeroed → free)
             // + a shared return stub; on failure, fall back to entry-only for this hook.
@@ -448,7 +461,14 @@ namespace Cda.Core.Engine
             byte[] stubBytes = CaptureStub.Build(_process.Is64Bit, stub, func,
                 _buffer.ControlAddress, _buffer.DataAddress, hook!.Trampoline, ArgCount, _buffer.SlotCount,
                 retStub, retCtx);
-            if (stubBytes.Length > StubBytesMax) { skipReason = "capture stub exceeded size budget"; return false; }
+            if (stubBytes.Length > StubBytesMax)
+            {
+                hook.Remove();
+                _code.ReleaseNear(hook.Trampoline, hook.PatchLength * 2 + 64);
+                _code.ReleaseNear(stub, StubBytesMax);
+                skipReason = "capture stub exceeded size budget";
+                return false;
+            }
 
             _code.Write(stub, stubBytes);
             _code.Flush(stub, stubBytes.Length);
@@ -867,8 +887,17 @@ namespace Cda.Core.Engine
             if (n >= 4 && b[1] == 0 && b[3] == 0 && IsPrint(b[0]) && IsPrint(b[2]))
             {
                 int len = 0;
-                while (len + 1 < n && !(b[len] == 0 && b[len + 1] == 0)) len += 2;
-                bool terminated = len + 1 < n && b[len] == 0 && b[len + 1] == 0;
+                bool printable = true;
+                while (len + 1 < n && !(b[len] == 0 && b[len + 1] == 0))
+                {
+                    if (b[len + 1] != 0 || !IsStrChar(b[len]))
+                    {
+                        printable = false;
+                        break;
+                    }
+                    len += 2;
+                }
+                bool terminated = printable && len + 1 < n && b[len] == 0 && b[len + 1] == 0;
                 if (terminated && len >= 4)
                 {
                     var data = new byte[len];
@@ -998,14 +1027,15 @@ namespace Cda.Core.Engine
             lock (_hookGate)
             {
                 if (_disposed) return;
-                if (_stopping) throw new InvalidOperationException("Capture stop is already in progress.");
-                RestoreAllHooks();
+                if (_stopping) return;
                 _disposed = true;
+                try { RestoreAllHooks(); }
+                catch { /* Dispose must not mask an in-flight failure. */ }
                 // Deliberately DO NOT free the stubs/trampolines/buffer. A thread may
                 // still be executing inside a stub or trampoline, or be poised to
                 // return into one; freeing would crash the target. These regions are
                 // reclaimed when the target exits. (Bounded leak per capture session.)
-                _process.Dispose();
+                try { _process.Dispose(); } catch { }
             }
         }
     }

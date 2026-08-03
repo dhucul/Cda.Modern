@@ -5,6 +5,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Data;
 using System.Windows.Input;
+using System.Threading.Tasks;
 using Cda.Core.Process;
 
 namespace Cda.App.UI
@@ -25,12 +26,13 @@ namespace Cda.App.UI
         public ProcessPickerWindow()
         {
             InitializeComponent();
-            Loaded += (_, _) => Reload();
+            Loaded += async (_, _) => await ReloadAsync();
         }
 
-        private void Reload()
+        private async Task ReloadAsync()
         {
-            _all = ProcessList.Enumerate();
+            List.ItemsSource = null;
+            _all = await Task.Run(ProcessList.Enumerate);
             _view = CollectionViewSource.GetDefaultView(_all);
             _view.Filter = o =>
             {
@@ -42,7 +44,7 @@ namespace Cda.App.UI
             List.ItemsSource = _view;
         }
 
-        private void OnRefresh(object sender, RoutedEventArgs e) => Reload();
+        private async void OnRefresh(object sender, RoutedEventArgs e) => await ReloadAsync();
 
         private void OnFilterChanged(object sender, TextChangedEventArgs e)
         {

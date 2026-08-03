@@ -7,6 +7,7 @@ using System.Text;
 using System.Threading;
 using Cda.Core.Engine;
 using Cda.Core.Memory;
+using Cda.Core.Model;
 using Cda.Core.Pe;
 using Cda.Core.Process;
 using Iced.Intel;
@@ -171,6 +172,93 @@ namespace Cda.Core.Tests
                 @"\\?\C:\Windows\System32\kernel32.dll", @"C:\Windows"));
         }
 
+        [Fact]
+        public void RingDecoderUsesFixedSnapshotStrideForShortStacks()
+        {
+            const int argCount = 1;
+            int recordSize = CaptureStub.RecordSize(argCount);
+            var record = new byte[recordSize];
+            BinaryPrimitives.WriteUInt64LittleEndian(record.AsSpan(8), 0x1111);
+            BinaryPrimitives.WriteUInt64LittleEndian(record.AsSpan(16), 0x2222);
+            BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(32), argCount);
+            BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(36), 7);
+            BinaryPrimitives.WriteUInt64LittleEndian(record.AsSpan(40), 0xAAAA);
+            int stackCount = 48;
+            BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(stackCount), 2);
+            BinaryPrimitives.WriteUInt64LittleEndian(record.AsSpan(stackCount + 4), 0x1234);
+            BinaryPrimitives.WriteUInt64LittleEndian(record.AsSpan(stackCount + 12), 0x5678);
+            int derefCount = stackCount + 4 + CaptureStub.StackSlots * 8;
+            BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(derefCount), 0);
+
+            List<CallRecord> decoded = RingBufferReader.Decode(record, recordSize, 0, 1);
+
+            CallRecord call = Assert.Single(decoded);
+            Assert.Equal(new ulong[] { 0x1234, 0x5678 }, call.StackSnapshot);
+        }
+
+        [Fact]
+        public void ApiSignatureLookupAcceptsQualifiedEngineNames()
+        {
+            Assert.NotNull(ApiSignatures.Lookup("kernel32!CreateFileW"));
+        }
+
+        [Fact]
+        public void AnsiDereferencePreservesHighBytes()
+        {
+            var dereference = new Dereference
+            {
+                Kind = DereferenceKind.AnsiString,
+                Data = new byte[] { (byte)'J', 0xE9 },
+            };
+
+            Assert.Equal("Jé", dereference.AsString());
+        }
+
+        [Fact]
+        public void TraceComparisonReservesExactRvaMatchesBeforeNameFallback()
+        {
+            var a = new TraceDataset();
+            a.Modules.Add(new ModuleInfo("app.exe", 0x1000, 0x1000));
+            a.Functions.Add(new TracedFunction(0x1100, 0x1000, "Foo"));
+            a.Functions.Add(new TracedFunction(0x1200, 0x1000, "Bar"));
+            a.Records.Add(new CallRecord { Destination = 0x1100 });
+            a.Records.Add(new CallRecord { Destination = 0x1200 });
+
+            var b = new TraceDataset();
+            b.Modules.Add(new ModuleInfo("app.exe", 0x2000, 0x1000));
+            b.Functions.Add(new TracedFunction(0x2200, 0x2000, "Foo"));
+            b.Records.Add(new CallRecord { Destination = 0x2200 });
+
+            TraceComparisonResult comparison = TraceComparison.Compare(a, b);
+
+            Assert.Contains(comparison.Functions,
+                d => d.AddressA == 0x1200 && d.AddressB == 0x2200);
+        }
+
+        [Fact]
+        public void MappedFileSourceSlidesAcrossWindowBoundary()
+        {
+            string path = Path.Combine(Path.GetTempPath(), Guid.NewGuid() + ".bin");
+            const long offset = 64L * 1024 * 1024 + 17;
+            try
+            {
+                using (var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.Read))
+                {
+                    stream.SetLength(offset + 4);
+                    stream.Position = offset;
+                    stream.Write(new byte[] { 1, 2, 3, 4 });
+                }
+                using var source = new MappedFileMemorySource(path, is64Bit: true);
+                var bytes = new byte[4];
+                Assert.Equal(4, source.ReadMemory((ulong)offset, bytes));
+                Assert.Equal(new byte[] { 1, 2, 3, 4 }, bytes);
+            }
+            finally
+            {
+                try { File.Delete(path); } catch { }
+            }
+        }
+
         private static byte[] BuildTraceWithTruncatedLongTnt()
         {
             const int threadHeader = 28;
@@ -254,6 +342,29 @@ namespace Cda.Core.Tests
             {
                 try { Directory.Delete(tempDir, recursive: true); } catch { }
             }
+        }
+
+        [Fact]
+        public void Wow64LaunchConsumesBothLoaderBreakpoints()
+        {
+            string powerShell = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                @"SysWOW64\WindowsPowerShell\v1.0\powershell.exe");
+            Assert.True(File.Exists(powerShell), $"WOW64 test target not found: {powerShell}");
+            string script =
+                "$s='using System; using System.Runtime.InteropServices; " +
+                "public static class CdaWow64DialogProbe { " +
+                "[DllImport(\"user32.dll\", CharSet=CharSet.Unicode)] " +
+                "public static extern int MessageBox(IntPtr h, string t, string c, uint u); }'; " +
+                "Add-Type -TypeDefinition $s; " +
+                "[CdaWow64DialogProbe]::MessageBox([IntPtr]::Zero,'CDA WOW64 probe','CDA WOW64 probe',0)";
+            string encoded = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
+            RunLaunchProbe(
+                powerShell,
+                $"\"{powerShell}\" -NoProfile -NonInteractive -EncodedCommand {encoded}",
+                LaunchApiCapture.HookMode.Dialogs,
+                "WOW64 dialog hooks were never armed after both loader breakpoints.",
+                "No WOW64 dialog call reached the capture ring.");
         }
 
         private static void RunPowerShellLaunchProbe(

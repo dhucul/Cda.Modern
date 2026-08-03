@@ -72,7 +72,8 @@ namespace Cda.Core.Engine
                 uint ringOff = BitConverter.ToUInt32(trace, pos + 20);
                 uint tsz = BitConverter.ToUInt32(trace, pos + 24);
                 int traceStart = pos + 28;
-                if (tsz == 0 || (long)traceStart + tsz > trace.Length) break;
+                if ((long)traceStart + tsz > trace.Length) break;
+                if (tsz == 0) { threadIdx++; pos = traceStart; continue; }
                 ulong tid = BitConverter.ToUInt64(trace, pos + 0);
                 diag?.Invoke($"thr#{threadIdx} hdr: tid=0x{tid:X} ringOff={ringOff} tsz={tsz}");
                 if (ringOff <= tsz)
@@ -432,7 +433,14 @@ namespace Cda.Core.Engine
             if (c == 0x99) { len = 2; return Pk.Mode; }
             if (c == 0x19) { len = 8; return Pk.Tsc; }
             if (c == 0x59) { len = 2; return Pk.Mtc; }
-            if ((c & 0x03) == 0x03) { int l = 1; while (pos + l < b.Length && (b[pos + l - 1] & 1) != 0) l++; len = Math.Max(1, l); return Pk.Cyc; }
+            if ((c & 0x03) == 0x03)
+            {
+                int l = 1;
+                if ((c & 0x04) != 0)
+                    do { l++; } while (pos + l - 1 < b.Length && (b[pos + l - 1] & 1) != 0);
+                len = l;
+                return Pk.Cyc;
+            }
             if ((c & 0x01) == 0) { len = 1; tc = ShortTnt(c, out tnt); return Pk.ShortTnt; }
             len = 1; return Pk.Unknown;
         }

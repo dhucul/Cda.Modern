@@ -113,6 +113,8 @@ namespace Cda.Core.Engine
         private bool _hooked;
         private bool _attached;
         private bool _loaderBpSeen;   // the initial loader breakpoint has been consumed
+        private bool _wow64LoaderBpSeen;
+        private int _exitNotified;
         private bool _dialogHostSeen; // (Dialogs mode) a dialog-host LOAD_DLL (user32/comctl32/comdlg32/credui) has arrived post-loader-BP
         private CaptureSession? _unclaimedSession;
 
@@ -221,8 +223,16 @@ namespace Cda.Core.Engine
         public void Dispose()
         {
             Stop();
-            WaitForExit(Timeout.Infinite);
-            DisposeUnclaimedSession();
+            if (!WaitForExit(5000))
+                Log?.Invoke("API launch loop did not exit within 5s; abandoning it.");
+            else
+                try { DisposeUnclaimedSession(); } catch { }
+        }
+
+        private void NotifyTargetExited()
+        {
+            if (Interlocked.Exchange(ref _exitNotified, 1) == 0)
+                TargetExited?.Invoke();
         }
 
         private void Run()
@@ -244,7 +254,7 @@ namespace Cda.Core.Engine
                 if (!ok)
                 {
                     Log?.Invoke($"launch failed (error {Marshal.GetLastWin32Error()})");
-                    TargetExited?.Invoke();
+                    NotifyTargetExited();
                     return;
                 }
                 _pid = (int)pi.dwProcessId;
@@ -392,12 +402,13 @@ namespace Cda.Core.Engine
                             // or the program's own debug-break / anti-tamper on the
                             // patched code — report it with the faulting module+RVA and
                             // hand it back to the program rather than swallowing it.
-                            bool isBp = exCode == NativeMethods.EXCEPTION_BREAKPOINT ||
-                                        exCode == NativeMethods.STATUS_WX86_BREAKPOINT;
-                            bool loaderBp = isBp && !_loaderBpSeen;
+                            bool isNativeBp = exCode == NativeMethods.EXCEPTION_BREAKPOINT;
+                            bool isBp = isNativeBp || exCode == NativeMethods.STATUS_WX86_BREAKPOINT;
+                            bool loaderBp = isNativeBp ? !_loaderBpSeen : (isBp && !_wow64LoaderBpSeen);
                             if (loaderBp)
                             {
-                                _loaderBpSeen = true;
+                                if (isNativeBp) _loaderBpSeen = true;
+                                else _wow64LoaderBpSeen = true;
                                 if (!_hooked)
                                 {
                                     if (_mode == HookMode.Dialogs)
@@ -447,7 +458,7 @@ namespace Cda.Core.Engine
                             }
                             try { _pt?.Dispose(); _pt = null; } catch { }
                             Log?.Invoke("target exited.");
-                            TargetExited?.Invoke();
+                            NotifyTargetExited();
                             return;
                     }
 
@@ -455,7 +466,11 @@ namespace Cda.Core.Engine
                     if (NativeMethods.ContinueDebugEvent(evtPid, evtTid, cont))
                         eventPending = false;
                     else
+                    {
+                        Log?.Invoke($"ContinueDebugEvent failed (error {Marshal.GetLastWin32Error()}) — ending the launch loop.");
+                        Detach();
                         break;
+                    }
 
                     ServiceProbeRequests(); // pick up any UI-requested branch probe
                     if (_stop) { Detach(); break; }
@@ -478,7 +493,7 @@ namespace Cda.Core.Engine
                 Detach();
                 try { DisposeUnclaimedSession(); }
                 catch (Exception ex) { Log?.Invoke("unclaimed API session cleanup failed: " + ex.Message); }
-                finally { Marshal.FreeHGlobal(evt); }
+                finally { Marshal.FreeHGlobal(evt); NotifyTargetExited(); }
             }
         }
 
@@ -519,6 +534,7 @@ namespace Cda.Core.Engine
             //    active) or queue a DR branch-probe (no PT — confirms on the caller's next run).
             while (_probeRequests.TryDequeue(out var req))
             {
+                if (_stop) return;
                 if (_pt != null)
                 {
                     if (!TryPtConfirm(req.Key, req.DialogApi, req.Candidates))
@@ -529,7 +545,8 @@ namespace Cda.Core.Engine
             }
 
             // 2a. PT active: (re)arm the API-entry watches for fresh reads (see ServiceApiWatch).
-            if (_pt != null) { ServiceApiWatch(); return; }
+            if (_pt != null && _apiWatch.Count > 0) { ServiceApiWatch(); return; }
+            if (_pt != null) ServiceApiWatch();
 
             // 2b. DR fallback: free the current probe once its nearest gate has routed in (or
             //    give-up) — NOT on any confirmation, or we'd disarm mid-pass on a farther branch.
@@ -552,6 +569,7 @@ namespace Cda.Core.Engine
                 _armedProbeAddrs = addrs;
                 _armedProbeMask = (1UL << addrs.Length) - 1;
                 _armedCallSiteKey = d.Key;
+                _drApiWatch = false;
                 ArmProbeAllThreads();
                 break;
             }
@@ -644,6 +662,7 @@ namespace Cda.Core.Engine
                 if (!_apiWatchDone.Contains(apiAddr) && (w.AppTries >= MaxAppWatchTries || w.Hits >= MaxApiWatchHits))
                 {
                     PtDiag($"watch on API 0x{apiAddr:X} gave up (appTries={w.AppTries} hits={w.Hits})");
+                    _drPending.Enqueue((w.Key, w.Cands));
                     _apiWatchDone.Add(apiAddr);
                 }
             }
@@ -706,11 +725,19 @@ namespace Cda.Core.Engine
         {
             if (_armedProbeAddrs.Length == 0) return false;
             IntPtr h = NativeMethods.OpenThread(THREAD_ACCESS, false, tid);
-            if (h == IntPtr.Zero) return false;
+            if (h == IntPtr.Zero)
+            {
+                Log?.Invoke($"branch probe: OpenThread failed on tid {tid} (error {Marshal.GetLastWin32Error()})");
+                return true;
+            }
             try
             {
                 using var ctx = ThreadContext.Capture(h, _targetIsWow64);
-                if (ctx == null) return false;
+                if (ctx == null)
+                {
+                    Log?.Invoke($"branch probe: GetThreadContext failed on tid {tid} (error {Marshal.GetLastWin32Error()})");
+                    return true;
+                }
 
                 ulong hit = ctx.Dr6 & _armedProbeMask;
                 if (hit == 0) return false; // not one of ours
@@ -733,7 +760,9 @@ namespace Cda.Core.Engine
 
                 ctx.Dr6 = 0;                              // acknowledge
                 ctx.EFlags |= ThreadContext.ResumeFlag;   // step over the instruction once
-                return ctx.Apply(h);
+                if (!ctx.Apply(h))
+                    Log?.Invoke($"branch probe: SetThreadContext failed on tid {tid} (error {Marshal.GetLastWin32Error()})");
+                return true;
             }
             finally { NativeMethods.CloseHandle(h); }
         }
@@ -887,6 +916,7 @@ namespace Cda.Core.Engine
                 }
                 map = new ModuleMap(mods);
                 dlg = DialogApiScanner.Discover(probe, map);
+                if (dlg.Functions.Count > 0) _dialogHostSeen = true;
             }
 
             var fresh = new List<TracedFunction>();
@@ -984,7 +1014,7 @@ namespace Cda.Core.Engine
             if (process.ReadMemory(baseAddr, hdr) < hdr.Length) return 0;
             if (hdr[0] != (byte)'M' || hdr[1] != (byte)'Z') return 0;
             int e = BitConverter.ToInt32(hdr, 0x3C);
-            if (e <= 0 || e + 24 + 60 > hdr.Length) return 0;
+            if (e <= 0 || e > hdr.Length - (24 + 60)) return 0;
             if (hdr[e] != (byte)'P' || hdr[e + 1] != (byte)'E') return 0;
             return BitConverter.ToUInt32(hdr, e + 24 + 56); // OptionalHeader.SizeOfImage
         }

@@ -58,6 +58,7 @@ namespace Cda.Core.Engine
         private TargetProcess? _reader;        // read-only handle for stack/return reads
         private bool _firstHit;
         private bool _initialBreakpointSeen;
+        private int _exitNotified;
         private readonly Dictionary<uint, DebugRegisterState> _priorDebugState = new();
 
         private readonly long _t0 = Stopwatch.GetTimestamp();
@@ -87,7 +88,8 @@ namespace Cda.Core.Engine
         public void Dispose()
         {
             Stop();
-            WaitForExit(Timeout.Infinite);
+            if (!WaitForExit(5000))
+                Log?.Invoke("hardware bp loop did not exit within 5s; abandoning it.");
         }
 
         /// <summary>
@@ -99,6 +101,12 @@ namespace Cda.Core.Engine
         public bool WaitForExit(int ms) =>
             _thread == null || ReferenceEquals(Thread.CurrentThread, _thread) || _thread.Join(ms);
 
+        private void NotifyTargetExited()
+        {
+            if (Interlocked.Exchange(ref _exitNotified, 1) == 0)
+                TargetExited?.Invoke();
+        }
+
         // The whole debugger lifecycle runs on this one thread: DebugActiveProcess,
         // every WaitForDebugEvent/ContinueDebugEvent, and the detach must all be
         // issued by the same thread that attached.
@@ -107,7 +115,7 @@ namespace Cda.Core.Engine
             if (_addrs.Length == 0)
             {
                 Log?.Invoke("hardware bp: no function addresses to watch.");
-                TargetExited?.Invoke();
+                NotifyTargetExited();
                 return;
             }
 
@@ -120,7 +128,7 @@ namespace Cda.Core.Engine
                 Log?.Invoke($"hardware bp: DebugActiveProcess failed (error {err}). The target may be protected, " +
                             "already being debugged, or running at higher integrity — try launching CDA as administrator.");
                 _reader?.Dispose(); _reader = null;
-                TargetExited?.Invoke();
+                NotifyTargetExited();
                 return;
             }
             // Detaching (or this process dying) must NOT kill the target.
@@ -171,6 +179,10 @@ namespace Cda.Core.Engine
                             ArmThread(Marshal.ReadIntPtr(evt, U), evtTid);
                             break;
 
+                        case NativeMethods.LOAD_DLL_DEBUG_EVENT:
+                            CloseHandleSafe(Marshal.ReadIntPtr(evt, U));
+                            break;
+
                         case NativeMethods.EXIT_THREAD_DEBUG_EVENT:
                             _priorDebugState.Remove(evtTid);
                             break;
@@ -197,7 +209,7 @@ namespace Cda.Core.Engine
                             Flush(pending);
                             _priorDebugState.Clear();
                             Log?.Invoke("hardware bp: target exited.");
-                            TargetExited?.Invoke();
+                            NotifyTargetExited();
                             return;
                     }
 
@@ -225,6 +237,7 @@ namespace Cda.Core.Engine
             {
                 Marshal.FreeHGlobal(evt);
                 _reader?.Dispose(); _reader = null;
+                NotifyTargetExited();
             }
         }
 
@@ -347,7 +360,8 @@ namespace Cda.Core.Engine
 
                 ctx.Dr6 = 0;                          // acknowledge
                 ctx.EFlags |= ThreadContextX64.ResumeFlag; // step over the entry once
-                if (!ctx.Apply(h)) return false;
+                if (!ctx.Apply(h))
+                    Log?.Invoke($"hardware bp: SetThreadContext failed on tid {tid} (error {Marshal.GetLastWin32Error()}).");
                 pending.Add(record);
                 if (!_firstHit) { _firstHit = true; Log?.Invoke("hardware bp: first hit recorded — capturing."); }
                 return true;

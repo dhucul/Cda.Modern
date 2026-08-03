@@ -510,8 +510,10 @@ namespace Cda.Core.Pe
                 int iatOff = RvaToOffset(firstThunk);
                 if (lookupOff < 0 || iatOff < 0) continue;
 
-                int maxThunks = (_data.Length - lookupOff) / ptr;
-                for (int t = 0; t < maxThunks; t++)
+                const int MaxThunksPerDescriptor = 65_536;
+                const int MaxImportsTotal = 500_000;
+                int maxThunks = Math.Min((_data.Length - lookupOff) / ptr, MaxThunksPerDescriptor);
+                for (int t = 0; t < maxThunks && result.Count < MaxImportsTotal; t++)
                 {
                     int thunkOff = lookupOff + t * ptr;
                     ulong thunk = Is64Bit ? U64(thunkOff) : U32(thunkOff);

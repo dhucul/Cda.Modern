@@ -22,7 +22,7 @@ namespace Cda.App.UI
     /// </summary>
     public partial class CallListView : UserControl
     {
-        public sealed class CallRow
+        public sealed class CallRow : INotifyPropertyChanged
         {
             public string Seq { get; set; } = "";       // display text (also searched)
             public long SeqNum { get; set; }             // numeric sort key for the "#" column
@@ -30,13 +30,30 @@ namespace Cda.App.UI
             public string Source { get; set; } = "";
             public string Dest { get; set; } = "";
             public string Args { get; set; } = "";
-            public string Return { get; set; } = "";
+            public string Return { get; private set; } = "";
             public string Strings { get; set; } = "";          // single line, for the grid column
             public string StringsMultiline { get; set; } = ""; // one per line, for the detail panel
-            public bool HasReturn { get; set; }
+            public bool HasReturn { get; private set; }
             public bool HasStrings { get; set; }
             public bool Bookmarked { get; set; }
             public CallRecord Record { get; set; } = null!;
+
+            public event PropertyChangedEventHandler? PropertyChanged;
+
+            public void SetReturn(string value)
+            {
+                bool hasReturn = value.Length != 0;
+                if (Return != value)
+                {
+                    Return = value;
+                    PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Return)));
+                }
+                if (HasReturn != hasReturn)
+                {
+                    HasReturn = hasReturn;
+                    PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(HasReturn)));
+                }
+            }
         }
 
         // WPF's ObservableCollection raises one CollectionChanged event per Add.
@@ -149,10 +166,10 @@ namespace Cda.App.UI
         /// </summary>
         public bool SelectRecord(CallRecord record)
         {
-            FollowTail.IsChecked = false;
             for (int i = 0; i < _rows.Count; i++)
             {
                 if (!ReferenceEquals(_rows[i].Record, record)) continue;
+                FollowTail.IsChecked = false;
                 Select(i);
                 return true;
             }
@@ -224,7 +241,8 @@ namespace Cda.App.UI
 
             // Don't fight an active filter/bookmark view by scrolling to a row
             // that may be hidden; tailing resumes when the filter is cleared.
-            if (FollowTail.IsChecked == true && _rows.Count > 0 && _filterText.Length == 0 && !_bookmarkedOnly)
+            if (FollowTail.IsChecked == true && _rows.Count > 0 && _filterText.Length == 0 && !_bookmarkedOnly &&
+                (_view == null || _view.SortDescriptions.Count == 0))
                 Grid.ScrollIntoView(_rows[_rows.Count - 1]);
         }
 
@@ -313,8 +331,21 @@ namespace Cda.App.UI
         {
             _maxRows = (int.TryParse(CapBox.Text, out int n) && n > 0) ? n : 0;
             if (Header == null) return; // a change before the view is fully built
+            UpdateHeader();
+        }
+
+        private void OnCapCommitted(object sender, RoutedEventArgs e)
+        {
             TrimToCap();
             UpdateHeader();
+        }
+
+        private void OnCapKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key != Key.Enter) return;
+            OnCapCommitted(sender, e);
+            Keyboard.ClearFocus();
+            e.Handled = true;
         }
 
         private CallRow ToRow(CallRecord r, long seq)
@@ -341,7 +372,7 @@ namespace Cda.App.UI
 
             string ret = FormatReturn(r);
 
-            return new CallRow
+            var row = new CallRow
             {
                 Seq = seq.ToString(),
                 SeqNum = seq,
@@ -349,13 +380,13 @@ namespace Cda.App.UI
                 Source = Describe(r.Source),
                 Dest = DescribeCallee(r.Destination, name),
                 Args = FormatArgs(r, name, strByArg),
-                Return = ret,
                 Strings = strs.ToString(),
                 StringsMultiline = strsMulti.ToString(),
-                HasReturn = ret.Length > 0,
                 HasStrings = strs.Length > 0,
                 Record = r,
             };
+            row.SetReturn(ret);
+            return row;
         }
 
         /// <summary>
@@ -365,15 +396,11 @@ namespace Cda.App.UI
         /// </summary>
         public void RefreshCompletedReturns()
         {
-            bool changed = false;
             foreach (var row in _rows)
             {
                 if (row.HasReturn || !row.Record.HasReturned) continue;
-                row.Return = FormatReturn(row.Record);
-                row.HasReturn = row.Return.Length != 0;
-                changed = true;
+                row.SetReturn(FormatReturn(row.Record));
             }
-            if (changed) _view?.Refresh();
         }
 
         // Format the argument list. With a known Win32 signature, each captured

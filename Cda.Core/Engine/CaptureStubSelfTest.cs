@@ -26,7 +26,7 @@ namespace Cda.Core.Engine
             const int argCount = 4;
             int recordSize = CaptureStub.RecordSize(argCount);
 
-            var mem = new LocalCodeMemory();
+            using var mem = new LocalCodeMemory();
             var arch = CpuArchitectures.For(is64);
 
             var buffer = CaptureBuffer.Create(mem, requestedSlots: 256, recordSize: recordSize);
@@ -45,6 +45,9 @@ namespace Cda.Core.Engine
             try { hook = InlineHook.Install(arch, mem, func, stub); }
             catch (Exception ex) { return "FAIL: hook install — " + ex.Message; }
 
+            bool removed = false;
+            try
+            {
             byte[] stubBytes;
             try
             {
@@ -74,6 +77,7 @@ namespace Cda.Core.Engine
             GC.KeepAlive(fn);
 
             hook.Remove();
+            removed = true;
 
             byte[] data = buffer.DrainSince(mem, ref readSeq, out _);
             var records = RingBufferReader.Decode(data, recordSize, qpcBase: 0, qpcFrequency: 1.0);
@@ -88,6 +92,12 @@ namespace Cda.Core.Engine
 
             return $"PASS ({arch.Name}): captured {records.Count} calls into the ring buffer · " +
                    $"dest=0x{func:X} · {records[0].IntegerArgs.Length} args/record · {recordSize}-byte records.";
+            }
+            finally
+            {
+                if (!removed)
+                    try { hook.Remove(); } catch { }
+            }
         }
     }
 }

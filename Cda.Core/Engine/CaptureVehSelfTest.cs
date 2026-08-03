@@ -26,7 +26,7 @@ namespace Cda.Core.Engine
             if (!Environment.Is64BitProcess)
                 return "SKIP (x86: return-address redirection doesn't disturb chain-based SEH; no handler needed).";
 
-            var mem = new LocalCodeMemory();
+            using var mem = new LocalCodeMemory();
             int scan = 0x800000; // 8 MB, matches production
 
             // Real return slot for the in-range context, seeded with a stand-in for the

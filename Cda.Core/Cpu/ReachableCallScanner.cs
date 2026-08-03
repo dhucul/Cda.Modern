@@ -73,7 +73,8 @@ namespace Cda.Core.Cpu
 
             var visited = new HashSet<ulong>();
             long scaledBudget = (long)maxEdges * 256;
-            int instructionBudget = (int)Math.Min(10_000_000L, Math.Max(100_000L, scaledBudget));
+            const long MaxVisitedInstructions = 2_000_000L;
+            int instructionBudget = (int)Math.Min(MaxVisitedInstructions, Math.Max(100_000L, scaledBudget));
             int instructions = 0;
 
             byte[] window = new byte[ReadWindow];

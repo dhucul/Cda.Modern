@@ -409,6 +409,12 @@ namespace Cda.Core.Process
             string? appName, string? cmdLine, uint creationFlags, string? workDir,
             bool disableAslr, bool hideWindow, out PROCESS_INFORMATION pi)
         {
+            int lastError = 0;
+            bool Remember(bool result)
+            {
+                lastError = result ? 0 : Marshal.GetLastWin32Error();
+                return result;
+            }
             int dwFlags = hideWindow ? (int)STARTF_USESHOWWINDOW : 0;
             short wShow = hideWindow ? SW_HIDE : (short)0;
             if (hideWindow) creationFlags |= CREATE_NO_WINDOW;
@@ -446,7 +452,7 @@ namespace Cda.Core.Process
                 InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
                 attrList = Marshal.AllocHGlobal(size);
                 if (!InitializeProcThreadAttributeList(attrList, 1, 0, ref size))
-                    return LaunchPlain(out pi);
+                    return Remember(LaunchPlain(out pi));
                 listInited = true; // only now is the list safe to Delete
 
                 ulong policy = PROCESS_CREATION_MITIGATION_POLICY_BOTTOM_UP_ASLR_ALWAYS_OFF
@@ -459,7 +465,7 @@ namespace Cda.Core.Process
                 // does — both buffers are freed in the finally, after the call).
                 if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
                         policyBuf, (IntPtr)sizeof(ulong), IntPtr.Zero, IntPtr.Zero))
-                    return LaunchPlain(out pi);
+                    return Remember(LaunchPlain(out pi));
 
                 var six = new STARTUPINFOEX
                 {
@@ -471,9 +477,9 @@ namespace Cda.Core.Process
                     },
                     lpAttributeList = attrList,
                 };
-                return CreateProcessW(appName, cmdLine, IntPtr.Zero, IntPtr.Zero, false,
+                return Remember(CreateProcessW(appName, cmdLine, IntPtr.Zero, IntPtr.Zero, false,
                     creationFlags | EXTENDED_STARTUPINFO_PRESENT, IntPtr.Zero, workDir,
-                    ref six, out pi);
+                    ref six, out pi));
             }
             finally
             {
@@ -482,6 +488,7 @@ namespace Cda.Core.Process
                 if (listInited) DeleteProcThreadAttributeList(attrList);
                 if (attrList != IntPtr.Zero) Marshal.FreeHGlobal(attrList);
                 if (policyBuf != IntPtr.Zero) Marshal.FreeHGlobal(policyBuf);
+                if (lastError != 0) Marshal.SetLastPInvokeError(lastError);
             }
         }
 

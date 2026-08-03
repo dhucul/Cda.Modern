@@ -13,6 +13,7 @@ namespace Cda.Core.Process
     {
         private IntPtr _process;
         private bool _suspended;
+        public bool ResumeFailed { get; private set; }
 
         public ThreadSuspender(int pid)
         {
@@ -46,18 +47,16 @@ namespace Cda.Core.Process
             if (_suspended)
             {
                 int status = NativeMethods.NtResumeProcess(_process);
-                if (status != 0)
+                for (int retry = 0; status != 0 && retry < 3; retry++)
                 {
-                    uint error = NativeMethods.RtlNtStatusToDosError(status);
-                    // Keep the process handle and the finalizer armed so a later
-                    // retry can still resume the target.
-                    throw new Win32Exception(unchecked((int)error),
-                        $"Could not resume target process (NTSTATUS 0x{status:X8}).");
+                    System.Threading.Thread.Sleep(5);
+                    status = NativeMethods.NtResumeProcess(_process);
                 }
+                ResumeFailed = status != 0;
                 _suspended = false;
             }
 
-            NativeMethods.CloseHandle(_process);
+            try { NativeMethods.CloseHandle(_process); } catch { }
             _process = IntPtr.Zero;
             GC.SuppressFinalize(this);
         }

@@ -39,6 +39,7 @@ namespace Cda.Core.Engine
         private IntPtr _device = InvalidHandle;
         private IntPtr _hProcess = IntPtr.Zero;
         private bool _tracing;
+        private readonly object _handleGate = new();
 
         public bool IsOpen => _device != InvalidHandle && _device != IntPtr.Zero;
 
@@ -164,22 +165,24 @@ namespace Cda.Core.Engine
             if (size < 16 || size > 512UL * 1024 * 1024) return null;
 
             byte[] trace;
-            try { trace = GC.AllocateUninitializedArray<byte>(checked((int)size)); }
+            try { trace = new byte[checked((int)size)]; }
             catch (OutOfMemoryException) { return null; }
             bool ok = NativeMethods.DeviceIoControl(_device, IOCTL_IPT_READ_TRACE,
-                Input(TypeGetProcessTrace, FillSizeTrace), 0x30, trace, (uint)size, out _, IntPtr.Zero);
-            return ok ? trace : null;
+                Input(TypeGetProcessTrace, FillSizeTrace), 0x30, trace, (uint)size, out uint returned, IntPtr.Zero);
+            if (!ok || returned == 0) return null;
+            return returned < size ? trace.AsSpan(0, (int)returned).ToArray() : trace;
         }
 
         public void Stop()
         {
-            if (_tracing && _hProcess != IntPtr.Zero)
-                Request(Input(TypeStopProcessTrace, b => BitConverter.GetBytes((ulong)_hProcess).CopyTo(b, 0x10)), null);
-            _tracing = false;
-            if (_hProcess != IntPtr.Zero)
+            lock (_handleGate)
             {
-                NativeMethods.CloseHandle(_hProcess);
+                if (_tracing && _hProcess != IntPtr.Zero)
+                    Request(Input(TypeStopProcessTrace, b => BitConverter.GetBytes((ulong)_hProcess).CopyTo(b, 0x10)), null);
+                _tracing = false;
+                IntPtr h = _hProcess;
                 _hProcess = IntPtr.Zero;
+                if (h != IntPtr.Zero) NativeMethods.CloseHandle(h);
             }
         }
 
@@ -188,17 +191,19 @@ namespace Cda.Core.Engine
         /// <see cref="PtDecoder"/> to disassemble the executed code path. 0 on failure.</summary>
         public int ReadMemory(ulong addr, byte[] buf)
         {
-            if (_hProcess == IntPtr.Zero) return 0;
-            NativeMethods.ReadProcessMemory(
-                _hProcess, (IntPtr)(long)addr, buf, (IntPtr)buf.Length, out IntPtr read);
-            long count = read.ToInt64();
-            return count <= 0 ? 0 : (int)Math.Min(count, buf.Length);
+            lock (_handleGate)
+            {
+                if (_hProcess == IntPtr.Zero) return 0;
+                NativeMethods.ReadProcessMemory(
+                    _hProcess, (IntPtr)(long)addr, buf, (IntPtr)buf.Length, out IntPtr read);
+                long count = read.ToInt64();
+                return count <= 0 ? 0 : (int)Math.Min(count, buf.Length);
+            }
         }
 
         public void Dispose()
         {
             try { Stop(); } catch { /* best effort */ }
-            if (_hProcess != IntPtr.Zero) { NativeMethods.CloseHandle(_hProcess); _hProcess = IntPtr.Zero; }
             if (IsOpen) { NativeMethods.CloseHandle(_device); _device = InvalidHandle; }
         }
     }

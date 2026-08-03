@@ -24,10 +24,14 @@ namespace Cda.Core.Memory
     {
         private readonly FileStream _file;
         private readonly MemoryMappedFile _map;
-        private readonly MemoryMappedViewAccessor _view;
-        private readonly long _viewOffset; // PointerOffset slack from view alignment
+        private MemoryMappedViewAccessor _view;
+        private long _viewOffset; // PointerOffset slack from view alignment
+        private long _windowStart;
+        private long _windowLength;
         private readonly long _length;
+        private readonly object _viewGate = new();
         private bool _disposed;
+        private const long WindowBytes = 64L * 1024 * 1024;
 
         public MappedFileMemorySource(string path, bool is64Bit)
         {
@@ -51,7 +55,9 @@ namespace Cda.Core.Memory
                 _map = MemoryMappedFile.CreateFromFile(
                     _file, mapName: null, capacity: 0,
                     MemoryMappedFileAccess.Read, HandleInheritability.None, leaveOpen: true);
-                _view = _map.CreateViewAccessor(0, _length, MemoryMappedFileAccess.Read);
+                _windowStart = 0;
+                _windowLength = Math.Min(_length, WindowBytes);
+                _view = _map.CreateViewAccessor(_windowStart, _windowLength, MemoryMappedFileAccess.Read);
                 _viewOffset = _view.PointerOffset;
             }
             catch
@@ -74,31 +80,58 @@ namespace Cda.Core.Memory
         {
             if (_disposed || buffer.Length == 0 || address >= (ulong)_length) return 0;
 
-            long rel = (long)address;
-            int n = (int)Math.Min((long)buffer.Length, _length - rel);
-            if (n <= 0) return 0;
+            lock (_viewGate)
+            {
+                if (_disposed) return 0;
+                long rel = (long)address;
+                int total = 0;
+                while (total < buffer.Length && rel < _length)
+                {
+                    EnsureWindow(rel);
+                    int n = (int)Math.Min(
+                        Math.Min((long)buffer.Length - total, _length - rel),
+                        _windowStart + _windowLength - rel);
+                    if (n <= 0) break;
 
-            var handle = _view.SafeMemoryMappedViewHandle;
-            byte* p = null;
-            handle.AcquirePointer(ref p);
-            try
-            {
-                new ReadOnlySpan<byte>(p + _viewOffset + rel, n).CopyTo(buffer);
+                    var handle = _view.SafeMemoryMappedViewHandle;
+                    byte* p = null;
+                    handle.AcquirePointer(ref p);
+                    try
+                    {
+                        new ReadOnlySpan<byte>(p + _viewOffset + (rel - _windowStart), n)
+                            .CopyTo(buffer.Slice(total));
+                    }
+                    finally
+                    {
+                        if (p != null) handle.ReleasePointer();
+                    }
+                    total += n;
+                    rel += n;
+                }
+                return total;
             }
-            finally
-            {
-                if (p != null) handle.ReleasePointer();
-            }
-            return n;
+        }
+
+        private void EnsureWindow(long offset)
+        {
+            if (offset >= _windowStart && offset < _windowStart + _windowLength) return;
+            _view.Dispose();
+            _windowStart = offset;
+            _windowLength = Math.Min(_length - _windowStart, WindowBytes);
+            _view = _map.CreateViewAccessor(_windowStart, _windowLength, MemoryMappedFileAccess.Read);
+            _viewOffset = _view.PointerOffset;
         }
 
         public void Dispose()
         {
-            if (_disposed) return;
-            _disposed = true;
-            _view.Dispose();
-            _map.Dispose();
-            _file.Dispose();
+            lock (_viewGate)
+            {
+                if (_disposed) return;
+                _disposed = true;
+                try { _view.Dispose(); } catch { }
+                try { _map.Dispose(); } catch { }
+                try { _file.Dispose(); } catch { }
+            }
         }
     }
 }

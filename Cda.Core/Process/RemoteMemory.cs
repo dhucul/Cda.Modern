@@ -20,12 +20,14 @@ namespace Cda.Core.Process
     {
         private readonly TargetProcess _process;
         private readonly System.Collections.Generic.List<(IntPtr addr, IntPtr size)> _allocs = new();
+        private bool _disposed;
 
         public RemoteMemory(TargetProcess process) => _process = process;
 
         /// <summary>Commit a block in the target. <paramref name="executable"/> picks RWX vs RW.</summary>
         public ulong Allocate(int size, bool executable)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             if (size <= 0) throw new ArgumentOutOfRangeException(nameof(size));
             uint protect = executable ? NativeMethods.PAGE_EXECUTE_READWRITE : NativeMethods.PAGE_READWRITE;
             IntPtr p = NativeMethods.VirtualAllocEx(
@@ -73,6 +75,7 @@ namespace Cda.Core.Process
         /// </summary>
         public ulong AllocateNear(int size, ulong anchor)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             if (size <= 0 || size > int.MaxValue - 15)
                 throw new ArgumentOutOfRangeException(nameof(size));
             int need = (size + 15) & ~15;
@@ -114,6 +117,22 @@ namespace Cda.Core.Process
             // far allocation. The caller still succeeds — the x64 detour just uses
             // the 14-byte indirect form, as it did before this path existed.
             return Allocate(size, executable: true);
+        }
+
+        /// <summary>Rewind a failed tail allocation in a shared near block.</summary>
+        public bool ReleaseNear(ulong address, int size)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (size <= 0 || size > int.MaxValue - 15) return false;
+            ulong need = (ulong)((size + 15) & ~15);
+            foreach (var block in _nearBlocks)
+            {
+                if (address < block.Base || address > ulong.MaxValue - need ||
+                    address + need != block.Next) continue;
+                block.Next = address;
+                return true;
+            }
+            return false;
         }
 
         private static bool InReach(ulong anchor, ulong addr)
@@ -190,6 +209,7 @@ namespace Cda.Core.Process
 
         public void Write(ulong address, ReadOnlySpan<byte> data)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             int n = _process.WriteMemory(address, data);
             if (n != data.Length)
                 throw new InvalidOperationException(
@@ -199,6 +219,7 @@ namespace Cda.Core.Process
 
         public uint Protect(ulong address, int size, uint protect)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             if (!NativeMethods.VirtualProtectEx(_process.Handle, NativeMethods.ToIntPtr(address),
                     (IntPtr)size, protect, out uint old))
                 throw new InvalidOperationException(
@@ -210,6 +231,7 @@ namespace Cda.Core.Process
         /// <summary>Flush the CPU instruction cache after writing code (mandatory on patches).</summary>
         public void FlushCode(ulong address, int size)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             if (!NativeMethods.FlushInstructionCache(_process.Handle,
                     NativeMethods.ToIntPtr(address), (IntPtr)size))
                 throw new System.ComponentModel.Win32Exception(
@@ -219,9 +241,12 @@ namespace Cda.Core.Process
 
         public void Dispose()
         {
+            if (_disposed) return;
+            _disposed = true;
             foreach (var (addr, _) in _allocs)
                 NativeMethods.VirtualFreeEx(_process.Handle, addr, IntPtr.Zero, NativeMethods.MEM_RELEASE);
             _allocs.Clear();
+            _nearBlocks.Clear();
         }
     }
 }

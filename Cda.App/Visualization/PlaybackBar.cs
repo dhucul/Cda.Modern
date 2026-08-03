@@ -43,6 +43,9 @@ namespace Cda.App.Visualization
         private double _selStart = double.NaN, _selEnd = double.NaN;
 
         private bool _draggingCursor, _draggingSelection;
+        private int[] _binCache = Array.Empty<int>();
+        private int _binMax = 1, _binCount, _binRecords = -1;
+        private double _binViewStart = double.NaN, _binViewEnd = double.NaN;
 
         private static readonly Brush Bg = Frozen(Color.FromRgb(0x21, 0x27, 0x2F));
         private static readonly Brush Density = Frozen(Color.FromArgb(0xFF, 0x60, 0x90, 0xD4));
@@ -51,6 +54,8 @@ namespace Cda.App.Visualization
         private static readonly Brush SelectionBand = Frozen(Color.FromArgb(0x33, 0x60, 0x90, 0xD4));
         private static readonly Pen AxisPen = FrozenPen(Color.FromArgb(0x55, 0x8A, 0x95, 0xA9), 1.0);
         private static readonly Pen FocusPen = FrozenPen(Color.FromArgb(0x99, 0x60, 0x90, 0xD4), 1.0);
+        private static readonly Typeface AxisFace = new("Segoe UI");
+        private static readonly Brush AxisText = Frozen(Color.FromArgb(0xAA, 0x8A, 0x95, 0xA9));
 
         public PlaybackBar()
         {
@@ -70,6 +75,7 @@ namespace Cda.App.Visualization
             _viewStart = _datasetStart;
             _viewEnd = _datasetEnd;
             _cursorTime = (_datasetStart + _datasetEnd) * 0.5; // start mid-trace, over activity
+            _binRecords = -1;
             RaiseWindow();
             InvalidateVisual();
         }
@@ -132,9 +138,11 @@ namespace Cda.App.Visualization
 
         protected override void OnMouseWheel(MouseWheelEventArgs e)
         {
+            double dataSpan = _datasetEnd - _datasetStart;
+            if (dataSpan <= 0) { base.OnMouseWheel(e); return; }
             double focus = Math.Clamp(XToTime(e.GetPosition(this).X), _viewStart, _viewEnd);
             double factor = Math.Pow(0.9, e.Delta / 120.0);
-            double newSpan = Math.Clamp(ViewSpan * factor, 1e-6, _datasetEnd - _datasetStart);
+            double newSpan = Math.Clamp(ViewSpan * factor, Math.Min(1e-6, dataSpan), dataSpan);
 
             double left = focus - (focus - _viewStart) * (newSpan / ViewSpan);
             _viewStart = left;
@@ -220,16 +228,26 @@ namespace Cda.App.Visualization
         {
             if (_records.Count == 0) return;
             int bins = Math.Max(1, (int)w);
-            var counts = new int[bins];
-            int max = 1;
-            foreach (var r in _records)
+            if (bins != _binCount || _binRecords != _records.Count ||
+                _binViewStart != _viewStart || _binViewEnd != _viewEnd)
             {
-                if (r.Time < _viewStart || r.Time > _viewEnd) continue;
-                int b = (int)(TimeToX(r.Time));
-                if (b < 0) b = 0; else if (b >= bins) b = bins - 1;
-                counts[b]++;
-                if (counts[b] > max) max = counts[b];
+                _binCache = new int[bins];
+                _binCount = bins;
+                _binRecords = _records.Count;
+                _binViewStart = _viewStart;
+                _binViewEnd = _viewEnd;
+                _binMax = 1;
+                foreach (var r in _records)
+                {
+                    if (r.Time < _viewStart || r.Time > _viewEnd) continue;
+                    int b = (int)TimeToX(r.Time);
+                    if (b < 0) b = 0; else if (b >= bins) b = bins - 1;
+                    _binCache[b]++;
+                    if (_binCache[b] > _binMax) _binMax = _binCache[b];
+                }
             }
+            int[] counts = _binCache;
+            int max = _binMax;
             double baseY = h - 16;
             for (int x = 0; x < bins; x++)
             {
@@ -262,7 +280,6 @@ namespace Cda.App.Visualization
         {
             dc.DrawLine(AxisPen, new Point(0, h - 16), new Point(w, h - 16));
             int ticks = 8;
-            var tf = new Typeface("Segoe UI");
             double dpi = VisualTreeHelper.GetDpi(this).PixelsPerDip;
             for (int i = 0; i <= ticks; i++)
             {
@@ -271,8 +288,7 @@ namespace Cda.App.Visualization
                 double t = XToTime(x);
                 var ft = new FormattedText(t.ToString("0.000") + "s",
                     System.Globalization.CultureInfo.CurrentUICulture,
-                    FlowDirection.LeftToRight, tf, 9,
-                    new SolidColorBrush(Color.FromArgb(0xAA, 0x8A, 0x95, 0xA9)), dpi);
+                    FlowDirection.LeftToRight, AxisFace, 9, AxisText, dpi);
                 double tx = Math.Min(Math.Max(0, x - ft.Width / 2), w - ft.Width);
                 dc.DrawText(ft, new Point(tx, h - 11));
             }

@@ -141,6 +141,7 @@ namespace Cda.App.UI
         public void LoadFromDataset(TraceDataset data)
         {
             var map = new ModuleMap(data.Modules);
+            _view.SortDescriptions.Clear();
             _rows.Clear();
             _byAddress.Clear();
             foreach (var fn in data.Functions)
@@ -152,13 +153,13 @@ namespace Cda.App.UI
             _countMode = CountFilterMode.All; // a fresh dataset always starts fully visible
             SetLiveFiltering(false);          // snapshot default until "Hide 0-hit" is applied
             _firstCallOrderNext = 0;          // ranks restart with the new dataset
-            _view.SortDescriptions.Clear();   // drop any call-order/column sort; show natural order
             _view.Refresh();
             UpdateMatchInfo();
         }
 
         public void LoadFunctions(IEnumerable<TracedFunction> functions, ModuleMap? map = null)
         {
+            _view.SortDescriptions.Clear();
             _rows.Clear();
             _byAddress.Clear();
             foreach (var fn in functions)
@@ -170,7 +171,6 @@ namespace Cda.App.UI
             _countMode = CountFilterMode.All; // a fresh dataset always starts fully visible
             SetLiveFiltering(false);          // snapshot default until "Hide 0-hit" is applied
             _firstCallOrderNext = 0;          // ranks restart with the new dataset
-            _view.SortDescriptions.Clear();   // drop any call-order/column sort; show natural order
             _view.Refresh();
             UpdateMatchInfo();
         }

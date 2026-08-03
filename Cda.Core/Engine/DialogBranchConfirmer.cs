@@ -56,12 +56,14 @@ namespace Cda.Core.Engine
             public int BestDrIndex = int.MaxValue;                   // nearest routing-in seen (small = nearer)
             public Confirmation? Best;
             public int Hits;                                         // candidate #DBs observed (give-up backstop)
+            public long ArmedAtMs;
         }
 
         // If the nearest candidate never routes in, the probe would hold its DR slots forever;
         // after this many candidate hits without reaching the nearest gate, give up and free
         // the slots for other call sites (the best-so-far confirmation, if any, already stands).
         private const int GiveUpHits = 500;
+        private const long GiveUpMs = 5000;
 
         // Keyed by call site (the candidates are unique to one code path, so no thread id is
         // needed to correlate). Accessed only from the debug-loop thread.
@@ -89,7 +91,11 @@ namespace Cda.Core.Engine
                 byIdx.Add(c);
             }
             if (arm.Count == 0) return arm;
-            _byCallSite[callSiteKey] = new State { ByDrIndex = byIdx.ToArray() };
+            _byCallSite[callSiteKey] = new State
+            {
+                ByDrIndex = byIdx.ToArray(),
+                ArmedAtMs = Environment.TickCount64,
+            };
             return arm;
         }
 
@@ -138,7 +144,8 @@ namespace Cda.Core.Engine
         /// </summary>
         public bool IsResolved(ulong callSiteKey)
             => _byCallSite.TryGetValue(callSiteKey, out var st) &&
-               (st.BestDrIndex == 0 || st.Hits >= GiveUpHits);
+               (st.BestDrIndex == 0 || st.Hits >= GiveUpHits ||
+                Environment.TickCount64 - st.ArmedAtMs >= GiveUpMs);
 
         public void Forget(ulong callSiteKey) => _byCallSite.Remove(callSiteKey);
 

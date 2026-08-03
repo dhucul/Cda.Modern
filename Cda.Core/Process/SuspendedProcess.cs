@@ -19,6 +19,7 @@ namespace Cda.Core.Process
         public int Pid { get; }
         private IntPtr _hProcess;
         private IntPtr _hThread;
+        private bool _resumed;
 
         private SuspendedProcess(int pid, IntPtr hProcess, IntPtr hThread)
         {
@@ -141,12 +142,23 @@ namespace Cda.Core.Process
             if (previous == uint.MaxValue)
                 throw new System.ComponentModel.Win32Exception(
                     Marshal.GetLastWin32Error(), "Could not resume the launched target.");
+            _resumed = true;
         }
 
         public void Dispose()
         {
-            if (_hThread != IntPtr.Zero) { NativeMethods.CloseHandle(_hThread); _hThread = IntPtr.Zero; }
-            if (_hProcess != IntPtr.Zero) { NativeMethods.CloseHandle(_hProcess); _hProcess = IntPtr.Zero; }
+            IntPtr thread = System.Threading.Interlocked.Exchange(ref _hThread, IntPtr.Zero);
+            if (!_resumed && thread != IntPtr.Zero)
+            {
+                try { NativeMethods.ResumeThread(thread); } catch { }
+                _resumed = true;
+            }
+            if (thread != IntPtr.Zero) NativeMethods.CloseHandle(thread);
+            IntPtr process = System.Threading.Interlocked.Exchange(ref _hProcess, IntPtr.Zero);
+            if (process != IntPtr.Zero) NativeMethods.CloseHandle(process);
+            GC.SuppressFinalize(this);
         }
+
+        ~SuspendedProcess() => Dispose();
     }
 }

@@ -83,7 +83,7 @@ namespace Cda.Core.Engine
         internal const int CommitBytes = 8;
 
         /// <summary>Per-hook return context laid out in target memory (zero-initialised).</summary>
-        internal const int CtxBusy = 0;     // u32: 0 free, 1 owned
+        internal const int CtxBusy = 0;     // u32: 0 free, 2 claimed, 1 armed
         internal const int CtxOrigRet = 8;  // pointer-sized: real return address
         internal const int CtxCorrId = 16;  // u32: the owning call's correlation id
         internal const int CtxSlotAddr = 24;// pointer-sized: stack address of the overwritten return slot
@@ -415,7 +415,7 @@ namespace Cda.Core.Engine
                 var skip = a.CreateLabel();
                 a.mov(rbx, returnCtxAddress);
                 a.xor(eax, eax);                                  // expected busy = 0
-                a.mov(edx, 1);                                    // desired busy = 1
+                a.mov(edx, 2);                                    // claimed, not yet armed
                 a.@lock.cmpxchg(__dword_ptr[rbx + CtxBusy], edx); // ZF=1 if acquired
                 a.jnz(skip);                                      // busy → do not redirect
                 a.mov(rax, __qword_ptr[rsp + 64]);                // original return address
@@ -424,6 +424,7 @@ namespace Cda.Core.Engine
                 a.mov(__dword_ptr[rbx + CtxCorrId], eax);
                 a.lea(rax, __[rsp + 64]);                         // address of the return slot (for the VEH fixup)
                 a.mov(__qword_ptr[rbx + CtxSlotAddr], rax);
+                a.mov(__dword_ptr[rbx + CtxBusy], 1);             // publish only after the context is complete
                 a.mov(rax, returnStubAddress);
                 a.mov(__qword_ptr[rsp + 64], rax);                // redirect the return
                 a.Label(ref skip);
@@ -516,7 +517,7 @@ namespace Cda.Core.Engine
             for (int i = 1; i < argCount; i++)
                 a.mov(__qword_ptr[rdi + OffArgs + i * 8], 0);
 
-            a.mov(__dword_ptr[rdi + stackCountOff], StackSlots); // snapshot count (content unused for returns)
+            a.mov(__dword_ptr[rdi + stackCountOff], 0);          // return records carry no snapshot
             a.mov(__dword_ptr[rdi + derefCountOff], 0);
 
             a.mov(__dword_ptr[rdi + commitSequenceOff], ecx);
@@ -605,7 +606,7 @@ namespace Cda.Core.Engine
                 a.mov(__dword_ptr[edi + OffArgs + i * 8 + 4], 0);
             }
 
-            a.mov(__dword_ptr[edi + stackCountOff], StackSlots);
+            a.mov(__dword_ptr[edi + stackCountOff], 0);
             a.mov(__dword_ptr[edi + derefCountOff], 0);
 
             a.mov(__dword_ptr[edi + commitSequenceOff], ecx);
@@ -661,8 +662,8 @@ namespace Cda.Core.Engine
             a.jz(done);
             a.Label(ref loop);
             a.mov(r8, __qword_ptr[r10]);              // r8 = ctx address
-            a.cmp(__dword_ptr[r8 + CtxBusy], 0);
-            a.je(next);                               // not an outstanding redirect
+            a.cmp(__dword_ptr[r8 + CtxBusy], 1);
+            a.jne(next);                              // not a fully armed redirect
             a.mov(rax, __qword_ptr[r8 + CtxSlotAddr]);// rax = slot address
             a.cmp(rax, r11);
             a.jb(next);                               // below the fault SP → skip

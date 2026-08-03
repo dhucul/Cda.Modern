@@ -63,6 +63,8 @@ namespace Cda.Core.Engine
         private int _pid;
         private bool _hooked;
         private bool _loaderBpSeen; // the loader breakpoint has been consumed
+        private bool _wow64LoaderBpSeen;
+        private int _exitNotified;
         private bool _attached;
         private CaptureSession? _unclaimedSession;
 
@@ -98,8 +100,16 @@ namespace Cda.Core.Engine
         public void Dispose()
         {
             Stop();
-            WaitForExit(Timeout.Infinite);
-            DisposeUnclaimedSession();
+            if (!WaitForExit(5000))
+                Log?.Invoke("debug load loop did not exit within 5s; abandoning it.");
+            else
+                try { DisposeUnclaimedSession(); } catch { }
+        }
+
+        private void NotifyTargetExited()
+        {
+            if (Interlocked.Exchange(ref _exitNotified, 1) == 0)
+                TargetExited?.Invoke();
         }
 
         private void Run()
@@ -122,6 +132,7 @@ namespace Cda.Core.Engine
                 if (!ok)
                 {
                     Log?.Invoke($"debug launch failed (error {Marshal.GetLastWin32Error()})");
+                    NotifyTargetExited();
                     return;
                 }
                 _pid = (int)pi.dwProcessId;
@@ -194,10 +205,14 @@ namespace Cda.Core.Engine
                             // or the program's own debug-break / anti-tamper on the
                             // patched code); report it with the faulting module+RVA and
                             // hand it back to the program rather than swallowing it.
-                            bool isBp = exCode == NativeMethods.EXCEPTION_BREAKPOINT ||
-                                        exCode == NativeMethods.STATUS_WX86_BREAKPOINT;
-                            bool loaderBp = isBp && !_loaderBpSeen;
-                            if (loaderBp) _loaderBpSeen = true;
+                            bool isNativeBp = exCode == NativeMethods.EXCEPTION_BREAKPOINT;
+                            bool isBp = isNativeBp || exCode == NativeMethods.STATUS_WX86_BREAKPOINT;
+                            bool loaderBp = isNativeBp ? !_loaderBpSeen : (isBp && !_wow64LoaderBpSeen);
+                            if (loaderBp)
+                            {
+                                if (isNativeBp) _loaderBpSeen = true;
+                                else _wow64LoaderBpSeen = true;
+                            }
 
                             if (!loaderBp && (DebugExceptionInfo.IsCrash(exCode) || isBp))
                             {
@@ -217,7 +232,7 @@ namespace Cda.Core.Engine
                                 _attached = false;
                             }
                             Log?.Invoke("host exited.");
-                            TargetExited?.Invoke();
+                            NotifyTargetExited();
                             return;
                     }
 
@@ -243,7 +258,7 @@ namespace Cda.Core.Engine
                 Detach();
                 try { DisposeUnclaimedSession(); }
                 catch (Exception ex) { Log?.Invoke("unclaimed DLL session cleanup failed: " + ex.Message); }
-                finally { Marshal.FreeHGlobal(evt); }
+                finally { Marshal.FreeHGlobal(evt); NotifyTargetExited(); }
             }
         }
 

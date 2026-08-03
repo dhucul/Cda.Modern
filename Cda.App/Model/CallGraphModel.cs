@@ -354,24 +354,20 @@ namespace Cda.App.Model
             for (int i = 0; i < records.Count; i++)
             {
                 var r = records[i];
+                int s = ResolveNode(r.Source);
                 if (r.Destination == center)
                 {
                     // Inbound: someone called the centre. Attribute it to the
                     // caller's enclosing function (resolved from the return address).
-                    int s = ResolveNode(r.Source);
                     ulong key = s >= 0 ? _nodes[s].Address : r.Source;
                     callers[key] = callers.TryGetValue(key, out long c) ? c + 1 : 1;
                     nb.TotalIn++;
                 }
-                else
+                if (s >= 0 && _nodes[s].Address == center)
                 {
                     // Outbound: a call whose caller resolves to the centre.
-                    int s = ResolveNode(r.Source);
-                    if (s >= 0 && _nodes[s].Address == center)
-                    {
-                        callees[r.Destination] = callees.TryGetValue(r.Destination, out long c) ? c + 1 : 1;
-                        nb.TotalOut++;
-                    }
+                    callees[r.Destination] = callees.TryGetValue(r.Destination, out long c) ? c + 1 : 1;
+                    nb.TotalOut++;
                 }
             }
 

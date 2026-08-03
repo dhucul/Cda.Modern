@@ -127,9 +127,12 @@ namespace Cda.App.UI
                 foreach (var d in decoded)
                     _lines.Add(new Line(d.Address.ToString("X" + digits), FormatBytes(d.Bytes), d.Text, plain: false));
 
-                if (_lines.Count == 0)
-                    _lines.Add(new Line("", "", "; no decodable instructions at this address", plain: true));
             }
+
+            if (_lines.Count == 0)
+                _lines.Add(new Line("", "", _source == null
+                    ? "; no byte source — open a module or attach to a process"
+                    : "; no decodable instructions at this address", plain: true));
 
             ConfigureScroll();
             _surface.InvalidateVisual();

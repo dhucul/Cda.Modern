@@ -53,6 +53,7 @@ namespace Cda.Core.Engine
         private Thread? _thread;
         private volatile bool _stop;
         private readonly ManualResetEventSlim _ready = new(false);
+        private int _readyDisposed;
         private volatile bool _attachOk;
 
         public DebugCrashWatch(int pid, int stackWords = 256)
@@ -92,7 +93,8 @@ namespace Cda.Core.Engine
         public void Dispose()
         {
             Stop();
-            WaitForExit(Timeout.Infinite);
+            if (WaitForExit(5000) && Interlocked.Exchange(ref _readyDisposed, 1) == 0)
+                _ready.Dispose();
         }
 
         private void Run()

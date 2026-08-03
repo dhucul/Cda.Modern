@@ -28,6 +28,15 @@ namespace Cda.Core.Process
             new(StringComparer.OrdinalIgnoreCase);
         private static readonly object Gate = new();
 
+        static FixedBaseImage()
+        {
+            AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+            {
+                foreach (var entry in OwnedCopies)
+                    try { if (File.Exists(entry.Key)) File.Delete(entry.Key); } catch { }
+            };
+        }
+
         /// <summary>
         /// Write a fixed-base (ASLR-stripped) copy of <paramref name="originalPath"/>
         /// next to it and return the copy's path. If the image already has ASLR off,
@@ -42,6 +51,7 @@ namespace Cda.Core.Process
             lock (Gate)
             {
                 CleanupOwnedCopies(originalPath);
+                CleanupStrayCopies(originalPath);
 
                 string dir = Path.GetDirectoryName(originalPath) ?? ".";
                 string name = Path.GetFileNameWithoutExtension(originalPath);
@@ -87,6 +97,19 @@ namespace Cda.Core.Process
                 }
                 catch { /* locked by a live capture — retain ownership and retry later */ }
             }
+        }
+
+        private static void CleanupStrayCopies(string originalPath)
+        {
+            string? dir = Path.GetDirectoryName(originalPath);
+            if (string.IsNullOrEmpty(dir)) return;
+            string name = Path.GetFileNameWithoutExtension(originalPath);
+            try
+            {
+                foreach (string file in Directory.EnumerateFiles(dir, name + Mid + "*"))
+                    try { File.Delete(file); } catch { }
+            }
+            catch { }
         }
     }
 }

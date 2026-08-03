@@ -41,6 +41,8 @@ namespace Cda.App.Visualization
         private ulong _selected;
         private CallNeighborhood? _nb;
         private DateTime _lastCompute;
+        private int _lastRecordCount = -1;
+        private object? _lastRecordTail;
 
         // When set, the neighbourhood is built from this (the trace diff) rather than
         // the live model; returning null lets the live model take over for a centre
@@ -137,9 +139,16 @@ namespace Cda.App.Visualization
         /// </summary>
         public void RefreshActive()
         {
-            if (_model != null && _selected != 0 &&
+            int recordCount = _model?.Records.Count ?? 0;
+            object? recordTail = recordCount > 0 ? _model!.Records[recordCount - 1] : null;
+            if (_model != null && _selected != 0 && !IsDiffMode &&
+                (recordCount != _lastRecordCount || !ReferenceEquals(recordTail, _lastRecordTail)) &&
                 (DateTime.UtcNow - _lastCompute).TotalMilliseconds > 180)
+            {
+                _lastRecordCount = recordCount;
+                _lastRecordTail = recordTail;
                 Recompute();
+            }
             InvalidateVisual();
         }
 
@@ -155,6 +164,8 @@ namespace Cda.App.Visualization
             CallNeighborhood? nb = _diffBuilder?.Invoke(_selected);
             nb ??= _model?.BuildNeighborhood(_selected);
             _nb = nb;
+            _lastRecordCount = _model?.Records.Count ?? -1;
+            _lastRecordTail = _lastRecordCount > 0 ? _model!.Records[_lastRecordCount - 1] : null;
             _lastCompute = DateTime.UtcNow;
         }
 
@@ -328,8 +339,10 @@ namespace Cda.App.Visualization
             var rects = new List<Rect>(n);
             if (n == 0) return rects;
             double top = pad + 30, bottom = H - pad;
+            if (bottom - top < 8) return rects;
+            n = Math.Min(n, Math.Max(1, (int)((bottom - top) / 14)));
             double slot = (bottom - top) / n;
-            double h = Math.Clamp(slot - 6, 20, 34);
+            double h = Math.Clamp(slot - 6, 8, 34);
             for (int i = 0; i < n; i++)
             {
                 double cy = top + slot * (i + 0.5);

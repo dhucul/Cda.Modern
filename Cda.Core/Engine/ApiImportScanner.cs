@@ -136,6 +136,7 @@ namespace Cda.Core.Engine
                     if (HotPrimitives.Contains(func)) { result.ExcludedHot++; continue; }
 
                     // The loader-resolved entry lives in the bound IAT slot.
+                    if (module.Size != 0 && imp.IatRva >= module.Size) continue;
                     ulong iatVa = module.BaseAddress + imp.IatRva;
                     int n = process.ReadMemory(iatVa, slot);
                     if (n < ptr) continue;
@@ -214,6 +215,7 @@ namespace Cda.Core.Engine
                     string func = imp.ByOrdinal ? "#" + imp.Ordinal : imp.Name!;
                     if (HotPrimitives.Contains(func)) { result.ExcludedHot++; continue; }
 
+                    if (module.Size != 0 && imp.IatRva >= module.Size) continue;
                     ulong slotVa = module.BaseAddress + imp.IatRva;
                     if (!seenSlots.Add(slotVa)) continue; // each slot once
 

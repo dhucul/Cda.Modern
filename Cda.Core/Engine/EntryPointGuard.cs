@@ -229,10 +229,11 @@ namespace Cda.Core.Engine
         {
             int i = Array.BinarySearch(_sortedCandidates, address);
             i = i < 0 ? ~i : i + 1; // first candidate strictly greater than address
+            while (i < _sortedCandidates.Length && _sortedCandidates[i] <= address) i++;
             if (i < _sortedCandidates.Length)
             {
                 ulong gap = _sortedCandidates[i] - address;
-                if (gap > 0 && gap < int.MaxValue) return (int)gap;
+                if (gap < int.MaxValue) return (int)gap;
             }
             return int.MaxValue;
         }

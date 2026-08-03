@@ -229,19 +229,28 @@ namespace Cda.Core.Engine
             var result = new TraceComparisonResult();
             var pairedB = new HashSet<Side>();
 
-            // Pass over A: pair each entry with B by RVA, then by name.
-            foreach (var ea in sideA)
+            var matched = new Side?[sideA.Count];
+            for (int i = 0; i < sideA.Count; i++)
             {
-                Side? eb = null;
+                Side ea = sideA[i];
                 if (bByRva.TryGetValue(ea.RvaKey, out var byRva))
-                    eb = FirstUnpaired(byRva, pairedB);
-                if (eb == null && ea.NameKey != null &&
-                    bByName.TryGetValue(ea.NameKey, out var byName))
-                    eb = FirstUnpaired(byName, pairedB);
-
-                if (eb != null) pairedB.Add(eb);
-                result.Functions.Add(MakeDiff(ea, eb));
+                {
+                    Side? eb = FirstUnpaired(byRva, pairedB);
+                    if (eb != null) { pairedB.Add(eb); matched[i] = eb; }
+                }
             }
+            for (int i = 0; i < sideA.Count; i++)
+            {
+                Side ea = sideA[i];
+                if (matched[i] == null && ea.NameKey != null &&
+                    bByName.TryGetValue(ea.NameKey, out var byName))
+                {
+                    Side? eb = FirstUnpaired(byName, pairedB);
+                    if (eb != null) { pairedB.Add(eb); matched[i] = eb; }
+                }
+            }
+            for (int i = 0; i < sideA.Count; i++)
+                result.Functions.Add(MakeDiff(sideA[i], matched[i]));
 
             // Whatever in B never got paired is "only in B".
             foreach (var eb in sideB)
@@ -462,7 +471,7 @@ namespace Cda.Core.Engine
                 return pairedKey;
 
             var id = Identify(map, byAddr, addr);
-            string key = id.nameKey ?? id.rvaKey;
+            string key = id.rvaKey;
             if (!endpoints.ContainsKey(key))
                 endpoints[key] = (id.label, isA ? addr : 0);
             return key;
@@ -491,7 +500,11 @@ namespace Cda.Core.Engine
             int n = ds.Records.Count;
             var order = new int[n];
             for (int i = 0; i < n; i++) order[i] = i;
-            Array.Sort(order, (x, y) => ds.Records[x].Time.CompareTo(ds.Records[y].Time));
+            Array.Sort(order, (x, y) =>
+            {
+                int c = ds.Records[x].Time.CompareTo(ds.Records[y].Time);
+                return c != 0 ? c : x.CompareTo(y);
+            });
 
             var rank = new Dictionary<ulong, int>();
             int next = 1;

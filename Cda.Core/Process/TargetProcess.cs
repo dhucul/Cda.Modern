@@ -206,9 +206,15 @@ namespace Cda.Core.Process
                     byte[] header = new byte[0x1000];
                     int read = ReadMemory(moduleBase, header);
                     if (read >= 0x200)
-                        preferredBase = PeImage.FromMappedImage(header, moduleBase).PreferredImageBase;
+                    {
+                        var mapped = PeImage.FromMappedImage(header, moduleBase);
+                        preferredBase = mapped.PreferredImageBase;
+                        if (size == 0) size = mapped.SizeOfImage;
+                    }
                 }
                 catch { /* malformed or unreadable module: live VA remains usable */ }
+
+                if (size == 0) continue;
 
                 result.Add(new ModuleInfo(shortName, moduleBase, size, path,
                     preferredBaseAddress: preferredBase));
@@ -233,11 +239,11 @@ namespace Cda.Core.Process
 
         public void Dispose()
         {
-            if (_handle != IntPtr.Zero)
-            {
-                NativeMethods.CloseHandle(_handle);
-                _handle = IntPtr.Zero;
-            }
+            IntPtr handle = System.Threading.Interlocked.Exchange(ref _handle, IntPtr.Zero);
+            if (handle != IntPtr.Zero) NativeMethods.CloseHandle(handle);
+            GC.SuppressFinalize(this);
         }
+
+        ~TargetProcess() => Dispose();
     }
 }

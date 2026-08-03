@@ -23,6 +23,8 @@ namespace Cda.Core.Engine
         /// 5-byte jump and stolen RIP-relative operands relocate in range.
         /// </summary>
         ulong AllocateNear(int size, ulong near);
+        /// <summary>Release or rewind a failed near allocation when possible.</summary>
+        bool ReleaseNear(ulong address, int size);
         int Read(ulong address, Span<byte> buffer);
         void Write(ulong address, ReadOnlySpan<byte> data);
         uint Protect(ulong address, int size, uint protect);
@@ -30,17 +32,22 @@ namespace Cda.Core.Engine
     }
 
     /// <summary>Operates on the current process — used only by the self-test.</summary>
-    public sealed class LocalCodeMemory : ICodeMemory
+    public sealed class LocalCodeMemory : ICodeMemory, IDisposable
     {
+        private readonly System.Collections.Generic.List<IntPtr> _allocations = new();
+        private bool _disposed;
+
         public bool Is64Bit => IntPtr.Size == 8;
 
         public ulong Allocate(int size, bool executable)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             uint protect = executable ? NativeMethods.PAGE_EXECUTE_READWRITE : NativeMethods.PAGE_READWRITE;
             IntPtr p = NativeMethods.VirtualAlloc(IntPtr.Zero, (IntPtr)size,
                 NativeMethods.MEM_COMMIT | NativeMethods.MEM_RESERVE, protect);
             if (p == IntPtr.Zero)
                 throw new InvalidOperationException($"VirtualAlloc failed ({Marshal.GetLastWin32Error()}).");
+            _allocations.Add(p);
             return NativeMethods.ToUInt64(p);
         }
 
@@ -48,6 +55,16 @@ namespace Cda.Core.Engine
         // allocation here exercises the same codegen and keeps the self-test
         // behaviour identical to before near-allocation existed.
         public ulong AllocateNear(int size, ulong near) => Allocate(size, executable: true);
+
+        public bool ReleaseNear(ulong address, int size)
+        {
+            IntPtr p = NativeMethods.ToIntPtr(address);
+            int index = _allocations.IndexOf(p);
+            if (index < 0) return false;
+            if (!NativeMethods.VirtualFree(p, IntPtr.Zero, NativeMethods.MEM_RELEASE)) return false;
+            _allocations.RemoveAt(index);
+            return true;
+        }
 
         public int Read(ulong address, Span<byte> buffer)
         {
@@ -78,6 +95,15 @@ namespace Cda.Core.Engine
                 throw new Win32Exception(Marshal.GetLastWin32Error(),
                     $"FlushInstructionCache failed at 0x{address:X}.");
         }
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+            _disposed = true;
+            foreach (IntPtr allocation in _allocations)
+                NativeMethods.VirtualFree(allocation, IntPtr.Zero, NativeMethods.MEM_RELEASE);
+            _allocations.Clear();
+        }
     }
 
     /// <summary>Operates on a remote target via <see cref="RemoteMemory"/>.</summary>
@@ -95,6 +121,7 @@ namespace Cda.Core.Engine
         public bool Is64Bit => _process.Is64Bit;
         public ulong Allocate(int size, bool executable) => _memory.Allocate(size, executable);
         public ulong AllocateNear(int size, ulong near) => _memory.AllocateNear(size, near);
+        public bool ReleaseNear(ulong address, int size) => _memory.ReleaseNear(address, size);
         public int Read(ulong address, Span<byte> buffer) => _process.ReadMemory(address, buffer);
         public void Write(ulong address, ReadOnlySpan<byte> data) => _memory.Write(address, data);
         public uint Protect(ulong address, int size, uint protect) => _memory.Protect(address, size, protect);

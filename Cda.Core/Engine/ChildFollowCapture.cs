@@ -98,10 +98,12 @@ namespace Cda.Core.Engine
         // hooking, and polling all run there), so no locking is needed.
         private readonly HashSet<int> _live = new();                  // live PIDs in the tree
         private readonly HashSet<int> _loaderBp = new();              // pids whose loader breakpoint was consumed
+        private readonly HashSet<int> _wow64LoaderBp = new();         // pids whose WOW64 loader breakpoint was consumed
         private readonly Dictionary<int, CaptureSession> _sessions = new(); // hooked PID -> its trace
         private readonly Dictionary<int, long> _counts = new();       // hooked PID -> calls captured
         private long _lastPoll;
         private long _lastSummary;
+        private int _treeExitNotified;
 
         public ChildFollowCapture(string exePath, int maxFunctions, int candidatePool,
             int bufferRecords, int minPreRunFunctions, bool skipSystemProcesses = true,
@@ -143,7 +145,14 @@ namespace Cda.Core.Engine
         public void Dispose()
         {
             Stop();
-            WaitForExit(Timeout.Infinite);
+            if (!WaitForExit(5000))
+                Log?.Invoke("child-follow loop did not exit within 5s; abandoning it.");
+        }
+
+        private void NotifyTreeExited()
+        {
+            if (Interlocked.Exchange(ref _treeExitNotified, 1) == 0)
+                TreeExited?.Invoke();
         }
 
         private void Run()
@@ -165,7 +174,7 @@ namespace Cda.Core.Engine
                 if (!ok)
                 {
                     Log?.Invoke($"launch failed (error {Marshal.GetLastWin32Error()})");
-                    TreeExited?.Invoke();
+                    NotifyTreeExited();
                     return;
                 }
                 _rootPid = (int)pi.dwProcessId;
@@ -252,9 +261,11 @@ namespace Cda.Core.Engine
                             // with the faulting module+RVA so the cause can be pinned,
                             // and hand them back to the program rather than swallowing
                             // them, so its outcome matches reality.
-                            bool isBp = exCode == NativeMethods.EXCEPTION_BREAKPOINT ||
-                                        exCode == NativeMethods.STATUS_WX86_BREAKPOINT;
-                            bool loaderBp = isBp && _loaderBp.Add((int)evtPid);
+                            bool isNativeBp = exCode == NativeMethods.EXCEPTION_BREAKPOINT;
+                            bool isBp = isNativeBp || exCode == NativeMethods.STATUS_WX86_BREAKPOINT;
+                            bool loaderBp = isBp && (isNativeBp
+                                ? _loaderBp.Add((int)evtPid)
+                                : _wow64LoaderBp.Add((int)evtPid));
 
                             if (!loaderBp && (DebugExceptionInfo.IsCrash(exCode) || isBp))
                             {
@@ -272,6 +283,8 @@ namespace Cda.Core.Engine
                         case NativeMethods.EXIT_PROCESS_DEBUG_EVENT:
                         {
                             _live.Remove((int)evtPid);
+                            _loaderBp.Remove((int)evtPid);
+                            _wow64LoaderBp.Remove((int)evtPid);
                             bool last = _live.Count == 0;
 
                             // Final drain + remove this process's hooks (best effort —
@@ -291,6 +304,7 @@ namespace Cda.Core.Engine
                                 try { sess.Dispose(); } catch { /* process gone */ }
                                 _sessions.Remove((int)evtPid);
                                 Log?.Invoke($"pid {evtPid} exited · {Count((int)evtPid)} call(s) captured" + (last ? " (tree finished)" : ""));
+                                _counts.Remove((int)evtPid);
                             }
                             else
                             {
@@ -302,7 +316,7 @@ namespace Cda.Core.Engine
                                 eventPending = false;
                             else
                                 return;
-                            if (last) { TreeExited?.Invoke(); return; }
+                            if (last) { NotifyTreeExited(); return; }
                             if (_stop) { DisposeAllSessions(); DetachAll(); return; }
                             continue; // already continued this event
                         }
@@ -329,6 +343,7 @@ namespace Cda.Core.Engine
                 try { DisposeAllSessions(); } catch { }
                 try { DetachAll(); } catch { }
                 Marshal.FreeHGlobal(evt);
+                NotifyTreeExited();
             }
         }
 

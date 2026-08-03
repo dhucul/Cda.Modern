@@ -26,7 +26,7 @@ namespace Cda.Core.Engine
 
         public static string Run()
         {
-            var mem = new LocalCodeMemory();
+            using var mem = new LocalCodeMemory();
             var arch = CpuArchitectures.For(mem.Is64Bit);
 
             // Original: mov eax, 0x11111111 ; ret  (padded with NOPs so there is

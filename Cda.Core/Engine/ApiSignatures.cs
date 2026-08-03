@@ -141,9 +141,12 @@ namespace Cda.Core.Engine
         public static ApiParam[]? Lookup(string? functionName)
         {
             if (string.IsNullOrEmpty(functionName)) return null;
-            if (Table.TryGetValue(functionName!, out var sig)) return sig;
+            int bang = functionName!.LastIndexOf('!');
+            if (bang >= 0) functionName = functionName.Substring(bang + 1);
+            if (functionName.Length == 0) return null;
+            if (Table.TryGetValue(functionName, out var sig)) return sig;
 
-            char last = functionName![functionName.Length - 1];
+            char last = functionName[functionName.Length - 1];
             if ((last == 'A' || last == 'W') && functionName.Length > 1)
             {
                 string baseName = functionName.Substring(0, functionName.Length - 1);

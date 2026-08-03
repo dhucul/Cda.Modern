@@ -84,13 +84,16 @@ namespace Cda.Core.Engine
                 // Stack snapshot (entry SP upward), for host-side caller walking.
                 if (pos + 4 > slot.Length) continue;
                 uint stackSlots = BinaryPrimitives.ReadUInt32LittleEndian(slot.Slice(pos)); pos += 4;
-                if (stackSlots > 4096 || pos + (int)stackSlots * 8 + 4 > slot.Length) continue;
+                int snapshotStart = pos;
+                if (stackSlots > CaptureStub.StackSlots ||
+                    snapshotStart + CaptureStub.StackSlots * 8 + 4 > slot.Length) continue;
                 var snapshot = new ulong[stackSlots];
                 for (int i = 0; i < stackSlots; i++)
                 {
-                    snapshot[i] = BinaryPrimitives.ReadUInt64LittleEndian(slot.Slice(pos));
-                    pos += 8;
+                    snapshot[i] = BinaryPrimitives.ReadUInt64LittleEndian(
+                        slot.Slice(snapshotStart + i * 8));
                 }
+                pos = snapshotStart + CaptureStub.StackSlots * 8;
 
                 uint derefc = BinaryPrimitives.ReadUInt32LittleEndian(slot.Slice(pos)); pos += 4;
                 if (derefc > 256) continue;

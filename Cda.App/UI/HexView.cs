@@ -188,7 +188,9 @@ namespace Cda.App.UI
             if (_source == null) return;
             ulong steps = (ulong)Math.Abs((long)rows) * BytesPerRow;
             ulong min = _source.MinAddress;
-            ulong max = LastRowAddress();
+            ulong lastRow = LastRowAddress();
+            ulong page = (ulong)(Math.Max(1, VisibleRows) - 1) * BytesPerRow;
+            ulong max = lastRow > min + page ? lastRow - page : min;
             if (rows < 0)
                 _topAddress = steps > _topAddress - min ? min : _topAddress - steps;
             else
@@ -430,6 +432,12 @@ namespace Cda.App.UI
             protected override void OnMouseLeftButtonUp(MouseButtonEventArgs e)
             {
                 if (_dragging) { _dragging = false; ReleaseMouseCapture(); }
+            }
+
+            protected override void OnLostMouseCapture(MouseEventArgs e)
+            {
+                base.OnLostMouseCapture(e);
+                _dragging = false;
             }
 
             protected override void OnKeyDown(KeyEventArgs e)

@@ -263,6 +263,13 @@ namespace Cda.Core.Engine
             CheckCount(ds.Modules.Count, MaxModules, "module");
             CheckCount(ds.Functions.Count, MaxFunctions, "function");
             CheckCount(ds.Records.Count, MaxRecords, "record");
+            long estimated = (long)ds.Modules.Count * 128
+                           + (long)ds.Functions.Count * 96
+                           + (long)ds.Records.Count * 160;
+            if (estimated > MaxArchiveBytes)
+                throw new InvalidDataException(
+                    $"This trace ({ds.Records.Count:N0} records) exceeds the " +
+                    $"{MaxArchiveBytes / (1024 * 1024)} MB archive limit CDA can reopen.");
             ValidateTimeRange(ds.TimeStart, ds.TimeEnd);
 
             foreach (var m in ds.Modules)

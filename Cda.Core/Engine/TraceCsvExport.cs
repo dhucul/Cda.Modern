@@ -34,13 +34,23 @@ namespace Cda.Core.Engine
 
         public static void Export(string path, TraceDataset ds)
         {
-            // UTF-8 with a BOM so Excel detects the encoding and renders decoded
-            // (non-ASCII) string arguments correctly rather than as mojibake.
-            using var writer = new StreamWriter(path, append: false, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true))
+            string tempPath = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
             {
-                NewLine = "\r\n", // RFC 4180 line ending, independent of platform
-            };
-            Write(writer, ds);
+                // UTF-8 with a BOM so Excel detects the encoding and renders decoded
+                // (non-ASCII) string arguments correctly rather than as mojibake.
+                using (var writer = new StreamWriter(tempPath, append: false,
+                    new UTF8Encoding(encoderShouldEmitUTF8Identifier: true)) { NewLine = "\r\n" })
+                    Write(writer, ds);
+
+                if (File.Exists(path)) File.Replace(tempPath, path, null);
+                else File.Move(tempPath, path);
+            }
+            finally
+            {
+                if (File.Exists(tempPath))
+                    try { File.Delete(tempPath); } catch { }
+            }
         }
 
         /// <summary>Writes the CSV to an arbitrary writer (testing / piping).</summary>
@@ -116,11 +126,14 @@ namespace Cda.Core.Engine
         private static string Escape(string? field)
         {
             field ??= "";
+            if (field.Length > 0 && FormulaTriggers.IndexOf(field[0]) >= 0)
+                field = "'" + field;
             bool mustQuote = field.IndexOfAny(QuoteTriggers) >= 0;
             if (!mustQuote) return field;
             return "\"" + field.Replace("\"", "\"\"") + "\"";
         }
 
         private static readonly char[] QuoteTriggers = { ',', '"', '\r', '\n' };
+        private const string FormulaTriggers = "=+-@\t\r";
     }
 }

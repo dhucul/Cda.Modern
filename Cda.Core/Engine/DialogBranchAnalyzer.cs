@@ -331,7 +331,7 @@ namespace Cda.Core.Engine
                 if (IsConditionalBranch(instr))
                     branches.Add((instr, (int)(callSite - instr.IP)));
 
-                if (IsFunctionBoundary(instr) && instr.IP < callSite - 1)
+                if (IsFunctionBoundary(instr) && instr.NextIP < callSite)
                 {
                     aligned = false;
                     break;
