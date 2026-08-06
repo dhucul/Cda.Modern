@@ -15,7 +15,7 @@ authorized to analyze.
 
 ## Status
 
-Current preview release: **1.21.3**. Working and validated on real targets.
+Current preview release: **1.21.5**. Working and validated on real targets.
 Implemented and confirmed:
 
 - **Static module view** — open any PE (EXE/DLL/SYS), parse headers, list exports
