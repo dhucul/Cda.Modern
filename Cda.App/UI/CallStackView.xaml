@@ -4,7 +4,7 @@
              Background="{StaticResource Surface}">
     <DockPanel>
         <TextBlock x:Name="Header" DockPanel.Dock="Top" Foreground="{StaticResource TextSecondary}"
-                   Margin="8,6" FontFamily="Cascadia Mono, Consolas" FontSize="12"
+                   Margin="8,6" FontFamily="{StaticResource MonoFont}" FontSize="12"
                    TextWrapping="NoWrap"
                    Text="Click a call in the Calls tab to trace it back into the program." />
         <DataGrid x:Name="Grid" AutoGenerateColumns="False" IsReadOnly="True"
@@ -14,7 +14,7 @@
                   EnableRowVirtualization="True" EnableColumnVirtualization="True"
                   VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
                   SelectionMode="Single"
-                  FontFamily="Cascadia Mono, Consolas" FontSize="12">
+                  FontFamily="{StaticResource MonoFont}" FontSize="12">
             <DataGrid.Columns>
                 <DataGridTextColumn Header="#" Binding="{Binding Depth}" Width="48" ElementStyle="{StaticResource GridCellText}" />
                 <DataGridTextColumn Header="Frame (caller)" Binding="{Binding Function}" Width="Auto" MinWidth="200" ElementStyle="{StaticResource GridCellText}" />

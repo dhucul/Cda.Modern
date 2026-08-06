@@ -66,16 +66,16 @@ namespace Cda.App.Visualization
         // --- palette (frozen) ----------------------------------------------
         private static readonly Brush Bg = VisualTheme.Background;
         private static readonly Brush NodeFill = Frozen(Color.FromRgb(0x27, 0x2D, 0x37));
-        private static readonly Brush NodeText = Frozen(Color.FromRgb(0xF2, 0xF5, 0xFA));
-        private static readonly Brush SubText = Frozen(Color.FromRgb(0xDC, 0xE2, 0xEC));
-        private static readonly Brush HintText = Frozen(Color.FromRgb(0x8A, 0x95, 0xA9));
+        private static readonly Brush NodeText = Frozen(Color.FromRgb(0xC6, 0xCD, 0xD8));
+        private static readonly Brush SubText = Frozen(Color.FromRgb(0x99, 0xA2, 0xB0));
+        private static readonly Brush HintText = Frozen(Color.FromRgb(0x6B, 0x74, 0x81));
         private static readonly Brush CallerBrush = Frozen(VisualTheme.LinkSource);
         private static readonly Brush CalleeBrush = Frozen(VisualTheme.LinkDest);
         private static readonly Brush CenterBrush = Frozen(Color.FromRgb(0xF2, 0xD0, 0x8A));
         private static readonly Pen CallerPen = FrozenPen(VisualTheme.LinkSource, 1.4);
         private static readonly Pen CalleePen = FrozenPen(VisualTheme.LinkDest, 1.4);
         private static readonly Pen CenterPen = FrozenPen(Color.FromRgb(0xF2, 0xD0, 0x8A), 1.6);
-        private static readonly Pen HoverPen = FrozenPen(Color.FromRgb(0xF2, 0xF5, 0xFA), 1.6);
+        private static readonly Pen HoverPen = FrozenPen(Color.FromRgb(0xC6, 0xCD, 0xD8), 1.6);
 
         // Diff palette: green = more / new, red = fewer / removed, grey = unchanged.
         private static readonly Color MoreColor = Color.FromRgb(0xB4, 0xDC, 0x90);
@@ -88,12 +88,9 @@ namespace Cda.App.Visualization
         private static readonly Pen LessPen = FrozenPen(LessColor, 1.6);
         private static readonly Pen SamePen = FrozenPen(SameColor, 1.2);
 
-        private readonly Typeface _face =
-            new(new FontFamily("Segoe UI"), FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
-        private readonly Typeface _faceSemi =
-            new(new FontFamily("Segoe UI"), FontStyles.Normal, FontWeights.SemiBold, FontStretches.Normal);
-        private readonly Typeface _mono =
-            new(new FontFamily("Cascadia Mono, Consolas"), FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
+        private readonly Typeface _face = AppFonts.UiRegular;
+        private readonly Typeface _faceSemi = AppFonts.UiSemiBold;
+        private readonly Typeface _mono = AppFonts.MonoRegular;
 
         public CallGraphView()
         {

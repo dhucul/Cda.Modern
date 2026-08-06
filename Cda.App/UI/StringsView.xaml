@@ -45,7 +45,7 @@
                       CanUserSortColumns="False"
                       SelectionMode="Single" SelectionChanged="OnStringSelectionChanged"
                       MouseDoubleClick="OnStringDoubleClick"
-                      FontFamily="Cascadia Mono, Consolas" FontSize="12">
+                      FontFamily="{StaticResource MonoFont}" FontSize="12">
                 <DataGrid.Columns>
                     <DataGridTextColumn Header="Address" Binding="{Binding AddressHex}" Width="Auto" ElementStyle="{StaticResource GridCellText}" />
                     <DataGridTextColumn Header="T" Binding="{Binding KindGlyph}" Width="28" ElementStyle="{StaticResource GridCellText}" />
@@ -67,9 +67,9 @@
                          TextWrapping="Wrap" MinHeight="40" MaxHeight="120" VerticalScrollBarVisibility="Auto"
                          Background="{StaticResource SurfaceAlt}" BorderThickness="0"
                          Foreground="{StaticResource TextPrimary}" Padding="6,3" Margin="6,2,6,0"
-                         FontFamily="Cascadia Mono, Consolas" FontSize="12" />
+                         FontFamily="{StaticResource MonoFont}" FontSize="12" />
                 <TextBlock x:Name="DetailHeader" DockPanel.Dock="Top" Foreground="{StaticResource TextSecondary}"
-                           Margin="8,4" FontFamily="Cascadia Mono, Consolas" FontSize="12"
+                           Margin="8,4" FontFamily="{StaticResource MonoFont}" FontSize="12"
                            Text="Referenced by — select a string above." />
                 <DataGrid x:Name="DetailGrid" AutoGenerateColumns="False" IsReadOnly="True"
                           HeadersVisibility="Column" GridLinesVisibility="None"
@@ -77,7 +77,7 @@
                           Foreground="{StaticResource TextPrimary}" BorderThickness="0"
                           EnableRowVirtualization="True" VirtualizingPanel.IsVirtualizing="True"
                           SelectionMode="Single" SelectionChanged="OnDetailSelectionChanged"
-                          FontFamily="Cascadia Mono, Consolas" FontSize="12">
+                          FontFamily="{StaticResource MonoFont}" FontSize="12">
                     <DataGrid.Columns>
                         <DataGridTextColumn Header="Address" Binding="{Binding AddressHex}" Width="Auto" ElementStyle="{StaticResource GridCellText}" />
                         <DataGridTextColumn Header="Module" Binding="{Binding Module}" Width="Auto" ElementStyle="{StaticResource GridCellText}" />

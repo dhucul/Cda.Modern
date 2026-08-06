@@ -38,7 +38,7 @@
                   EnableRowVirtualization="True" EnableColumnVirtualization="True"
                   VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
                   SelectionMode="Single" SelectionChanged="OnSelectionChanged"
-                  FontFamily="Cascadia Mono, Consolas" FontSize="12">
+                  FontFamily="{StaticResource MonoFont}" FontSize="12">
             <DataGrid.Columns>
                 <DataGridTextColumn Header="Order" Binding="{Binding CallOrderText}" SortMemberPath="FirstCallSeq" Width="Auto" MinWidth="44" ElementStyle="{StaticResource GridCellText}" />
                 <DataGridTextColumn Header="Live VA" Binding="{Binding AddressHex}" Width="Auto" ElementStyle="{StaticResource GridCellText}" />

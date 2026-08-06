@@ -10,7 +10,7 @@
              readable and individually copyable, not squeezed into a grid cell. -->
         <Style x:Key="DetailLabel" TargetType="TextBlock">
             <Setter Property="Foreground" Value="{StaticResource TextMuted}" />
-            <Setter Property="FontFamily" Value="Cascadia Mono, Consolas" />
+            <Setter Property="FontFamily" Value="{StaticResource MonoFont}" />
             <Setter Property="FontSize" Value="12" />
             <Setter Property="MinWidth" Value="52" />
             <Setter Property="Margin" Value="0,1,10,1" />
@@ -23,7 +23,7 @@
             <Setter Property="Padding" Value="0" />
             <Setter Property="Margin" Value="0,1,0,1" />
             <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
-            <Setter Property="FontFamily" Value="Cascadia Mono, Consolas" />
+            <Setter Property="FontFamily" Value="{StaticResource MonoFont}" />
             <Setter Property="FontSize" Value="12" />
             <Setter Property="TextWrapping" Value="Wrap" />
             <Setter Property="IsTabStop" Value="False" />
@@ -54,7 +54,7 @@
                          TextChanged="OnFilterChanged" />
             </StackPanel>
             <TextBlock x:Name="Header" Foreground="{StaticResource TextPrimary}"
-                       Margin="8,6" FontFamily="Cascadia Mono, Consolas" FontSize="12"
+                       Margin="8,6" FontFamily="{StaticResource MonoFont}" FontSize="12"
                        Text="No calls captured yet." TextWrapping="NoWrap" />
         </DockPanel>
         <DataGrid x:Name="Grid" AutoGenerateColumns="False" IsReadOnly="True"
@@ -64,7 +64,7 @@
                   EnableRowVirtualization="True" EnableColumnVirtualization="True"
                   VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
                   RowDetailsVisibilityMode="Collapsed"
-                  FontFamily="Cascadia Mono, Consolas" FontSize="12">
+                  FontFamily="{StaticResource MonoFont}" FontSize="12">
             <DataGrid.Columns>
                 <DataGridTemplateColumn Header="★" Width="32" SortMemberPath="Bookmarked">
                     <DataGridTemplateColumn.CellTemplate>

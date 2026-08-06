@@ -38,18 +38,15 @@ namespace Cda.App.Visualization
         private static readonly Brush Bg = VisualTheme.Background;
         private static readonly Brush MoreFill = Frozen(Color.FromRgb(0xB4, 0xDC, 0x90)); // green: more in B / new
         private static readonly Brush LessFill = Frozen(Color.FromRgb(0xD8, 0x5F, 0x6A)); // red: fewer in B / removed
-        private static readonly Brush LabelText = Frozen(Color.FromRgb(0xF2, 0xF5, 0xFA));
-        private static readonly Brush SubText = Frozen(Color.FromRgb(0xDC, 0xE2, 0xEC));
-        private static readonly Brush HintText = Frozen(Color.FromRgb(0x8A, 0x95, 0xA9));
+        private static readonly Brush LabelText = Frozen(Color.FromRgb(0xC6, 0xCD, 0xD8));
+        private static readonly Brush SubText = Frozen(Color.FromRgb(0x99, 0xA2, 0xB0));
+        private static readonly Brush HintText = Frozen(Color.FromRgb(0x6B, 0x74, 0x81));
         private static readonly Pen ZeroPen = FrozenPen(Color.FromRgb(0x40, 0x49, 0x59), 1.0);
-        private static readonly Pen HoverPen = FrozenPen(Color.FromRgb(0xF2, 0xF5, 0xFA), 1.4);
+        private static readonly Pen HoverPen = FrozenPen(Color.FromRgb(0xC6, 0xCD, 0xD8), 1.4);
 
-        private readonly Typeface _face =
-            new(new FontFamily("Segoe UI"), FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
-        private readonly Typeface _faceSemi =
-            new(new FontFamily("Segoe UI"), FontStyles.Normal, FontWeights.SemiBold, FontStretches.Normal);
-        private readonly Typeface _mono =
-            new(new FontFamily("Cascadia Mono, Consolas"), FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
+        private readonly Typeface _face = AppFonts.UiRegular;
+        private readonly Typeface _faceSemi = AppFonts.UiSemiBold;
+        private readonly Typeface _mono = AppFonts.MonoRegular;
 
         public TraceDiffChart()
         {

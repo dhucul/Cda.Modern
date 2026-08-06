@@ -39,8 +39,8 @@ namespace Cda.App.UI
         /// <summary>Bytes decoded for one function (a generous single-function window).</summary>
         private const int MaxDecodeBytes = 4096;
 
-        private readonly Typeface _typeface =
-            new(new FontFamily("Cascadia Mono, Consolas"), FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
+        // Shared with the rest of the app via AppFonts (see AppFonts.cs).
+        private readonly Typeface _typeface = AppFonts.MonoRegular;
         private const double FontSize = 13.0;
         private double _rowHeight = 16;
         private double _charWidth = 8;
@@ -48,11 +48,11 @@ namespace Cda.App.UI
         // How many instruction bytes to show before eliding (keeps the mnemonic column aligned).
         private const int MaxShownBytes = 8;
 
-        private static readonly Brush BgBrush = Frozen(Color.FromRgb(0x1B, 0x20, 0x28));
-        private static readonly Brush AddrBrush = Frozen(Color.FromRgb(0x88, 0xAE, 0xDE));
-        private static readonly Brush BytesBrush = Frozen(Color.FromRgb(0x4F, 0x59, 0x6B));
-        private static readonly Brush TextBrush = Frozen(Color.FromRgb(0xF2, 0xF5, 0xFA));
-        private static readonly Brush PlainBrush = Frozen(Color.FromRgb(0xDC, 0xE2, 0xEC));
+        private static readonly Brush BgBrush = Frozen(Color.FromRgb(0x1B, 0x1E, 0x24));
+        private static readonly Brush AddrBrush = Frozen(Color.FromRgb(0x7F, 0xA3, 0xCF));
+        private static readonly Brush BytesBrush = Frozen(Color.FromRgb(0x54, 0x5C, 0x69));
+        private static readonly Brush TextBrush = Frozen(Color.FromRgb(0xC6, 0xCD, 0xD8));
+        private static readonly Brush PlainBrush = Frozen(Color.FromRgb(0xA7, 0xB0, 0xBD));
 
         private readonly struct Line
         {

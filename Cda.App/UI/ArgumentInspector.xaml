@@ -4,13 +4,13 @@
              Background="{StaticResource Surface}">
     <DockPanel>
         <TextBlock x:Name="Header" DockPanel.Dock="Top" Foreground="{StaticResource TextPrimary}"
-                   Margin="8,6" FontFamily="Cascadia Mono, Consolas" FontSize="12"
+                   Margin="8,6" FontFamily="{StaticResource MonoFont}" FontSize="12"
                    Text="No call selected" TextWrapping="Wrap" />
         <DataGrid x:Name="Grid" AutoGenerateColumns="False" IsReadOnly="True"
                   HeadersVisibility="Column" GridLinesVisibility="None"
                   Background="{StaticResource Surface}" RowBackground="{StaticResource Surface}" AlternatingRowBackground="{StaticResource SurfaceAlt}"
                   Foreground="{StaticResource TextPrimary}" BorderThickness="0"
-                  FontFamily="Cascadia Mono, Consolas" FontSize="12">
+                  FontFamily="{StaticResource MonoFont}" FontSize="12">
             <DataGrid.Columns>
                 <DataGridTextColumn Header="#" Binding="{Binding Index}" Width="40" ElementStyle="{StaticResource GridCellText}" />
                 <DataGridTextColumn Header="Register/Slot" Binding="{Binding Slot}" Width="110" ElementStyle="{StaticResource GridCellText}" />

@@ -13,44 +13,82 @@
              ===================================================================== -->
 
         <!-- ============================================================
-             Palette: KvArcDark (the Arc Dark look). Cool blue-grey window
-             and view tones, dark hairline borders, and the signature Arc
-             blue (#5294E2) as the accent/selection colour.
+             Palette: Graphite Blue. A deep neutral graphite window with
+             flat (non-gradient) raised surfaces, low-noise hairlines, and
+             one saturated blue (#4C8DFF) carrying every accent, selection
+             and focus cue. Replaces the previous Arc Dark blue-grey: the
+             surfaces are darker and less saturated so the call graph,
+             timeline and hex/disasm text carry the colour instead of the
+             chrome, and body contrast rises to ~11:1.
              ============================================================ -->
 
+        <!-- ============================================================
+             Type stack. Two families, defined once here and mirrored in
+             AppFonts.cs for the custom-drawn surfaces (hex, disassembly,
+             call graph, timeline, diff chart) that build FormattedText in
+             code rather than reading resources.
+
+             UiFont   — Segoe UI Variable Text: Windows 11's optically-sized
+                        UI face, drawn for 12–18px body copy, so it holds
+                        aperture and spacing at the sizes this app uses.
+                        Degrades to Segoe UI on Windows 10, then Tahoma.
+             MonoFont — Cascadia Mono, NOT Cascadia Code: Code's programming
+                        ligatures fuse character pairs, which is wrong for a
+                        hex dump or a disassembly listing where every glyph
+                        is one byte or one token. Slashed zero, unambiguous
+                        1/l/I. Degrades to Consolas, then Courier New.
+
+             WPF walks a comma-separated family list itself, so a machine
+             missing the first choice silently gets the next one rather than
+             falling back to a serif default.
+             ============================================================ -->
+        <FontFamily x:Key="UiFont">Segoe UI Variable Text, Segoe UI, Tahoma</FontFamily>
+        <FontFamily x:Key="UiFontDisplay">Segoe UI Variable Display, Segoe UI, Tahoma</FontFamily>
+        <FontFamily x:Key="MonoFont">Cascadia Mono, Consolas, Courier New</FontFamily>
+
         <!-- Surfaces (back to front) -->
-        <SolidColorBrush x:Key="Background"    Color="#383C4A" />  <!-- window bg_color -->
-        <SolidColorBrush x:Key="Surface"       Color="#2F343F" />  <!-- headerbar / toolbar / panels -->
-        <SolidColorBrush x:Key="Surface2"      Color="#404552" />  <!-- raised: column headers, tracks -->
-        <SolidColorBrush x:Key="SurfaceAlt"    Color="#353A47" />  <!-- alt rows / inset -->
+        <SolidColorBrush x:Key="Background"    Color="#1B1E24" />  <!-- window field -->
+        <SolidColorBrush x:Key="Surface"       Color="#22262E" />  <!-- command bar / status bar / panel headers -->
+        <SolidColorBrush x:Key="Surface2"      Color="#2A2F38" />  <!-- raised: buttons, column headers, tracks -->
+        <SolidColorBrush x:Key="SurfaceAlt"    Color="#1F232A" />  <!-- alt rows / inset -->
 
         <!-- Lines / outlines -->
-        <SolidColorBrush x:Key="Outline"       Color="#2B2E39" />  <!-- Arc dark border -->
-        <SolidColorBrush x:Key="OutlineStrong" Color="#4B5162" />
+        <SolidColorBrush x:Key="Outline"       Color="#333945" />  <!-- hairline separator -->
+        <SolidColorBrush x:Key="OutlineStrong" Color="#454D5C" />  <!-- control border -->
 
-        <!-- Text tiers -->
-        <SolidColorBrush x:Key="TextPrimary"   Color="#D3DAE3" />  <!-- Arc fg_color -->
-        <SolidColorBrush x:Key="OnSurface"     Color="#D3DAE3" />
-        <SolidColorBrush x:Key="TextSecondary" Color="#C4CBD6" />
-        <SolidColorBrush x:Key="TextMuted"     Color="#7C818C" />  <!-- Arc insensitive fg -->
+        <!-- Text tiers. Deliberately softened: nothing is pure white, and the
+             steps are wide enough to read as a hierarchy rather than as one
+             bright wall of type. Primary carries values and button labels;
+             Secondary carries descriptive/running text; Muted carries hints and
+             captions; Disabled is for inactive controls. Ratios are against
+             Background (#1B1E24). Semantic colours (Danger/Success/Warning) are
+             intentionally left brighter so warnings stay prominent. -->
+        <SolidColorBrush x:Key="TextPrimary"   Color="#C6CDD8" />  <!-- ~10.5:1 on Background -->
+        <SolidColorBrush x:Key="OnSurface"     Color="#C6CDD8" />
+        <SolidColorBrush x:Key="TextSecondary" Color="#99A2B0" />  <!-- ~6.6:1 -->
+        <SolidColorBrush x:Key="TextMuted"     Color="#6B7481" />  <!-- ~3.5:1, hints only -->
 
-        <!-- Accent + states (Arc blue) -->
-        <SolidColorBrush x:Key="Accent"        Color="#5294E2" />
-        <SolidColorBrush x:Key="AccentHover"   Color="#6BA5E7" />
-        <SolidColorBrush x:Key="AccentPressed" Color="#4884CC" />
-        <SolidColorBrush x:Key="AccentSoft"    Color="#3A4358" />
-        <SolidColorBrush x:Key="Selection"     Color="#4E82C4" />
+        <!-- Accent + states -->
+        <SolidColorBrush x:Key="Accent"        Color="#4C8DFF" />
+        <SolidColorBrush x:Key="AccentHover"   Color="#6BA0FF" />
+        <SolidColorBrush x:Key="AccentPressed" Color="#3B76DE" />
+        <SolidColorBrush x:Key="AccentSoft"    Color="#20304C" />  <!-- tinted fill behind a selected row -->
+        <SolidColorBrush x:Key="Selection"     Color="#2C6BE0" />
+        <SolidColorBrush x:Key="OnAccent"      Color="#F2F6FC" />  <!-- label on an accent-filled face; off-white, never pure -->
+        <SolidColorBrush x:Key="TextDisabled"  Color="#565E6A" />  <!-- ~2.6:1, clearly inactive -->
 
-        <!-- Arc button gradient (subtle top-lit vertical fill) and its states -->
-        <LinearGradientBrush x:Key="ButtonFace" StartPoint="0,0" EndPoint="0,1">
-            <GradientStop Offset="0" Color="#444A59" />
-            <GradientStop Offset="1" Color="#3A3F4D" />
-        </LinearGradientBrush>
-        <LinearGradientBrush x:Key="ButtonFaceHover" StartPoint="0,0" EndPoint="0,1">
-            <GradientStop Offset="0" Color="#4E5568" />
-            <GradientStop Offset="1" Color="#434A5A" />
-        </LinearGradientBrush>
-        <SolidColorBrush x:Key="ButtonFacePressed" Color="#33373F" />
+        <!-- Semantic states: the status bar's capture LED and the Stop command. -->
+        <SolidColorBrush x:Key="Success"       Color="#4FC08D" />
+        <SolidColorBrush x:Key="Warning"       Color="#E8A33D" />
+        <SolidColorBrush x:Key="Danger"        Color="#E5657A" />
+        <SolidColorBrush x:Key="DangerHover"   Color="#F07E90" />
+
+        <!-- Button face. Flat rather than gradient: at this surface depth a
+             vertical gradient reads as a smudge, and the flat fill lets the
+             1px border do the separating. -->
+        <SolidColorBrush x:Key="ButtonFace"        Color="#2A2F38" />
+        <SolidColorBrush x:Key="ButtonFaceHover"   Color="#333A46" />
+        <SolidColorBrush x:Key="ButtonFacePressed" Color="#191C21" />
 
         <!-- TreeView selection (the "Called by" caller tree). The stock TreeViewItem
              template colours a selected node from the system Highlight* brush keys,
@@ -58,19 +96,20 @@
              focused, washed-out light grey when not) made the light item text
              unreadable. Re-point those keys at the theme so a selected node matches
              the lists/grids. Colours mirror Selection / TextPrimary above. -->
-        <SolidColorBrush x:Key="{x:Static SystemColors.HighlightBrushKey}"                  Color="#4E82C4" />
-        <SolidColorBrush x:Key="{x:Static SystemColors.HighlightTextBrushKey}"              Color="#FFFFFF" />
-        <SolidColorBrush x:Key="{x:Static SystemColors.InactiveSelectionHighlightBrushKey}" Color="#4E82C4" />
-        <SolidColorBrush x:Key="{x:Static SystemColors.InactiveSelectionHighlightTextBrushKey}" Color="#FFFFFF" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.HighlightBrushKey}"                  Color="#2C6BE0" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.HighlightTextBrushKey}"              Color="#F2F6FC" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.InactiveSelectionHighlightBrushKey}" Color="#2C6BE0" />
+        <SolidColorBrush x:Key="{x:Static SystemColors.InactiveSelectionHighlightTextBrushKey}" Color="#F2F6FC" />
 
         <!-- ============================ Button ============================ -->
-        <!-- Arc Dark button: subtle top-lit gradient face, dark hairline border,
-             ~3px rounding, light-grey label. Hover lifts the face and rings it in
-             Arc blue; pressed sinks to a flat dark inset. -->
+        <!-- Graphite button: flat raised face, 1px border, 5px rounding, light
+             label. Hover lifts the face and rings it in accent blue; pressed
+             sinks to a dark inset. -->
         <Style TargetType="Button">
+            <Setter Property="FontFamily" Value="{StaticResource UiFont}" />
             <Setter Property="Background" Value="{StaticResource ButtonFace}" />
             <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
-            <Setter Property="BorderBrush" Value="{StaticResource Outline}" />
+            <Setter Property="BorderBrush" Value="{StaticResource OutlineStrong}" />
             <Setter Property="BorderThickness" Value="1" />
             <Setter Property="Padding" Value="12,5" />
             <Setter Property="FontSize" Value="12.5" />
@@ -82,7 +121,7 @@
                         <Border x:Name="bd" Background="{TemplateBinding Background}"
                                 BorderBrush="{TemplateBinding BorderBrush}"
                                 BorderThickness="{TemplateBinding BorderThickness}"
-                                CornerRadius="3" SnapsToDevicePixels="True">
+                                CornerRadius="5" SnapsToDevicePixels="True">
                             <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"
                                               Margin="{TemplateBinding Padding}" RecognizesAccessKey="True" />
                         </Border>
@@ -104,8 +143,169 @@
             </Setter>
         </Style>
 
+        <!-- ================== Command-bar button variants ================== -->
+        <!-- The command bar reads as three tiers so the eye lands on the one
+             action that starts work: PRIMARY (accent-filled) for Launch &
+             capture, DANGER (red label) for Stop, GHOST (borderless until
+             hovered) for the view/IO commands that sit on the right. Everything
+             else stays on the default raised face. -->
+
+        <Style x:Key="PrimaryButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="Background" Value="{StaticResource Accent}" />
+            <Setter Property="BorderBrush" Value="{StaticResource Accent}" />
+            <Setter Property="Foreground" Value="{StaticResource OnAccent}" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="bd" Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1"
+                                CornerRadius="5" SnapsToDevicePixels="True">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"
+                                              Margin="{TemplateBinding Padding}" RecognizesAccessKey="True" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="bd" Property="Background" Value="{StaticResource AccentHover}" />
+                                <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource AccentHover}" />
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="bd" Property="Background" Value="{StaticResource AccentPressed}" />
+                                <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource AccentPressed}" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="bd" Property="Opacity" Value="0.45" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <Style x:Key="DangerButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="Foreground" Value="{StaticResource Danger}" />
+        </Style>
+
+        <Style x:Key="GhostButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderBrush" Value="Transparent" />
+            <Setter Property="Foreground" Value="{StaticResource TextSecondary}" />
+            <Setter Property="Padding" Value="10,5" />
+        </Style>
+
+        <!-- ===================== Drop-down command ======================== -->
+        <!-- A MenuItem styled to read as a toolbar button with a ▾ chevron. Used
+             for the command bar's grouped commands (Launch ▾, Attach ▾, Open ▾,
+             Capture ▾, Trace ▾): the group's variants live in the drop-down as
+             ordinary MenuItems, whose Click handlers are the same handlers the
+             old flat buttons used. Using MenuItem rather than a hand-rolled
+             Button+Popup buys open/close, click-away, keyboard navigation and
+             access keys for free. -->
+        <Style x:Key="DropButton" TargetType="MenuItem">
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
+            <Setter Property="FontSize" Value="12.5" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="MenuItem">
+                        <Border x:Name="bd" Background="{StaticResource ButtonFace}"
+                                BorderBrush="{StaticResource OutlineStrong}" BorderThickness="1"
+                                CornerRadius="5" Padding="11,5" SnapsToDevicePixels="True">
+                            <StackPanel Orientation="Horizontal">
+                                <ContentPresenter ContentSource="Header" RecognizesAccessKey="True"
+                                                  VerticalAlignment="Center" />
+                                <Path x:Name="chev" Data="M 0,0 L 4,4 L 8,0" Stroke="{StaticResource TextMuted}"
+                                      StrokeThickness="1.4" Margin="8,1,0,0" VerticalAlignment="Center"
+                                      StrokeEndLineCap="Round" StrokeStartLineCap="Round" />
+                                <Popup x:Name="PART_Popup" Placement="Bottom" VerticalOffset="4"
+                                       AllowsTransparency="True" Focusable="False" PopupAnimation="Fade"
+                                       IsOpen="{TemplateBinding IsSubmenuOpen}">
+                                    <Border Background="{StaticResource Surface}"
+                                            BorderBrush="{StaticResource OutlineStrong}"
+                                            BorderThickness="1" CornerRadius="6" Padding="4" MinWidth="230">
+                                        <StackPanel IsItemsHost="True"
+                                                    KeyboardNavigation.DirectionalNavigation="Cycle" />
+                                    </Border>
+                                </Popup>
+                            </StackPanel>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsHighlighted" Value="True">
+                                <Setter TargetName="bd" Property="Background" Value="{StaticResource ButtonFaceHover}" />
+                                <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource Accent}" />
+                            </Trigger>
+                            <Trigger Property="IsSubmenuOpen" Value="True">
+                                <Setter TargetName="bd" Property="Background" Value="{StaticResource AccentSoft}" />
+                                <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource Accent}" />
+                                <Setter TargetName="chev" Property="Stroke" Value="{StaticResource Accent}" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Opacity" Value="0.45" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- The accent-filled variant, for the one group that starts work. -->
+        <Style x:Key="PrimaryDropButton" TargetType="MenuItem" BasedOn="{StaticResource DropButton}">
+            <Setter Property="Foreground" Value="{StaticResource OnAccent}" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="MenuItem">
+                        <Border x:Name="bd" Background="{StaticResource Accent}"
+                                BorderBrush="{StaticResource Accent}" BorderThickness="1"
+                                CornerRadius="5" Padding="11,5" SnapsToDevicePixels="True">
+                            <StackPanel Orientation="Horizontal">
+                                <ContentPresenter ContentSource="Header" RecognizesAccessKey="True"
+                                                  VerticalAlignment="Center" />
+                                <Path Data="M 0,0 L 4,4 L 8,0" Stroke="{StaticResource OnAccent}"
+                                      StrokeThickness="1.4" Margin="8,1,0,0" VerticalAlignment="Center"
+                                      StrokeEndLineCap="Round" StrokeStartLineCap="Round" />
+                                <Popup x:Name="PART_Popup" Placement="Bottom" VerticalOffset="4"
+                                       AllowsTransparency="True" Focusable="False" PopupAnimation="Fade"
+                                       IsOpen="{TemplateBinding IsSubmenuOpen}">
+                                    <Border Background="{StaticResource Surface}"
+                                            BorderBrush="{StaticResource OutlineStrong}"
+                                            BorderThickness="1" CornerRadius="6" Padding="4" MinWidth="230">
+                                        <StackPanel IsItemsHost="True"
+                                                    KeyboardNavigation.DirectionalNavigation="Cycle" />
+                                    </Border>
+                                </Popup>
+                            </StackPanel>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsHighlighted" Value="True">
+                                <Setter TargetName="bd" Property="Background" Value="{StaticResource AccentHover}" />
+                                <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource AccentHover}" />
+                            </Trigger>
+                            <Trigger Property="IsSubmenuOpen" Value="True">
+                                <Setter TargetName="bd" Property="Background" Value="{StaticResource AccentPressed}" />
+                                <Setter TargetName="bd" Property="BorderBrush" Value="{StaticResource AccentPressed}" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Opacity" Value="0.45" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Menu bar item: the same look as a ghost button, for File/Capture/View/Help
+             style top-level headers that are not drop-BUTTONS. Kept separate so the
+             stock Menu chrome doesn't inherit the DropButton border. -->
+        <Style x:Key="ToolbarLabel" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="{StaticResource TextMuted}" />
+            <Setter Property="FontSize" Value="10.5" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+        </Style>
+
         <!-- ============================ TextBox =========================== -->
         <Style TargetType="TextBox">
+            <Setter Property="FontFamily" Value="{StaticResource UiFont}" />
             <Setter Property="Background" Value="{StaticResource Surface2}" />
             <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
             <Setter Property="CaretBrush" Value="{StaticResource TextPrimary}" />
@@ -133,6 +333,7 @@
 
         <!-- =========================== CheckBox =========================== -->
         <Style TargetType="CheckBox">
+            <Setter Property="FontFamily" Value="{StaticResource UiFont}" />
             <Setter Property="Foreground" Value="{StaticResource TextSecondary}" />
             <Setter Property="VerticalContentAlignment" Value="Center" />
             <Setter Property="Cursor" Value="Hand" />
@@ -165,12 +366,63 @@
             </Setter>
         </Style>
 
+        <!-- ========================= ToggleChip =========================== -->
+        <!-- The command bar's six capture options as pill-shaped switches instead
+             of tick boxes. Same CheckBox control (same x:Name, same IsChecked,
+             same Click handlers) — only the template changes, so nothing in the
+             code-behind moves. On = accent track + accent ring, so which options
+             are armed is readable at a glance across the whole row. -->
+        <Style x:Key="ToggleChip" TargetType="CheckBox">
+            <Setter Property="Foreground" Value="{StaticResource TextMuted}" />
+            <Setter Property="FontSize" Value="11.5" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="CheckBox">
+                        <Border x:Name="pill" Background="Transparent" CornerRadius="11"
+                                BorderBrush="{StaticResource Outline}" BorderThickness="1"
+                                Padding="6,3,11,3" SnapsToDevicePixels="True">
+                            <StackPanel Orientation="Horizontal">
+                                <Border x:Name="track" Width="22" Height="12" CornerRadius="6"
+                                        Background="{StaticResource OutlineStrong}" VerticalAlignment="Center">
+                                    <Ellipse x:Name="knob" Width="8" Height="8" Fill="{StaticResource Background}"
+                                             HorizontalAlignment="Left" Margin="2,0,0,0" />
+                                </Border>
+                                <ContentPresenter Margin="7,0,0,0" VerticalAlignment="Center"
+                                                  RecognizesAccessKey="True" />
+                            </StackPanel>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="track" Property="Background" Value="{StaticResource Accent}" />
+                                <Setter TargetName="knob" Property="HorizontalAlignment" Value="Right" />
+                                <Setter TargetName="knob" Property="Margin" Value="0,0,2,0" />
+                                <Setter TargetName="knob" Property="Fill" Value="{StaticResource OnAccent}" />
+                                <Setter TargetName="pill" Property="BorderBrush" Value="{StaticResource Accent}" />
+                                <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="pill" Property="Background" Value="{StaticResource SurfaceAlt}" />
+                                <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Opacity" Value="0.45" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
         <!-- ===================== TabControl / TabItem ===================== -->
         <Style TargetType="TabControl">
+            <Setter Property="FontFamily" Value="{StaticResource UiFont}" />
             <Setter Property="Background" Value="{StaticResource Surface}" />
             <Setter Property="BorderThickness" Value="0" />
         </Style>
         <Style TargetType="TabItem">
+            <Setter Property="FontFamily" Value="{StaticResource UiFont}" />
             <Setter Property="Foreground" Value="{StaticResource TextSecondary}" />
             <Setter Property="FontSize" Value="12.5" />
             <Setter Property="Template">
@@ -203,11 +455,13 @@
              its drop-down leaf items: the Popup only opens for an item that has
              children, so leaves simply never show it. -->
         <Style TargetType="Menu">
+            <Setter Property="FontFamily" Value="{StaticResource UiFont}" />
             <Setter Property="Background" Value="{StaticResource Surface}" />
             <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
             <Setter Property="FontSize" Value="12.5" />
         </Style>
         <Style TargetType="MenuItem">
+            <Setter Property="FontFamily" Value="{StaticResource UiFont}" />
             <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
             <Setter Property="Background" Value="Transparent" />
             <Setter Property="Padding" Value="10,4" />
@@ -278,6 +532,7 @@
              (transparent face, light text, AccentSoft highlight), matching the Help
              menu's drop-down. -->
         <Style TargetType="ContextMenu">
+            <Setter Property="FontFamily" Value="{StaticResource UiFont}" />
             <Setter Property="Background" Value="{StaticResource Surface}" />
             <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
             <Setter Property="BorderBrush" Value="{StaticResource OutlineStrong}" />
@@ -306,6 +561,7 @@
              up the wrap style from the presenter's resources; rich content is left
              untouched. -->
         <Style TargetType="ToolTip">
+            <Setter Property="FontFamily" Value="{StaticResource UiFont}" />
             <Setter Property="Background" Value="{StaticResource Surface2}" />
             <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
             <Setter Property="BorderBrush" Value="{StaticResource OutlineStrong}" />
@@ -367,7 +623,7 @@
                     <Setter Property="Background" Value="{StaticResource Selection}" />
                     <!-- White (not light-grey) on the blue selection, matching the caller
                          tree's selected node, so a selected row's text stays high-contrast. -->
-                    <Setter Property="Foreground" Value="#FFFFFF" />
+                    <Setter Property="Foreground" Value="#F2F6FC" />
                 </Trigger>
             </Style.Triggers>
         </Style>

@@ -4,7 +4,7 @@
              Background="{StaticResource Surface}">
     <DockPanel>
         <TextBlock x:Name="Header" DockPanel.Dock="Top" Foreground="{StaticResource TextSecondary}"
-                   Margin="8,6" FontFamily="Cascadia Mono, Consolas" FontSize="12"
+                   Margin="8,6" FontFamily="{StaticResource MonoFont}" FontSize="12"
                    TextWrapping="NoWrap"
                    Text="Dialog boxes the target raises will appear here, each with the app function that created it. Start 'Detect dialog caller' or 'Launch &amp; detect dialogs…'." />
         <DataGrid x:Name="Grid" AutoGenerateColumns="False" IsReadOnly="True"
@@ -14,7 +14,7 @@
                   EnableRowVirtualization="True" EnableColumnVirtualization="True"
                   VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
                   SelectionMode="Single"
-                  FontFamily="Cascadia Mono, Consolas" FontSize="12">
+                  FontFamily="{StaticResource MonoFont}" FontSize="12">
             <DataGrid.Columns>
                 <DataGridTextColumn Header="Time" Binding="{Binding Time}" Width="Auto" MinWidth="72" ElementStyle="{StaticResource GridCellText}" />
                 <DataGridTextColumn Header="Dialog API" Binding="{Binding Api}" Width="Auto" MinWidth="150" ElementStyle="{StaticResource GridCellText}" />

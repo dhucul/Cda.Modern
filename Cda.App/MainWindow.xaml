@@ -8,9 +8,13 @@
         MinWidth="760" MinHeight="480"
         WindowStartupLocation="CenterScreen"
         Background="{StaticResource Background}"
+        FontFamily="{StaticResource UiFont}"
+        FontSize="12.5"
         TextOptions.TextFormattingMode="Ideal"
         TextOptions.TextRenderingMode="ClearType"
-        UseLayoutRounding="True">
+        Typography.NumeralAlignment="Tabular"
+        UseLayoutRounding="True"
+        Loaded="OnStatusChromeLoaded">
 
     <Window.CommandBindings>
         <!-- F1 (ApplicationCommands.Help) and the Help ▸ Help Contents item both
@@ -29,119 +33,244 @@
             </MenuItem>
         </Menu>
 
-        <!-- Toolbar -->
-        <Border DockPanel.Dock="Top" Background="{StaticResource Surface}" Padding="10,8">
-            <WrapPanel Orientation="Horizontal">
-                <!-- Sources: bring in a target -->
-                <Button Content="Open module (PE)…" Padding="12,4" Margin="0,0,8,6" Click="OnOpenModule"
-                        ToolTip="Statically load an EXE/DLL: lists its functions and shows its bytes. Does NOT run it — use Launch &amp; capture for that." />
-                <Button Content="Attach to process…" Padding="12,4" Margin="0,0,8,6" Click="OnAttach"
-                        ToolTip="Attach to a running process and discover its call graph (read-only). Active call recording is the next, gated step." />
-                <Button Content="Load demo trace" Padding="12,4" Margin="0,0,8,6" Click="OnLoadDemo" />
+        <!-- =====================================================================
+             Command bar (row 1): the commands, grouped.
 
-                <Border Width="1" Height="22" Background="{StaticResource Outline}" VerticalAlignment="Center" Margin="2,0,10,6" />
+             Each family collapses to one drop-down command (Launch & capture ▾,
+             Open ▾, Capture ▾, Trace ▾) whose items carry the SAME labels, the
+             SAME tooltips and the SAME Click handlers the flat buttons used —
+             nothing was removed and no handler was renamed. Launch is accent
+             filled, Stop is the only red control, and the view/IO commands are
+             ghost buttons pinned right.
 
-                <!-- Launch &amp; capture: instrument a target from startup -->
-                <Button Content="Launch &amp; capture…" Padding="12,4" Margin="0,0,8,6" Click="OnLaunchCapture"
-                        ToolTip="Launch an executable SUSPENDED, arm a broad set of its functions before it runs, then resume — so the startup call flow is captured from the first instruction. Click any function afterward to focus the trace on just it." />
-                <Button Content="Launch &amp; capture API…" Padding="12,4" Margin="0,0,8,6" Click="OnLaunchApiCapture"
-                        ToolTip="LAUNCH an executable and hook the Windows API functions it imports (kernel32, user32, ntdll, …) BEFORE its entry point runs — so the API calls it makes during startup are captured from the first instruction, not missed. Use this instead of Capture Windows API when the calls you want happen at startup (attaching after the fact shows 0 calls). Uses inline hooks on the resolved API entries; ultra-hot primitives are skipped." />
-                <Button Content="Launch &amp; capture imports…" Padding="12,4" Margin="0,0,8,6" Click="OnLaunchIatCapture"
-                        ToolTip="LAUNCH an executable and hook its import-table SLOTS (IAT) BEFORE its entry point runs — capturing the imported-API calls it makes at startup from the first instruction. Like Launch &amp; capture API but writes only to the import table (data), never .text, so it captures anti-tamper targets that checksum their own code. Use when startup calls are what you need and the target self-terminates on a code patch." />
-                <Button Content="Launch &amp; capture exports…" Padding="12,4" Margin="0,0,8,6" Click="OnLaunchExportCapture"
-                        ToolTip="LAUNCH an executable and hook the functions its OWN modules EXPORT (the EXE and its app DLLs — not the OS) BEFORE its entry point runs, capturing calls IN to the app's public surface from the first instruction. The mirror of Launch &amp; capture API: that hooks what the program calls out to (imports); this hooks what its own code exposes (exports). Forwarder exports are skipped; exports are authoritative entries, so the set is always safe to splice. Most useful for an app built from its own DLLs." />
-                <Button Content="Launch &amp; detect dialogs…" Padding="12,4" Margin="0,0,8,6" Click="OnLaunchDialogCapture"
-                        ToolTip="LAUNCH an executable and hook only the OS dialog-box functions (MessageBox, DialogBoxParam, CreateDialogParam, TaskDialog, …) BEFORE its entry point runs — so a dialog raised DURING STARTUP (a splash, nag, or error box) is caught from the first instruction and attributed to the app function that raised it. The dialogs it captures, with their caption and caller, appear in the Dialogs tab. Resolves the dialog functions by address from user32/comctl32, so it catches them however the program calls them." />
-                <Button Content="Capture DLL…" Padding="12,4" Margin="0,0,8,6" Click="OnLaunchDllCapture"
-                        ToolTip="Launch a host under a debugger and instrument a chosen DLL the instant it loads — capturing its DllMain and startup from the first instruction. Pick the DLL, then optionally a host EXE that loads it (Cancel = use rundll32)." />
-                <Button Content="Follow children…" Padding="12,4" Margin="0,0,8,6" Click="OnFollowChildren"
-                        ToolTip="Launch an executable under a debugger that follows every process it spawns AND instruments each one the instant it starts (frozen at creation, before its code runs). Per-process call counts stream into the diagnostics. Use Stop capture to remove the hooks and detach (leaves the tree running)." />
-                <Button Content="Launch .NET &amp; capture…" Padding="12,4" Margin="0,0,8,6" Click="OnLaunchManaged"
-                        ToolTip="Launch a .NET (managed) executable from disk and capture its managed calls — the managed counterpart of Launch &amp; capture. The target starts with DOTNET_TieredCompilation=0 (stable JIT addresses); CDA waits for the runtime to come up and app code to JIT, then hooks its methods' native entries through the same pipeline as a native capture, recording calls (and, with 'Capture returns' on, return values). Methods that JIT later are hooked by a background re-scan. Framework methods (System.*/Microsoft.*) are skipped. Because methods JIT lazily, the very first calls of a method may be missed; exercise the app to surface more. Managed method discovery supports 64-bit .NET targets only; use a native capture mode for 32-bit .NET targets." />
-                <StackPanel x:Name="ChildTargetPanel" Orientation="Horizontal" Visibility="Collapsed" VerticalAlignment="Center" Margin="0,0,8,6">
-                    <TextBlock Text="Target:" Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" Margin="0,0,4,0" FontSize="12" />
-                    <ComboBox x:Name="ChildTargetBox" Width="300" VerticalAlignment="Center" FontSize="12"
-                              DisplayMemberPath="Display" SelectionChanged="OnChildTargetChanged"
-                              ToolTip="Choose which followed process to view. Its captured calls drive the function list, call graph, calls log, caller tree, and timeline. The other followed processes keep recording in the background; switch between them any time, including after they exit." />
-                </StackPanel>
-                <CheckBox x:Name="DisableAslr" Content="Disable ASLR" IsChecked="False"
-                          Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" Margin="0,0,8,6"
-                          ToolTip="For the launch commands (Launch &amp; capture, Capture DLL, Follow children), start the target with ASLR off so its modules load at the same base every run — making the absolute addresses in a capture reproducible across runs and comparable across saved .cdatrace files. CDA launches a throwaway copy of the image with its /DYNAMICBASE opt-in stripped (so the loader uses its preferred base), and also applies a per-process bottom-up mitigation policy. It affects only programs CDA launches; nothing global is changed. Requires Windows mandatory ASLR (force-relocate) to be OFF, which is the default. Only the launched image (and, for Follow children, the root) is pinned — spawned children keep their own ASLR." />
-                <CheckBox x:Name="FollowSkipSystem" Content="Skip system" IsChecked="True"
-                          Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" Margin="0,0,8,6"
-                          ToolTip="When following a process tree, don't instrument OS helper processes (those whose image is under \Windows\, e.g. conhost.exe, WerFault.exe) — they're still followed and listed in the diagnostics, just not hooked. The executable you launch is always instrumented. Read when you click Follow children." />
-                <CheckBox x:Name="AutoBisectCrashes" Content="Auto-bisect crashes" IsChecked="False"
-                          Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" Margin="4,0,8,6"
-                          ToolTip="OFF by default. When a Launch &amp; capture crash can't be pinned to a single hook (a deferred culprit), binary-search the armed hooks to isolate it — relaunching the target HIDDEN (no window pop-ups / focus stealing), bounded, and cancellable with Stop capture. The culprit's RVA is written to cda_hook_skip.txt; you then re-launch to trace past it. The only way to find a deferred culprit is by re-running, so this relaunches — just invisibly." />
+             Layout: the left group lives in a WrapPanel that is the DockPanel's
+             fill child, so at narrow widths it wraps to a second line exactly as
+             the old toolbar did instead of being clipped — no command can become
+             unreachable. The right group is docked (declared first, as DockPanel
+             requires) but carries a high TabIndex, and TabNavigation is Local, so
+             Tab still walks the bar left-to-right in reading order.
+             ===================================================================== -->
+        <Border DockPanel.Dock="Top" Background="{StaticResource Surface}"
+                BorderBrush="{StaticResource Outline}" BorderThickness="0,0,0,1" Padding="10,7"
+                KeyboardNavigation.TabNavigation="Local">
+            <DockPanel LastChildFill="True">
 
-                <Border Width="1" Height="22" Background="{StaticResource Outline}" VerticalAlignment="Center" Margin="2,0,10,6" />
-
-                <!-- Capture on an already-attached process -->
-                <Button Content="Start capture" Padding="12,4" Margin="0,0,8,6" Click="OnStartCapture"
-                        ToolTip="Instrument ONLY the function selected on the left and record its live calls with decoded arguments." />
-                <Button Content="Capture Windows API" Padding="12,4" Margin="0,0,8,6" Click="OnCaptureApi"
-                        ToolTip="On the attached process, hook the Windows API functions it imports (kernel32, user32, ntdll, …) and record every call to them — with arguments and decoded strings. Attach to a process first. Ultra-hot primitives (critical-section/heap/last-error) are skipped to avoid flooding; click one to trace it specifically." />
-                <Button Content="Detect dialog caller" Padding="12,4" Margin="0,0,8,6" Click="OnDetectDialogCaller"
-                        ToolTip="On the attached process, hook only the OS dialog-box functions (MessageBox, DialogBoxParam, CreateDialogParam, TaskDialog, …). When the target pops a dialog, the Dialogs tab shows its caption and — the point — the app function that raised it, with the caller lit up in the function list, graph, and call stack. Resolves the dialog functions by address from user32/comctl32, so it catches them however the program calls them (import, GetProcAddress, delay-load). Attach to a process first." />
-                <Button Content="Capture imports (IAT)" Padding="12,4" Margin="0,0,8,6" Click="OnCaptureIat"
-                        ToolTip="Like Capture Windows API, but reroutes calls by overwriting the import-address-table SLOTS in the target's own modules instead of patching code. It writes only to the import table (data), never to .text — so it captures targets that checksum their own code (anti-tamper) and self-terminate when patched. Attach to a process first." />
-                <Button Content="Capture (hardware bp)" Padding="12,4" Margin="0,0,8,6" Click="OnCaptureHwbp"
-                        ToolTip="Trace the SELECTED function using a CPU debug register (hardware breakpoint) — writes NOTHING to the target's memory, so it captures binaries that both checksum their code and can't be IAT-hooked. Attaches as a debugger (an anti-debug target may notice), watches up to 4 addresses, x64 only. Attach, click a function, then click this." />
-                <Button Content="Capture .NET (managed)" Padding="12,4" Margin="0,0,8,6" Click="OnCaptureManaged"
-                        ToolTip="On the attached .NET process, discover its JIT-compiled app methods (via ClrMD) and hook their native entries through the same inline-hook pipeline as a native capture — recording every managed call with arguments (and, with 'Capture returns' on, return values). A background timer re-scans and hooks methods that JIT later. Attach to a .NET process first. For the most complete coverage launch the target with DOTNET_TieredCompilation=0 (stable JIT addresses); on an already-running target some pre-hook calls are missed and tiered re-JIT may bypass a hook (the re-scan re-hooks the new address). Framework methods (System.*/Microsoft.*) are skipped. Managed method discovery supports 64-bit .NET targets only; native capture modes remain available for 32-bit .NET targets." />
-                <CheckBox x:Name="AutoCapture" Content="Auto-capture on select" IsChecked="True"
-                          Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" Margin="4,0,8,6"
-                          ToolTip="When on, clicking a function in the list immediately starts tracing it — no Start button needed." />
-                <CheckBox x:Name="CaptureReturns" Content="Capture returns" IsChecked="False"
-                          Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" Margin="4,0,8,6"
-                          ToolTip="When on, a focused capture (Start capture / auto-capture-on-select) also records each call's RETURN value (RAX/EAX), shown in the Calls log's Return column. Uses a return trampoline; one outstanding return per hooked function at a time (concurrent/recursive returns are sampled); integer returns only (a float/double return shows a meaningless RAX). Set before starting a capture. On x64 a vectored exception handler is installed in the target so a C++/SEH exception unwinding through a hooked frame is handled safely (it un-redirects that call's return rather than crashing); on an exception-heavy target this can reduce how many returns are captured, but it won't crash." />
-
-                <Border Width="1" Height="22" Background="{StaticResource Outline}" VerticalAlignment="Center" Margin="2,0,10,6" />
-
-                <!-- Capture control -->
-                <Button Content="Stop capture" Padding="12,4" Margin="0,0,8,6" Click="OnStopCapture" />
-                <Button Content="Clear calls" x:Name="ClearCallsButton" IsEnabled="False" Padding="12,4" Margin="0,0,8,6" Click="OnClearCalls"
-                        ToolTip="Clear the recorded calls, counts, caller tree, and graph shown so far and KEEP capturing — the hooks stay installed, so subsequent calls are recorded fresh. Use it to reset the log, then exercise one action in the target to see only what that triggers. (Live capture only; Stop capture removes the hooks and freezes the trace for review instead.)" />
-                <CheckBox x:Name="FilterLeftOnClear" Content="Only new on left" IsChecked="True" Click="OnFilterLeftOnClearClicked"
-                          Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" Margin="0,0,8,6"
-                          ToolTip="Filter the function list (left) to show only functions that have calls — they appear live as they run (equivalent to the list's Hide 0-hit; Show all restores the rest). Toggling applies to the list immediately, and also controls whether Clear calls filters the left to just the functions hit since the clear. Uncheck to show the full function list." />
-                <TextBlock Text="Capture only:" Foreground="{StaticResource TextSecondary}" VerticalAlignment="Center" Margin="4,0,4,6" FontSize="12" />
-                <TextBox x:Name="CaptureCondBox" Width="200" VerticalAlignment="Center" FontSize="12" Margin="0,0,0,6"
-                         ToolTip="Record only calls matching these space-separated clauses (all must match): argN==V / argN!=V / argN&lt;V / argN&gt;V / argN&amp;V (V is 0x-hex or decimal; &amp; is a flag test); name~TEXT or name!~TEXT (callee name contains); str~TEXT or str!~TEXT (decoded string arg contains). Blank = record everything. Applies live during capture."
-                         TextChanged="OnCaptureConditionChanged" />
-
-                <Border Width="1" Height="22" Background="{StaticResource Outline}" VerticalAlignment="Center" Margin="2,0,10,6" />
-
-                <!-- Trace I/O &amp; review -->
-                <Button Content="Save trace…" Padding="12,4" Margin="0,0,8,6" Click="OnSaveTrace"
-                        ToolTip="Save the recorded calls — with arguments, decoded strings, and stack snapshots — to a .cdatrace file you can reopen and review later." />
-                <Button Content="Open trace…" Padding="12,4" Margin="0,0,8,6" Click="OnOpenTrace"
-                        ToolTip="Open a saved .cdatrace file and review it offline: functions, call graph, timeline, calls log, and caller tree (no live target needed)." />
-                <Button Content="Export CSV…" Padding="12,4" Margin="0,0,8,6" Click="OnExportCsv"
-                        ToolTip="Export the recorded calls to a spreadsheet-friendly CSV (one row per call: time, caller, callee, arguments, decoded strings) for Excel, pandas, or grep. One-way — use Save trace… for a file you can reopen in CDA." />
-                <Button Content="Compare trace…" Padding="12,4" Margin="0,0,8,6" Click="OnCompareTrace"
-                        ToolTip="Compare two traces (A vs B): the current trace is A, or — with nothing loaded — pick two saved .cdatrace files (no capture needed). Shows a per-function call-count diff (which functions ran only in one run, and which ran a different number of times) and a chart of where they differ, and recolours the butterfly graph by edge changes. Double-click a row to jump to that function." />
-                <Button Content="Copy results" Padding="12,4" Margin="0,0,8,6" Click="OnCopyResults"
-                        ToolTip="Copy the captured calls (and the current diagnostic state) to the clipboard as text, so you can paste them elsewhere." />
-
-                <Border Width="1" Height="22" Background="{StaticResource Outline}" VerticalAlignment="Center" Margin="2,0,10,6" />
-
-                <!-- View &amp; diagnostics -->
-                <Button Content="Fit graph" Padding="12,4" Margin="0,0,8,6" Click="OnFit" />
-                <Button Content="Self-test" Padding="12,4" Margin="0,0,8,6" Click="OnSelfTest"
+                <!-- Right: view, comparison and trace I/O (never starts a capture). -->
+                <Menu DockPanel.Dock="Right" Background="Transparent" Padding="0"
+                      VerticalAlignment="Center" IsMainMenu="False" TabIndex="94">
+                    <MenuItem Style="{StaticResource DropButton}" Header="Trace"
+                              ToolTip="Take the recorded calls out of CDA: save a reopenable .cdatrace, export a CSV, or copy them as text.">
+                        <MenuItem Header="Save trace…" Click="OnSaveTrace"
+                                  ToolTip="Save the recorded calls — with arguments, decoded strings, and stack snapshots — to a .cdatrace file you can reopen and review later." />
+                        <MenuItem Header="Export CSV…" Click="OnExportCsv"
+                                  ToolTip="Export the recorded calls to a spreadsheet-friendly CSV (one row per call: time, caller, callee, arguments, decoded strings) for Excel, pandas, or grep. One-way — use Save trace… for a file you can reopen in CDA." />
+                        <Separator />
+                        <MenuItem Header="Copy results" Click="OnCopyResults"
+                                  ToolTip="Copy the captured calls (and the current diagnostic state) to the clipboard as text, so you can paste them elsewhere." />
+                    </MenuItem>
+                </Menu>
+                <Button DockPanel.Dock="Right" Style="{StaticResource GhostButton}" Content="Self-test"
+                        Margin="6,0,6,0" Click="OnSelfTest" TabIndex="93"
                         ToolTip="In-process validation (no target) of the inline-hook codegen and the capture stub + ring buffer — the byte-exact pieces everything else depends on. A failure here means the codegen needs fixing before trusting a live capture." />
+                <Button DockPanel.Dock="Right" Style="{StaticResource GhostButton}" Content="Compare trace…"
+                        Margin="0,0,6,0" Click="OnCompareTrace" TabIndex="92"
+                        ToolTip="Compare two traces (A vs B): the current trace is A, or — with nothing loaded — pick two saved .cdatrace files (no capture needed). Shows a per-function call-count diff (which functions ran only in one run, and which ran a different number of times) and a chart of where they differ, and recolours the butterfly graph by edge changes. Double-click a row to jump to that function." />
+                <Button DockPanel.Dock="Right" Style="{StaticResource GhostButton}" Content="Fit graph"
+                        Margin="0,0,6,0" Click="OnFit" TabIndex="91"
+                        ToolTip="Zoom the call graph so the whole butterfly fits the pane." />
+                <Border DockPanel.Dock="Right" Width="1" Height="20" Background="{StaticResource Outline}"
+                        VerticalAlignment="Center" Margin="10,0" />
 
-                <TextBlock Foreground="{StaticResource TextMuted}" VerticalAlignment="Center" Margin="8,0,0,6"
-                           Text="graph: click a node to focus · timeline: click=scrub, ←→=step (Ctrl=bigger), right-drag=select" />
-            </WrapPanel>
+                <!-- Left: bring a target in, capture it, control the capture. Wraps. -->
+                <WrapPanel Orientation="Horizontal">
+
+                    <Menu Background="Transparent" Padding="0" VerticalAlignment="Center"
+                          IsMainMenu="False" TabIndex="10" Margin="0,0,0,4">
+                        <MenuItem Style="{StaticResource PrimaryDropButton}" Header="Launch &amp; capture"
+                                  ToolTip="Launch a target and arm it BEFORE its entry point runs, so the startup call flow is captured from the first instruction. Pick which surface to hook from the drop-down.">
+                            <MenuItem Header="Launch &amp; capture…" Click="OnLaunchCapture"
+                                      ToolTip="Launch an executable SUSPENDED, arm a broad set of its functions before it runs, then resume — so the startup call flow is captured from the first instruction. Click any function afterward to focus the trace on just it." />
+                            <Separator />
+                            <MenuItem Header="Launch &amp; capture API…" Click="OnLaunchApiCapture"
+                                      ToolTip="LAUNCH an executable and hook the Windows API functions it imports (kernel32, user32, ntdll, …) BEFORE its entry point runs — so the API calls it makes during startup are captured from the first instruction, not missed. Use this instead of Capture Windows API when the calls you want happen at startup (attaching after the fact shows 0 calls). Uses inline hooks on the resolved API entries; ultra-hot primitives are skipped." />
+                            <MenuItem Header="Launch &amp; capture imports…" Click="OnLaunchIatCapture"
+                                      ToolTip="LAUNCH an executable and hook its import-table SLOTS (IAT) BEFORE its entry point runs — capturing the imported-API calls it makes at startup from the first instruction. Like Launch &amp; capture API but writes only to the import table (data), never .text, so it captures anti-tamper targets that checksum their own code. Use when startup calls are what you need and the target self-terminates on a code patch." />
+                            <MenuItem Header="Launch &amp; capture exports…" Click="OnLaunchExportCapture"
+                                      ToolTip="LAUNCH an executable and hook the functions its OWN modules EXPORT (the EXE and its app DLLs — not the OS) BEFORE its entry point runs, capturing calls IN to the app's public surface from the first instruction. The mirror of Launch &amp; capture API: that hooks what the program calls out to (imports); this hooks what its own code exposes (exports). Forwarder exports are skipped; exports are authoritative entries, so the set is always safe to splice. Most useful for an app built from its own DLLs." />
+                            <MenuItem Header="Launch &amp; detect dialogs…" Click="OnLaunchDialogCapture"
+                                      ToolTip="LAUNCH an executable and hook only the OS dialog-box functions (MessageBox, DialogBoxParam, CreateDialogParam, TaskDialog, …) BEFORE its entry point runs — so a dialog raised DURING STARTUP (a splash, nag, or error box) is caught from the first instruction and attributed to the app function that raised it. The dialogs it captures, with their caption and caller, appear in the Dialogs tab. Resolves the dialog functions by address from user32/comctl32, so it catches them however the program calls them." />
+                            <Separator />
+                            <MenuItem Header="Launch .NET &amp; capture…" Click="OnLaunchManaged"
+                                      ToolTip="Launch a .NET (managed) executable from disk and capture its managed calls — the managed counterpart of Launch &amp; capture. The target starts with DOTNET_TieredCompilation=0 (stable JIT addresses); CDA waits for the runtime to come up and app code to JIT, then hooks its methods' native entries through the same pipeline as a native capture, recording calls (and, with 'Capture returns' on, return values). Methods that JIT later are hooked by a background re-scan. Framework methods (System.*/Microsoft.*) are skipped. Because methods JIT lazily, the very first calls of a method may be missed; exercise the app to surface more. Managed method discovery supports 64-bit .NET targets only; use a native capture mode for 32-bit .NET targets." />
+                            <MenuItem Header="Capture DLL…" Click="OnLaunchDllCapture"
+                                      ToolTip="Launch a host under a debugger and instrument a chosen DLL the instant it loads — capturing its DllMain and startup from the first instruction. Pick the DLL, then optionally a host EXE that loads it (Cancel = use rundll32)." />
+                            <MenuItem Header="Follow children…" Click="OnFollowChildren"
+                                      ToolTip="Launch an executable under a debugger that follows every process it spawns AND instruments each one the instant it starts (frozen at creation, before its code runs). Per-process call counts stream into the diagnostics. Use Stop capture to remove the hooks and detach (leaves the tree running)." />
+                        </MenuItem>
+                    </Menu>
+
+                    <Button Content="Attach to process…" Margin="7,0,0,4" Click="OnAttach" TabIndex="11"
+                            ToolTip="Attach to a running process and discover its call graph (read-only). Active call recording is the next, gated step." />
+
+                    <Menu Background="Transparent" Padding="0" VerticalAlignment="Center"
+                          IsMainMenu="False" TabIndex="12" Margin="7,0,0,4">
+                        <MenuItem Style="{StaticResource DropButton}" Header="Open"
+                                  ToolTip="Bring something in without running it: a PE module to inspect statically, a saved trace to review offline, or the built-in demo trace.">
+                            <MenuItem Header="Open module (PE)…" Click="OnOpenModule"
+                                      ToolTip="Statically load an EXE/DLL: lists its functions and shows its bytes. Does NOT run it — use Launch &amp; capture for that." />
+                            <MenuItem Header="Open trace…" Click="OnOpenTrace"
+                                      ToolTip="Open a saved .cdatrace file and review it offline: functions, call graph, timeline, calls log, and caller tree (no live target needed)." />
+                            <Separator />
+                            <MenuItem Header="Load demo trace" Click="OnLoadDemo" />
+                        </MenuItem>
+                    </Menu>
+
+                    <Border Width="1" Height="20" Background="{StaticResource Outline}"
+                            VerticalAlignment="Center" Margin="11,0,11,4" />
+
+                    <Menu Background="Transparent" Padding="0" VerticalAlignment="Center"
+                          IsMainMenu="False" TabIndex="13" Margin="0,0,0,4">
+                        <MenuItem Style="{StaticResource DropButton}" Header="Capture"
+                                  ToolTip="Instrument the process you are already attached to. Attach to a process first.">
+                            <MenuItem Header="Start capture" Click="OnStartCapture"
+                                      ToolTip="Instrument ONLY the function selected on the left and record its live calls with decoded arguments." />
+                            <Separator />
+                            <MenuItem Header="Capture Windows API" Click="OnCaptureApi"
+                                      ToolTip="On the attached process, hook the Windows API functions it imports (kernel32, user32, ntdll, …) and record every call to them — with arguments and decoded strings. Attach to a process first. Ultra-hot primitives (critical-section/heap/last-error) are skipped to avoid flooding; click one to trace it specifically." />
+                            <MenuItem Header="Capture imports (IAT)" Click="OnCaptureIat"
+                                      ToolTip="Like Capture Windows API, but reroutes calls by overwriting the import-address-table SLOTS in the target's own modules instead of patching code. It writes only to the import table (data), never to .text — so it captures targets that checksum their own code (anti-tamper) and self-terminate when patched. Attach to a process first." />
+                            <MenuItem Header="Capture (hardware bp)" Click="OnCaptureHwbp"
+                                      ToolTip="Trace the SELECTED function using a CPU debug register (hardware breakpoint) — writes NOTHING to the target's memory, so it captures binaries that both checksum their code and can't be IAT-hooked. Attaches as a debugger (an anti-debug target may notice), watches up to 4 addresses, x64 only. Attach, click a function, then click this." />
+                            <MenuItem Header="Capture .NET (managed)" Click="OnCaptureManaged"
+                                      ToolTip="On the attached .NET process, discover its JIT-compiled app methods (via ClrMD) and hook their native entries through the same inline-hook pipeline as a native capture — recording every managed call with arguments (and, with 'Capture returns' on, return values). A background timer re-scans and hooks methods that JIT later. Attach to a .NET process first. For the most complete coverage launch the target with DOTNET_TieredCompilation=0 (stable JIT addresses); on an already-running target some pre-hook calls are missed and tiered re-JIT may bypass a hook (the re-scan re-hooks the new address). Framework methods (System.*/Microsoft.*) are skipped. Managed method discovery supports 64-bit .NET targets only; native capture modes remain available for 32-bit .NET targets." />
+                            <Separator />
+                            <MenuItem Header="Detect dialog caller" Click="OnDetectDialogCaller"
+                                      ToolTip="On the attached process, hook only the OS dialog-box functions (MessageBox, DialogBoxParam, CreateDialogParam, TaskDialog, …). When the target pops a dialog, the Dialogs tab shows its caption and — the point — the app function that raised it, with the caller lit up in the function list, graph, and call stack. Resolves the dialog functions by address from user32/comctl32, so it catches them however the program calls them (import, GetProcAddress, delay-load). Attach to a process first." />
+                        </MenuItem>
+                    </Menu>
+
+                    <Button Style="{StaticResource DangerButton}" Content="Stop capture"
+                            Margin="7,0,0,4" Click="OnStopCapture" TabIndex="14"
+                            ToolTip="Remove the installed hooks, detach, and freeze the trace for review." />
+                    <Button Style="{StaticResource GhostButton}" Content="Clear calls"
+                            x:Name="ClearCallsButton" IsEnabled="False" Margin="4,0,0,4" Click="OnClearCalls" TabIndex="15"
+                            ToolTip="Clear the recorded calls, counts, caller tree, and graph shown so far and KEEP capturing — the hooks stay installed, so subsequent calls are recorded fresh. Use it to reset the log, then exercise one action in the target to see only what that triggers. (Live capture only; Stop capture removes the hooks and freezes the trace for review instead.)" />
+
+                    <!-- Only visible while following a process tree. -->
+                    <StackPanel x:Name="ChildTargetPanel" Orientation="Horizontal"
+                                Visibility="Collapsed" VerticalAlignment="Center" Margin="11,0,0,4">
+                        <TextBlock Text="Target" Style="{StaticResource ToolbarLabel}" Margin="0,0,6,0" />
+                        <ComboBox x:Name="ChildTargetBox" Width="260" VerticalAlignment="Center" FontSize="12" TabIndex="16"
+                                  DisplayMemberPath="Display" SelectionChanged="OnChildTargetChanged"
+                                  ToolTip="Choose which followed process to view. Its captured calls drive the function list, call graph, calls log, caller tree, and timeline. The other followed processes keep recording in the background; switch between them any time, including after they exit." />
+                    </StackPanel>
+                </WrapPanel>
+            </DockPanel>
         </Border>
 
-        <!-- Status bar -->
-        <Border DockPanel.Dock="Bottom" Background="{StaticResource Surface}" Padding="10,4">
-            <DockPanel>
-                <TextBlock x:Name="DpiText" Foreground="{StaticResource TextMuted}" DockPanel.Dock="Right" />
-                <TextBlock x:Name="StatusText" Foreground="{StaticResource TextSecondary}" Text="Ready." />
+        <!-- =====================================================================
+             Options bar (row 2): the six capture switches and the live filter.
+
+             These are modifiers, not commands — they change what the next capture
+             does rather than doing anything themselves — so they sit on their own
+             recessed row instead of competing with the buttons. Same CheckBox
+             controls, same x:Names, same IsChecked defaults and the same handler
+             as before; only the template changed (ToggleChip). The chips live in a
+             WrapPanel for the same no-clip reason as the command bar.
+             ===================================================================== -->
+        <Border DockPanel.Dock="Top" Background="{StaticResource SurfaceAlt}"
+                BorderBrush="{StaticResource Outline}" BorderThickness="0,0,0,1" Padding="10,6"
+                KeyboardNavigation.TabNavigation="Local">
+            <DockPanel LastChildFill="True">
+
+                <!-- The live record filter, docked right so it lines up under the trace commands. -->
+                <TextBox x:Name="CaptureCondBox" DockPanel.Dock="Right" Width="230" VerticalAlignment="Center"
+                         FontSize="11.5" TextChanged="OnCaptureConditionChanged" TabIndex="90"
+                         ToolTip="Record only calls matching these space-separated clauses (all must match): argN==V / argN!=V / argN&lt;V / argN&gt;V / argN&amp;V (V is 0x-hex or decimal; &amp; is a flag test); name~TEXT or name!~TEXT (callee name contains); str~TEXT or str!~TEXT (decoded string arg contains). Blank = record everything. Applies live during capture." />
+                <TextBlock DockPanel.Dock="Right" Text="CAPTURE ONLY" Style="{StaticResource ToolbarLabel}" Margin="12,0,8,0" />
+
+                <WrapPanel Orientation="Horizontal">
+                    <TextBlock Text="OPTIONS" Style="{StaticResource ToolbarLabel}" Margin="0,0,10,0" />
+                    <Border Width="1" Height="16" Background="{StaticResource Outline}"
+                            VerticalAlignment="Center" Margin="0,0,10,0" />
+
+                    <CheckBox x:Name="AutoCapture" Style="{StaticResource ToggleChip}" TabIndex="20"
+                              Content="Auto-capture on select" IsChecked="True" Margin="0,0,6,2"
+                              ToolTip="When on, clicking a function in the list immediately starts tracing it — no Start button needed." />
+                    <CheckBox x:Name="CaptureReturns" Style="{StaticResource ToggleChip}" TabIndex="21"
+                              Content="Capture returns" IsChecked="False" Margin="0,0,6,2"
+                              ToolTip="When on, a focused capture (Start capture / auto-capture-on-select) also records each call's RETURN value (RAX/EAX), shown in the Calls log's Return column. Uses a return trampoline; one outstanding return per hooked function at a time (concurrent/recursive returns are sampled); integer returns only (a float/double return shows a meaningless RAX). Set before starting a capture. On x64 a vectored exception handler is installed in the target so a C++/SEH exception unwinding through a hooked frame is handled safely (it un-redirects that call's return rather than crashing); on an exception-heavy target this can reduce how many returns are captured, but it won't crash." />
+                    <CheckBox x:Name="FilterLeftOnClear" Style="{StaticResource ToggleChip}" TabIndex="22"
+                              Content="Only new on left" IsChecked="True" Margin="0,0,6,2" Click="OnFilterLeftOnClearClicked"
+                              ToolTip="Filter the function list (left) to show only functions that have calls — they appear live as they run (equivalent to the list's Hide 0-hit; Show all restores the rest). Toggling applies to the list immediately, and also controls whether Clear calls filters the left to just the functions hit since the clear. Uncheck to show the full function list." />
+
+                    <Border Width="1" Height="16" Background="{StaticResource Outline}"
+                            VerticalAlignment="Center" Margin="5,0,11,0" />
+
+                    <CheckBox x:Name="DisableAslr" Style="{StaticResource ToggleChip}" TabIndex="23"
+                              Content="Disable ASLR" IsChecked="False" Margin="0,0,6,2"
+                              ToolTip="For the launch commands (Launch &amp; capture, Capture DLL, Follow children), start the target with ASLR off so its modules load at the same base every run — making the absolute addresses in a capture reproducible across runs and comparable across saved .cdatrace files. CDA launches a throwaway copy of the image with its /DYNAMICBASE opt-in stripped (so the loader uses its preferred base), and also applies a per-process bottom-up mitigation policy. It affects only programs CDA launches; nothing global is changed. Requires Windows mandatory ASLR (force-relocate) to be OFF, which is the default. Only the launched image (and, for Follow children, the root) is pinned — spawned children keep their own ASLR." />
+                    <CheckBox x:Name="FollowSkipSystem" Style="{StaticResource ToggleChip}" TabIndex="24"
+                              Content="Skip system" IsChecked="True" Margin="0,0,6,2"
+                              ToolTip="When following a process tree, don't instrument OS helper processes (those whose image is under \Windows\, e.g. conhost.exe, WerFault.exe) — they're still followed and listed in the diagnostics, just not hooked. The executable you launch is always instrumented. Read when you click Follow children." />
+                    <CheckBox x:Name="AutoBisectCrashes" Style="{StaticResource ToggleChip}" TabIndex="25"
+                              Content="Auto-bisect crashes" IsChecked="False" Margin="0,0,6,2"
+                              ToolTip="OFF by default. When a Launch &amp; capture crash can't be pinned to a single hook (a deferred culprit), binary-search the armed hooks to isolate it — relaunching the target HIDDEN (no window pop-ups / focus stealing), bounded, and cancellable with Stop capture. The culprit's RVA is written to cda_hook_skip.txt; you then re-launch to trace past it. The only way to find a deferred culprit is by re-running, so this relaunches — just invisibly." />
+                </WrapPanel>
             </DockPanel>
+        </Border>
+
+        <!-- =====================================================================
+             Status bar: capture state at a glance.
+
+             Left, a live pill — grey "idle", green "attached", red "capturing" —
+             so the single most important piece of state (are hooks in the target
+             right now?) is never something you have to infer from the last log
+             line. StatusText keeps its role as the running commentary and its
+             x:Name, so the ~100 places that write to it are untouched.
+
+             A Grid rather than a DockPanel: docked children take their full
+             desired width first, which let the fixed hint text squeeze StatusText
+             out of existence on a narrow window. Proportional columns with
+             MinWidths mean both shrink together and both stay legible.
+             ===================================================================== -->
+        <Border DockPanel.Dock="Bottom" Background="{StaticResource Surface}"
+                BorderBrush="{StaticResource Outline}" BorderThickness="0,1,0,0" Padding="10,5">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />                  <!-- capture pill -->
+                    <ColumnDefinition Width="2*" MinWidth="150" />     <!-- StatusText -->
+                    <ColumnDefinition Width="*"  MinWidth="70" />      <!-- interaction hint -->
+                    <ColumnDefinition Width="Auto" />                  <!-- separator -->
+                    <ColumnDefinition Width="Auto" />                  <!-- target + call count -->
+                    <ColumnDefinition Width="Auto" />                  <!-- DPI -->
+                </Grid.ColumnDefinitions>
+
+                <Border x:Name="CapturePill" Grid.Column="0" CornerRadius="10" Padding="8,2"
+                        BorderBrush="{StaticResource OutlineStrong}" BorderThickness="1" Margin="0,0,10,0">
+                    <StackPanel Orientation="Horizontal">
+                        <Ellipse x:Name="CaptureLed" Width="7" Height="7" VerticalAlignment="Center"
+                                 Fill="{StaticResource TextMuted}" />
+                        <TextBlock x:Name="CaptureStateText" Text="idle" Margin="6,0,0,0" FontSize="11"
+                                   Foreground="{StaticResource TextMuted}" VerticalAlignment="Center" />
+                    </StackPanel>
+                </Border>
+
+                <TextBlock x:Name="StatusText" Grid.Column="1" Foreground="{StaticResource TextSecondary}"
+                           Text="Ready." FontSize="11.5" VerticalAlignment="Center"
+                           TextTrimming="CharacterEllipsis" ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+
+                <TextBlock Grid.Column="2" Foreground="{StaticResource TextMuted}" FontSize="11.5"
+                           VerticalAlignment="Center" TextTrimming="CharacterEllipsis" Margin="12,0,0,0"
+                           Text="graph: click a node to focus · timeline: click=scrub, ←→=step (Ctrl=bigger), right-drag=select" />
+
+                <Border Grid.Column="3" Width="1" Height="14" Background="{StaticResource Outline}"
+                        VerticalAlignment="Center" Margin="12,0" />
+                <TextBlock x:Name="TraceStatsText" Grid.Column="4" Foreground="{StaticResource TextSecondary}"
+                           FontSize="11.5" VerticalAlignment="Center" />
+                <TextBlock x:Name="DpiText" Grid.Column="5" Foreground="{StaticResource TextMuted}"
+                           FontSize="11.5" VerticalAlignment="Center" Margin="12,0,0,0" />
+            </Grid>
         </Border>
 
         <!-- Playback timeline -->

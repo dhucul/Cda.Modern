@@ -10,12 +10,12 @@
                     ToolTip="Collapse the tree back to the direct callers." />
         </StackPanel>
         <TextBlock x:Name="Header" DockPanel.Dock="Top" Foreground="{StaticResource TextSecondary}"
-                   Margin="8,6" FontFamily="Cascadia Mono, Consolas" FontSize="12"
+                   Margin="8,6" FontFamily="{StaticResource MonoFont}" FontSize="12"
                    TextWrapping="NoWrap"
                    Text="Select a function to see who calls it." />
         <TreeView x:Name="Tree" Background="{StaticResource Surface}" BorderThickness="0"
                   Foreground="{StaticResource TextPrimary}"
-                  FontFamily="Cascadia Mono, Consolas" FontSize="12"
+                  FontFamily="{StaticResource MonoFont}" FontSize="12"
                   VirtualizingPanel.IsVirtualizing="True"
                   VirtualizingPanel.VirtualizationMode="Recycling"
                   ScrollViewer.HorizontalScrollBarVisibility="Auto"

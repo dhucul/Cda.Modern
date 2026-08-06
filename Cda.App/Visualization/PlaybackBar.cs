@@ -47,15 +47,15 @@ namespace Cda.App.Visualization
         private int _binMax = 1, _binCount, _binRecords = -1;
         private double _binViewStart = double.NaN, _binViewEnd = double.NaN;
 
-        private static readonly Brush Bg = Frozen(Color.FromRgb(0x21, 0x27, 0x2F));
+        private static readonly Brush Bg = Frozen(Color.FromRgb(0x1F, 0x23, 0x2A));
         private static readonly Brush Density = Frozen(Color.FromArgb(0xFF, 0x60, 0x90, 0xD4));
         private static readonly Brush CursorBand = Frozen(Color.FromArgb(0x55, 0xF2, 0xD0, 0x8A));
         private static readonly Pen CursorPen = FrozenPen(Color.FromRgb(0xF2, 0xD0, 0x8A), 1.0);
         private static readonly Brush SelectionBand = Frozen(Color.FromArgb(0x33, 0x60, 0x90, 0xD4));
         private static readonly Pen AxisPen = FrozenPen(Color.FromArgb(0x55, 0x8A, 0x95, 0xA9), 1.0);
         private static readonly Pen FocusPen = FrozenPen(Color.FromArgb(0x99, 0x60, 0x90, 0xD4), 1.0);
-        private static readonly Typeface AxisFace = new("Segoe UI");
-        private static readonly Brush AxisText = Frozen(Color.FromArgb(0xAA, 0x8A, 0x95, 0xA9));
+        private static readonly Typeface AxisFace = AppFonts.UiRegular;
+        private static readonly Brush AxisText = Frozen(Color.FromArgb(0xAA, 0x6B, 0x74, 0x81));
 
         public PlaybackBar()
         {

@@ -4,7 +4,8 @@
         Title="Attach to process"
         Width="560" Height="640"
         WindowStartupLocation="CenterOwner"
-        Background="{StaticResource Surface}">
+        Background="{StaticResource Surface}"
+        FontFamily="{StaticResource UiFont}">
     <DockPanel Margin="10">
         <TextBlock DockPanel.Dock="Top" Foreground="{StaticResource TextSecondary}" Margin="0,0,0,8"
                    TextWrapping="Wrap"
@@ -29,7 +30,7 @@
         </Border>
 
         <ListBox x:Name="List"
-                 DisplayMemberPath="Display" FontFamily="Cascadia Mono, Consolas" FontSize="12"
+                 DisplayMemberPath="Display" FontFamily="{StaticResource MonoFont}" FontSize="12"
                  MouseDoubleClick="OnListDoubleClick" />
     </DockPanel>
 </Window>
