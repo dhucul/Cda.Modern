@@ -63,6 +63,23 @@ namespace Cda.Core.Engine
             public int Pid;
             public bool Is64Bit;
             public TraceDataset Dataset = null!; // modules + functions (+ static call edges)
+
+            /// <summary>
+            /// The image's entry point as an absolute address at its actual load
+            /// base, or 0 if the image declares none. The process is frozen at its
+            /// create event when this is reported, so the hooks are armed before it
+            /// runs.
+            /// </summary>
+            public ulong EntryPoint;
+
+            /// <summary>
+            /// The addresses actually armed in this process. The candidate filter and
+            /// the hook cap mean this is a subset of <c>Dataset.Functions</c>, so it is
+            /// what decides whether <see cref="EntryPoint"/> could ever have been
+            /// observed firing.
+            /// </summary>
+            public IReadOnlyList<ulong> HookedTargets = Array.Empty<ulong>();
+
             public int Instrumented;
             public int Skipped;
             public string? FirstError;
@@ -432,6 +449,8 @@ namespace Cda.Core.Engine
                 ProcessHooked?.Invoke(new HookedProcess
                 {
                     Pid = pid, Is64Bit = pe.Is64Bit, Dataset = ds,
+                    EntryPoint = pe.EntryPointRva == 0 ? 0 : unchecked(imageBase + pe.EntryPointRva),
+                    HookedTargets = session.HookedTargets,
                     Instrumented = instrumented, Skipped = skipped, FirstError = firstError,
                 });
             }

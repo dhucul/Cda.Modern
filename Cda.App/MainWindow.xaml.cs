@@ -104,6 +104,8 @@ namespace Cda.App
         private readonly Dictionary<ulong, bool> _startupRetCache = new(); // stack word -> looks like a return address
         private int _startupGeneration;          // monotonic token: a superseded post-start coroutine bails (guards rapid re-launches)
         private ulong _startupImageBase;         // main image base this attempt, to turn a culprit address into a stable RVA
+        private ulong _startupHeaderEntry;       // the image's declared entry (absolute), to compare against the observed one
+        private bool _startupEntryReported;      // the observed entry point has been logged for this attempt
         private bool _disableAslr;               // launch the target with ASLR forced off (set from the toolbar at launch time)
         // Originals we wrote a fixed-base (ASLR-stripped) copy next to this session, so
         // those copies can be best-effort swept on close (the ones whose target exited).
@@ -148,6 +150,16 @@ namespace Cda.App
             public long TotalCalls;                            // cumulative, incl. trimmed
             public bool Exited;
             public ChildTargetItem Item = null!;
+
+            // Entry-point reporting, per process: the observed entry is logged once,
+            // from this process's first batch, and compared against its own declared
+            // entry and armed set. Every process in a followed tree has a different
+            // image base, so none of this can be shared.
+            public ulong ImageBase;
+            public ulong HeaderEntry;                  // declared entry, absolute (0 = none)
+            public HashSet<ulong>? HookedSet;          // what was actually armed here
+            public bool EntryReported;
+            public string EntryField = "";             // short form for the status-bar field
         }
 
         // Selector row; Display updates live (call count / exited) without losing
@@ -319,6 +331,76 @@ namespace Cda.App
         {
             _diag.Add(msg);
             StatusText.Text = msg;
+        }
+
+        // --- pinned status ---------------------------------------------------
+        // A one-off announcement (currently: the observed entry point) has to survive
+        // long enough to be read. It can't just write StatusText: the poll loop rewrites
+        // that line every 100 ms tick, and in the same tick it would be overwritten
+        // before WPF rendered a frame — so the message would never appear at all.
+        //
+        // A pin holds the line for a few seconds. Only the ROUTINE per-poll status
+        // defers to it (see SetRoutineStatus); one-off writes — errors, target exited,
+        // capture stopped — still write StatusText directly and rightly win, because a
+        // stale entry-point line must never mask a failure.
+        private const int StatusPinMs = 6000;
+        private long _statusPinUntil;
+
+        private void PinStatus(string msg)
+        {
+            StatusText.Text = msg;
+            _statusPinUntil = Environment.TickCount64 + StatusPinMs;
+        }
+
+        // The recurring "Capturing · N hook(s) · M calls" style updates. Dropped while
+        // a pin is live; the next tick after it lapses restores the running commentary,
+        // so nothing needs to be restored by hand.
+        private void SetRoutineStatus(string msg)
+        {
+            if (Environment.TickCount64 < _statusPinUntil) return;
+            StatusText.Text = msg;
+        }
+
+        // --- entry-point formatting -------------------------------------------
+        // An entry point is printed as the COMPLETE link-time address, lowercase and
+        // unprefixed — 1404a4590 — not as a +RVA. That is the form a static
+        // disassembler shows, so it can be pasted straight into IDA/Ghidra, and it is
+        // stable across runs: ASLR moves the live base every launch, the link-time
+        // address never moves. (With "Disable ASLR" on, the two are the same anyway.)
+        //
+        // Falls back to the live VA when the module has no recorded preferred base —
+        // synthetic/runtime-only modules and older saved traces — where a link-time
+        // address doesn't exist to print.
+        private static string EntryAddr(ulong live, ModuleInfo? module) =>
+            PreferredOf(live, module).ToString("x");
+
+        private static ulong PreferredOf(ulong live, ModuleInfo? module) =>
+            module != null && module.TryToPreferredAddress(live, out ulong preferred)
+                ? preferred
+                : live;
+
+        // --- entry-point field ------------------------------------------------
+        // The status bar's own slot for the trace's entry point. StatusText scrolls
+        // past and _diag is only readable after the fact via Copy results, so neither
+        // can answer "what is this trace rooted at?" while the trace is running. This
+        // one is set at launch and stays put until the next launch.
+        // Both guards matter: these run from launch paths that can be reached before the
+        // status bar is realised, and the pair is set together or not at all — guarding
+        // only one would still throw on the other.
+        private void ShowEntryPoint(string text)
+        {
+            if (EntryPointText == null || EntryPointSep == null) return;
+            EntryPointText.Text = text;
+            EntryPointText.Visibility = Visibility.Visible;
+            EntryPointSep.Visibility = Visibility.Visible;
+        }
+
+        private void ClearEntryPoint()
+        {
+            if (EntryPointText == null || EntryPointSep == null) return;
+            EntryPointText.Text = "";
+            EntryPointText.Visibility = Visibility.Collapsed;
+            EntryPointSep.Visibility = Visibility.Collapsed;
         }
 
         public MainWindow()
@@ -1009,6 +1091,7 @@ namespace Cda.App
             // capture is stopped only once the new target is confirmed (just before the
             // session swap below), which also avoids the old poll racing a replaced session.
             _diag.Clear();
+            ClearEntryPoint(); // a managed image's native entry is the CLR stub — nothing to show
             Diag($"launch .NET: {System.IO.Path.GetFileName(exe)} — starting with DOTNET_TieredCompilation=0…");
             BeginTargetBusyCursor(targetGeneration);
             try
@@ -1527,6 +1610,7 @@ namespace Cda.App
             int pid = picker.SelectedPid;
             string label = picker.SelectedEntry?.Name ?? pid.ToString();
             _diag.Clear();
+            ClearEntryPoint(); // attaching mid-run: the entry point already ran, unobserved
             Diag($"attach: {label} ({pid}) — discovering…");
             SetCallersTarget(0);
             _offlineTrace = false;
@@ -1639,6 +1723,13 @@ namespace Cda.App
             _childView = false;
             _startupSortedEntries = null;
             _startupHookedSet = null;
+            _startupHeaderEntry = 0;
+            _startupEntryReported = false;
+            // An auto-bisection relaunches the SAME binary many times, hidden, so the
+            // field already holds the right answer and must not flicker through
+            // clear→declared→observed on every attempt. Leave the status bar untouched
+            // for the whole search; the diagnostic log still records each attempt.
+            if (!_bisecting) ClearEntryPoint();
             _startupRetCache.Clear();
             _faultSeenThisAttempt = false;
             _crashAppendedThisAttempt = false;
@@ -1723,6 +1814,25 @@ namespace Cda.App
 
                     var discovered = BuildUiDataset(name, imageBase, exe.PreferredImageBase,
                         exe.SizeOfImage, path, funcs, edges);
+                    // The DECLARED entry, from the header and the static scan. It is the
+                    // pre-run anchor only — the entry point this trace actually has is
+                    // the first function the target is caught entering, reported from the
+                    // first decoded batch (see ReportStartupEntry). Kept to compare the
+                    // two: they diverge exactly when the declared entry wasn't armed.
+                    _startupHeaderEntry = exe.EntryPointRva == 0 ? 0 : imageBase + exe.EntryPointRva;
+                    DiagEntryPoint(name + " (declared)", _startupHeaderEntry,
+                        discovered.Modules[0], discovered);
+
+                    // Put something in the status bar's entry-point slot NOW, while the
+                    // target is still frozen. This is the declared entry, flagged as
+                    // such — ReportObservedEntry overwrites it with the observed one as
+                    // soon as a call is captured. Without this the field would stay
+                    // empty on the common trace that never captures anything, which is
+                    // exactly when you most want to know where it was supposed to start.
+                    if (!_bisecting)
+                        ShowEntryPoint(_startupHeaderEntry == 0
+                            ? "entry: (none declared)"
+                            : $"entry: {EntryAddr(_startupHeaderEntry, discovered.Modules[0])} (declared)");
                     // NOTE: the Strings tab is filled AFTER the target is running (see the
                     // background scan post-resume) — mining strings disassembles the image
                     // and must never sit in the suspended/arm/resume critical path.
@@ -2306,6 +2416,7 @@ namespace Cda.App
             _maxCursorSeen = 0;
             _captureFocus = 0;
             _diag.Clear();
+            ClearEntryPoint(); // refilled with DllMain once the DLL is hooked at load
             Diag($"DLL capture: {dllName} via {Path.GetFileName(hostPath)} (waiting for load…)");
             SetCallersTarget(0);
             _apiCaptureMode = false;
@@ -2403,6 +2514,16 @@ namespace Cda.App
             _pollTimer.Tick += OnPollTick;
             _pollTimer.Start();
             Diag($"tracing {h.Module.Name} from load · {h.Instrumented} hook(s) armed before DllMain — capturing…");
+            // For a DLL the declared entry IS DllMain — the routine the line above
+            // says the hooks beat. Report it against the same discovery output.
+            DiagEntryPoint(h.Module.Name + " · DllMain", h.EntryPoint, h.Module, h.Dataset);
+            // …and into the status-bar field, so this path doesn't leave the previous
+            // target's entry on screen. Declared only: this path has no observed-entry
+            // seam, so it is never upgraded.
+            if (h.EntryPoint != 0)
+                ShowEntryPoint($"entry: {EntryAddr(h.EntryPoint, h.Module)} (DllMain)");
+            else
+                ClearEntryPoint();
 
             // Attach a read-only live session so the hex view has bytes and
             // click-to-refocus works; widen the module map for better resolution.
@@ -2467,6 +2588,7 @@ namespace Cda.App
             StopApiLaunch();
             StopChildFollow();
             _diag.Clear();
+            ClearEntryPoint(); // refilled per followed process, tracking the selection
             int targetGeneration = unchecked(++_targetGeneration);
 
             // Fresh multi-target state for this run; reveal the target picker.
@@ -2582,11 +2704,21 @@ namespace Cda.App
                 Dataset = hp.Dataset,
                 ModuleMap = new ModuleMap(hp.Dataset.Modules),
                 Item = item,
+                ImageBase = hp.Dataset.Modules.Count > 0 ? hp.Dataset.Modules[0].BaseAddress : 0,
+                HeaderEntry = hp.EntryPoint,
+                HookedSet = new HashSet<ulong>(hp.HookedTargets),
             };
             item.Display = ChildLabel(t);
             _childTargets[hp.Pid] = t;
             _childItems.Add(item);
             ChildTargetPanel.Visibility = Visibility.Visible;
+
+            // One line per followed process, so a tree's roots and its spawned
+            // children are each anchored in the diagnostics. Guarded on Modules
+            // because the label above already tolerates an empty module list.
+            if (hp.Dataset.Modules.Count > 0)
+                DiagEntryPoint($"pid {hp.Pid} · {image}", hp.EntryPoint,
+                    hp.Dataset.Modules[0], hp.Dataset);
 
             if (_childSelectedPid < 0)
                 ChildTargetBox.SelectedItem = item; // fires OnChildTargetChanged -> SelectChildTarget
@@ -2598,6 +2730,22 @@ namespace Cda.App
         {
             if (recs.Count == 0) return;
             if (!_childTargets.TryGetValue(pid, out var t)) return;
+
+            // This process's own entry point, from its own first batch — before the
+            // records are folded in, so the "first" test can't be spoiled by a trim.
+            // Runs for every followed process whether or not it is the one on screen:
+            // a tree's short-lived children are usually never selected, and their root
+            // is exactly what the diagnostics are for.
+            if (!t.EntryReported)
+            {
+                t.EntryReported = true;
+                t.EntryField = ReportObservedEntry($"pid {pid} · {t.Image}", recs,
+                    t.ModuleMap, t.HeaderEntry, t.HookedSet, t.Dataset);
+                // One field, many processes: it shows whichever is on screen. Switching
+                // targets re-reads it from the target (see SelectChildTarget), so an
+                // unselected process's entry isn't lost — it's just not displayed yet.
+                if (pid == _childSelectedPid) ShowEntryPoint(t.EntryField);
+            }
 
             t.TotalCalls += recs.Count;
             t.Records.AddRange(recs);
@@ -2619,7 +2767,7 @@ namespace Cda.App
                 _model.SetActiveWindow(_captured[from].Time, _captured[_captured.Count - 1].Time + 1e-9);
                 GraphView.RefreshActive();
             }
-            StatusText.Text = $"Following · viewing pid {pid} ({t.Image}) · {t.TotalCalls} calls";
+            SetRoutineStatus($"Following · viewing pid {pid} ({t.Image}) · {t.TotalCalls} calls");
         }
 
         private void OnChildProcessExited(int pid)
@@ -2661,6 +2809,13 @@ namespace Cda.App
             _moduleMap = t.ModuleMap;
             _liveDataset = t.Dataset;
             _selectedFunctionAddr = 0;
+
+            // Follow the selection: show this process's entry point, or its declared one
+            // if it hasn't produced a record yet.
+            if (t.EntryField.Length > 0) ShowEntryPoint(t.EntryField);
+            else if (t.HeaderEntry != 0)
+                ShowEntryPoint($"entry: {EntryAddr(t.HeaderEntry, t.ModuleMap.Resolve(t.HeaderEntry))} (declared)");
+            else ClearEntryPoint();
 
             _captured.Clear();
             AppendCapturedTimeOrdered(t.Records);
@@ -2751,6 +2906,62 @@ namespace Cda.App
             for (int i = 0; i < edges.Count; i++)
                 ds.Records.Add(new CallRecord((double)i / n, edges[i].Site, edges[i].Target));
             return ds;
+        }
+
+        // Report the traced image's entry point — the root the whole startup trace
+        // hangs off — as part of the discovery diagnostics. Shared by every launch
+        // path that statically discovers code before the target runs: the suspended
+        // EXE launch, the DLL-at-load path (where the entry IS DllMain), and each
+        // process the child-follow loop freezes at its create event.
+        //
+        // The address comes from the optional header, but the useful half is the
+        // cross-check against the code the scan actually produced: CallSiteScanner
+        // seeds traversal with imageBase + EntryPointRva (see BuildSeeds), so the
+        // entry MUST come back as a discovered function. When it doesn't, the scan
+        // never reached the real code — the classic packed/compressed image, whose
+        // header entry lands in an unpacker stub — which is the same condition the
+        // MinPreRunFunctions check infers from function count alone. Saying it
+        // outright means the pre-run hook set can be judged before the target is ever
+        // resumed.
+        //
+        // Takes the finished TraceDataset rather than the raw discovery lists so all
+        // three callers pass the same shape: ds.Records carries the static call edges
+        // (Source = call site) exactly as BuildUiDataset and its two Cda.Core
+        // equivalents build them.
+        //
+        // Extent is the gap to the next discovered address, matching StartupPlan's
+        // convention (discovery yields entry points, not lengths).
+        private void DiagEntryPoint(string what, ulong entry, ModuleInfo module, TraceDataset ds)
+        {
+            if (entry == 0)
+            {
+                _diag.Add($"entry point ({what}): none declared in the optional header — " +
+                          "no single root to anchor the trace to.");
+                return;
+            }
+
+            bool found = false;
+            ulong next = ulong.MaxValue;
+            foreach (var f in ds.Functions)
+            {
+                if (f.Address == entry) found = true;
+                else if (f.Address > entry && f.Address < next) next = f.Address;
+            }
+
+            ulong end = next != ulong.MaxValue ? next : module.BaseAddress + module.Size;
+            int outbound = 0;
+            foreach (var rec in ds.Records)
+                if (rec.Source >= entry && rec.Source < end) outbound++;
+
+            // Live VA appended only when ASLR actually moved the image, so the common
+            // (fixed-base) case prints one address rather than the same one twice.
+            string live = entry == PreferredOf(entry, module) ? "" : $" (live 0x{entry:X})";
+
+            _diag.Add($"entry point ({what}): {EntryAddr(entry, module)}{live}" +
+                      (found
+                          ? $" — confirmed in the scan, {outbound} outbound call site(s) before the next function"
+                          : " — NOT among the discovered functions; the scan never reached it " +
+                            "(packed/encrypted image, or an entry the traversal couldn't decode)"));
         }
 
         // Broad candidate set for a startup trace. Delegates to the shared
@@ -3395,6 +3606,9 @@ namespace Cda.App
             _maxCursorSeen = 0;
             _captureFocus = 0;
             _diag.Clear();
+            // This mode hooks the OS API surface, not the app's own code, so it never
+            // discovers an entry point to show.
+            ClearEntryPoint();
             SetCallersTarget(0);
             _apiCaptureMode = false;
             _offlineTrace = false;
@@ -5407,6 +5621,87 @@ namespace Cda.App
         // the old whole-history Sort on every poll. The usual single-threaded batch
         // takes the allocation-free append path; concurrent claim/timestamp inversions
         // sort only the incoming batch, and a rare boundary inversion is merged in O(n).
+        // The entry point a trace actually HAS: the first function its target was
+        // caught entering.
+        //
+        // The declared (header) entry can't answer this. The hooks armed before resume
+        // are a filtered SUBSET of what discovery found — StartupPlan drops the hottest
+        // few and holds back leaf primitives, the cda_hook_skip.txt RVAs are excluded,
+        // and the set is capped at StartupTraceFunctions — so the declared entry is
+        // frequently not among them, and on a packed image it isn't even the real code.
+        // Either way nothing fires at it and the header address names a function this
+        // trace never observed. What the trace is genuinely rooted at is the earliest
+        // record the target wrote, so that is what gets reported.
+        //
+        // Shared by the suspended-launch path (one target, once per attempt) and the
+        // child-follow loop (once per followed process — each has its own image base,
+        // declared entry and armed set, so nothing here may read shared state).
+        //
+        // A batch is not guaranteed to be in time order — the ring is drained per
+        // thread and AppendCapturedTimeOrdered exists precisely to merge it — so the
+        // earliest record is picked by Time rather than by position.
+        //
+        // Names come from the supplied dataset rather than ResolveCalleeName: that
+        // index is keyed to whichever target is on screen, which for a followed tree
+        // is usually not the process being reported.
+        //
+        // Returns the short form for the status bar's entry-point field. It is returned
+        // rather than assigned because a followed tree reports one of these per process
+        // and there is only one field: the caller decides whose entry it shows.
+        private string ReportObservedEntry(string what, List<CallRecord> batch, ModuleMap? modules,
+            ulong headerEntry, HashSet<ulong>? hookedSet, TraceDataset? names)
+        {
+            var first = batch[0];
+            for (int i = 1; i < batch.Count; i++)
+                if (batch[i].Time.CompareTo(first.Time) < 0) first = batch[i];
+
+            ulong entry = first.Destination;
+
+            string? name = null;
+            if (names != null)
+                foreach (var f in names.Functions)
+                    if (f.Address == entry) { name = f.Name; break; }
+
+            // Resolved per address, not against one assumed main module: a captured
+            // call can land outside it, and each module carries its own preferred base.
+            var entryModule = modules?.Resolve(entry);
+            string where = EntryAddr(entry, entryModule);
+            string live = entry == PreferredOf(entry, entryModule) ? "" : $" (live 0x{entry:X})";
+
+            string note;
+            if (headerEntry == 0)
+                note = "";
+            else if (headerEntry == entry)
+                note = " — this IS the image's declared entry";
+            else
+            {
+                string declared = EntryAddr(headerEntry, modules?.Resolve(headerEntry));
+                note = hookedSet != null && !hookedSet.Contains(headerEntry)
+                    ? $" — the declared entry ({declared}) was not among the armed hooks, " +
+                      "so the trace starts here instead"
+                    : $" — the declared entry ({declared}) was armed but had not fired " +
+                      "when this batch was drained";
+            }
+
+            string label = string.IsNullOrEmpty(name) ? "" : $" \"{name}\"";
+
+            _diag.Add($"trace entry point ({what}): {where}{live}{label}" +
+                      $" · first captured call at t={first.Time:F6}s" + note);
+
+            // Two surfaces, deliberately. The pin announces it once, in the running
+            // commentary, so it's noticed. The field keeps it for the rest of the run,
+            // so it can be looked up later without digging through Copy results. The
+            // declared-entry comparison and the timestamp stay in the diagnostic log —
+            // the full line would be truncated in either.
+            // Not during a hidden auto-bisection: each of its many relaunches would pin
+            // the status bar for six seconds, announcing a process the user was never
+            // shown and suppressing the routine capture status for most of the search.
+            if (!_bisecting)
+                PinStatus($"Entry point ({what}): {where}{label} — first captured call");
+
+            return $"entry: {where}{label}";
+        }
+
         private void AppendCapturedTimeOrdered(List<CallRecord> records)
         {
             if (records.Count == 0) return;
@@ -5698,6 +5993,17 @@ namespace Cda.App
             // no new visible record. Refresh those rows before the empty-batch exit.
             CallList.RefreshCompletedReturns();
 
+            // Deliberately on batch.Records, BEFORE the "Capture only" filter below:
+            // the trace's entry point is the first function the target entered, not
+            // the first one that happened to match a display filter.
+            if (_startupActive && !_startupEntryReported && batch.Records.Count > 0)
+            {
+                _startupEntryReported = true;
+                string field = ReportObservedEntry(_startupName ?? "target", batch.Records,
+                    _moduleMap, _startupHeaderEntry, _startupHookedSet, _liveDataset);
+                if (!_bisecting) ShowEntryPoint(field);
+            }
+
             // "Capture only": drop non-matching records, keeping each surviving
             // record aligned with its precomputed chain.
             var cond = _captureCondition;
@@ -5719,11 +6025,11 @@ namespace Cda.App
             {
                 if (_captureBursting) { _captureBursting = false; System.Windows.Input.Mouse.OverrideCursor = null; }
                 if (_captured.Count == 0)
-                    StatusText.Text =
+                    SetRoutineStatus(
                         $"Capturing · {cap.HookedCount} hook(s) · 0 calls yet · target wrote {_maxCursorSeen} bytes " +
                         (_maxCursorSeen == 0
                             ? "(hooked function not called yet — exercise the program, or click a function you know runs)"
-                            : "(stub firing; decoding…)");
+                            : "(stub firing; decoding…)"));
                 FinishAutoUnhookedCapture(cap);
                 return;
             }
@@ -5775,9 +6081,9 @@ namespace Cda.App
             string runaway = _autoUnhooked.Count > 0
                 ? $" · {_autoUnhooked.Count} runaway hook(s) auto-removed"
                 : "";
-            StatusText.Text = _captureBursting
+            SetRoutineStatus(_captureBursting
                 ? $"Capturing startup… catching up · {_captured.Count} calls (window briefly busy){lost}{runaway}"
-                : $"✓ Capturing · {cap.HookedCount} hook(s) · {_captured.Count} calls{lost}{runaway}";
+                : $"✓ Capturing · {cap.HookedCount} hook(s) · {_captured.Count} calls{lost}{runaway}");
 
             // Removing the only hook leaves nothing useful for the timer to poll. Fold
             // this batch first, then close the session so the UI becomes a stable trace

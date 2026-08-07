@@ -40,6 +40,15 @@ namespace Cda.Core.Engine
             public CaptureSession Session = null!;
             public TraceDataset Dataset = null!;
             public ModuleInfo Module = null!;
+
+            /// <summary>
+            /// The DLL's entry point (DllMain) as an absolute address at the actual
+            /// load base, or 0 if the image declares none. Reported alongside the
+            /// discovery result so the trace's root is visible; the hooks in
+            /// <see cref="Session"/> are armed before it runs.
+            /// </summary>
+            public ulong EntryPoint;
+
             public int Instrumented;
             public int Skipped;
             public string? FirstError;
@@ -337,6 +346,7 @@ namespace Cda.Core.Engine
                 Session = session,
                 Dataset = ds,
                 Module = module,
+                EntryPoint = pe.EntryPointRva == 0 ? 0 : unchecked(dllBase + pe.EntryPointRva),
                 Instrumented = instrumented,
                 Skipped = skipped,
                 FirstError = firstError,

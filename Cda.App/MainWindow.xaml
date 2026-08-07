@@ -242,6 +242,8 @@
                     <ColumnDefinition Width="2*" MinWidth="150" />     <!-- StatusText -->
                     <ColumnDefinition Width="*"  MinWidth="70" />      <!-- interaction hint -->
                     <ColumnDefinition Width="Auto" />                  <!-- separator -->
+                    <ColumnDefinition Width="Auto" />                  <!-- entry point -->
+                    <ColumnDefinition Width="Auto" />                  <!-- separator -->
                     <ColumnDefinition Width="Auto" />                  <!-- target + call count -->
                     <ColumnDefinition Width="Auto" />                  <!-- DPI -->
                 </Grid.ColumnDefinitions>
@@ -264,11 +266,26 @@
                            VerticalAlignment="Center" TextTrimming="CharacterEllipsis" Margin="12,0,0,0"
                            Text="graph: click a node to focus · timeline: click=scrub, ←→=step (Ctrl=bigger), right-drag=select" />
 
-                <Border Grid.Column="3" Width="1" Height="14" Background="{StaticResource Outline}"
+                <!-- Entry point of the current trace. Persistent, unlike StatusText's
+                     running commentary: it is set the moment a target is launched (the
+                     declared entry) and upgraded in place to the OBSERVED entry — the
+                     first function actually caught executing — when the first call is
+                     captured. Collapsed until there is a target, so it costs no width
+                     when idle. Monospace because it is an address. -->
+                <Border x:Name="EntryPointSep" Grid.Column="3" Width="1" Height="14"
+                        Background="{StaticResource Outline}" VerticalAlignment="Center"
+                        Margin="12,0" Visibility="Collapsed" />
+                <TextBlock x:Name="EntryPointText" Grid.Column="4" Visibility="Collapsed"
+                           Foreground="{StaticResource TextPrimary}"
+                           FontFamily="{StaticResource MonoFont}" FontSize="11.5"
+                           VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="420"
+                           ToolTip="{Binding Text, RelativeSource={RelativeSource Self}}" />
+
+                <Border Grid.Column="5" Width="1" Height="14" Background="{StaticResource Outline}"
                         VerticalAlignment="Center" Margin="12,0" />
-                <TextBlock x:Name="TraceStatsText" Grid.Column="4" Foreground="{StaticResource TextSecondary}"
+                <TextBlock x:Name="TraceStatsText" Grid.Column="6" Foreground="{StaticResource TextSecondary}"
                            FontSize="11.5" VerticalAlignment="Center" />
-                <TextBlock x:Name="DpiText" Grid.Column="5" Foreground="{StaticResource TextMuted}"
+                <TextBlock x:Name="DpiText" Grid.Column="7" Foreground="{StaticResource TextMuted}"
                            FontSize="11.5" VerticalAlignment="Center" Margin="12,0,0,0" />
             </Grid>
         </Border>
